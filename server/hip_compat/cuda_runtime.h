@@ -18,6 +18,7 @@ using cudaEvent_t           = hipEvent_t;
 using cudaError_t           = hipError_t;
 using cudaMemcpyKind        = hipMemcpyKind;
 using cudaDeviceProp        = hipDeviceProp_t;
+using cudaPointerAttributes = hipPointerAttribute_t;  // .type / .device match CUDA's
 
 // Memcpy kind constants
 #define cudaMemcpyHostToHost        hipMemcpyHostToHost
@@ -76,6 +77,12 @@ using cudaDeviceProp        = hipDeviceProp_t;
 // Launch bounds
 #define __launch_bounds__           __launch_bounds__
 
+// Warp shuffle: CUDA's *_sync intrinsics take a 32-bit lane mask; HIP's require
+// a 64-bit mask (wave64 ISAs) and static_assert against the implicit 32-bit
+// promotion. The mask-less __shfl_xor covers the all-lanes-active warp
+// reductions used here (RDNA wave32), matching rms_norm_hip.cu's idiom.
+#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+
 // Stream capture status (added CUDA 10.0 — ROCm compat headers may omit this)
 #define cudaStreamCaptureStatus             hipStreamCaptureStatus
 #define cudaStreamCaptureStatusNone         hipStreamCaptureStatusNone
@@ -90,3 +97,7 @@ using cudaDeviceProp        = hipDeviceProp_t;
 
 // Device count
 #define cudaGetDeviceCount                  hipGetDeviceCount
+
+// Pointer attributes (used by the GPU sampler to run where device logits live)
+#define cudaPointerGetAttributes            hipPointerGetAttributes
+#define cudaMemoryTypeDevice                hipMemoryTypeDevice

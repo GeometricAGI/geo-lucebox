@@ -380,6 +380,21 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # rms_norm_hip.cu is needed by the HIP chunk-B graph path regardless of SM80_EQUIV.
     target_sources(dflash_common PRIVATE src/rms_norm_hip.cu)
     set_source_files_properties(src/rms_norm_hip.cu PROPERTIES LANGUAGE HIP)
+    # GPU port of the sample_logits chain (fused penalty+softmax+draw). Shares
+    # upstream's geometric_sampler_cuda.cu verbatim — compiled as HIP, with its
+    # <cuda_runtime.h> resolving to hip_compat/ (already on the include path).
+    # The kernel's warp reductions assume a 32-lane wavefront, which holds on
+    # RDNA (gfx11xx/gfx12xx wave32). Opted into at runtime via DFLASH_GPU_SAMPLE;
+    # turn off at configure time with -DDFLASH_GPU_SAMPLER=OFF.
+    option(DFLASH_GPU_SAMPLER "Build the GPU sample_logits path" ON)
+    if(DFLASH_GPU_SAMPLER)
+        target_sources(dflash_common PRIVATE src/common/geometric_sampler_cuda.cu)
+        set_source_files_properties(src/common/geometric_sampler_cuda.cu
+            PROPERTIES LANGUAGE HIP)
+        # PUBLIC so the backends and test executables that call sample_logits()
+        # also compile their GPU dispatch branch.
+        target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_GPU_SAMPLER=1)
+    endif()
     if(DFLASH27B_HIP_SM80_EQUIV)
         find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
             HINTS "${_dflash_rocm_root}/include" /opt/rocm/include
@@ -611,6 +626,23 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    # GPU port of the sample_logits chain vs the CPU reference. Both backends:
+    # geometric_sampler_cuda.cu is compiled into dflash_common on cuda (as CUDA)
+    # and on hip (as HIP, via hip_compat). The test source is CUDA-spelled; on
+    # hip it compiles as HIP with the hip_compat shim, like test_flashprefill_kernels.
+    if(DFLASH_GPU_SAMPLER AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gpu_sampler_cuda.cpp")
+        add_executable(test_gpu_sampler_cuda test/test_gpu_sampler_cuda.cpp)
+        target_include_directories(test_gpu_sampler_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_gpu_sampler_cuda PRIVATE dflash_common CUDA::cudart)
+        else()
+            set_source_files_properties(test/test_gpu_sampler_cuda.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_gpu_sampler_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_include_directories(test_gpu_sampler_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+            target_link_libraries(test_gpu_sampler_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
+        endif()
+        add_test(NAME gpu_sampler_cuda COMMAND test_gpu_sampler_cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
         add_executable(test_kv_quant test/test_kv_quant.cpp)
