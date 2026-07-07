@@ -415,6 +415,16 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
         # also compile their GPU dispatch branch.
         target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_GPU_SAMPLER=1)
     endif()
+    # Split-K GPU draft top-K + logsumexp (spec-decode draft path). Shares the
+    # CUDA source verbatim — compiled as HIP (no warp intrinsics; a plain
+    # kBlock-wide __syncthreads reduction, so no wavefront-size assumption). Its
+    # <cuda_runtime.h> / cudaPointer* calls resolve through the hip_compat/ shim.
+    target_sources(dflash_common PRIVATE src/common/geometric_draft_topk_cuda.cu)
+    set_source_files_properties(src/common/geometric_draft_topk_cuda.cu
+        PROPERTIES LANGUAGE HIP)
+    # PUBLIC so consumers (e.g. test_dflash) also take the GPU draft top-K path
+    # instead of the CPU fallback.
+    target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK_CUDA=1)
     if(DFLASH27B_HIP_SM80_EQUIV)
         find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
             HINTS "${_dflash_rocm_root}/include" /opt/rocm/include
@@ -663,12 +673,21 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
-    # GPU draft top-K kernel vs CPU reference (extract_draft_topk). CUDA only:
-    # geometric_draft_topk_cuda.cu is compiled into dflash_common solely on the cuda backend.
-    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
+    # GPU draft top-K kernel vs CPU reference (extract_draft_topk). Built on
+    # whichever backend compiled geometric_draft_topk_cuda.cu into dflash_common
+    # (cuda as CUDA, hip as HIP). On hip the CUDA-spelled test compiles as HIP via
+    # the hip_compat/ shim, like test_gpu_sampler_cuda / test_flashprefill_kernels.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
         add_executable(test_draft_topk_cuda test/test_draft_topk_cuda.cpp)
         target_include_directories(test_draft_topk_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common CUDA::cudart)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common CUDA::cudart)
+        else()
+            set_source_files_properties(test/test_draft_topk_cuda.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_draft_topk_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_include_directories(test_draft_topk_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+            target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
+        endif()
         add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
     endif()
     # GPU port of the sample_logits chain vs the CPU reference. Built on whichever

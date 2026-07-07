@@ -19,9 +19,11 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -115,6 +117,64 @@ bool run_case(const Case & c, unsigned seed) {
     return pass;
 }
 
+// Per-call CPU-vs-GPU timing (gated by env DFLASH_TOPK_BENCH=1). Isolates the
+// whole extract_draft_topk call the ddtree draft path makes each speculative
+// step: the CPU reference vs the GPU kernel (launch + sync + D2H of the small
+// n*K result). Logits stay resident on the device across iters — the same as
+// decode, where the draft logits are produced on the GPU — so this measures the
+// steady-state per-step cost, not a cold launch or a full-vocab H2D upload.
+void draft_topk_microbench() {
+    auto now = []{ return std::chrono::steady_clock::now(); };
+    auto us  = [](auto a, auto b){ return std::chrono::duration<double, std::micro>(b - a).count(); };
+
+    struct BenchCase { int n, vocab, K; };
+    const BenchCase cases[] = {
+        {15, 151936, 8},   // realistic ddtree draft batch (~15 positions), Qwen3 vocab
+        {1,  151936, 8},   // single draft position
+    };
+    const int iters = 500;
+
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> dist(0.f, 4.f);
+
+    printf("[topk-bench] iters=%d (per call; >1.0x = GPU faster)\n", iters);
+    for (const auto & c : cases) {
+        const size_t n_logits = (size_t)c.n * c.vocab;
+        const size_t n_out    = (size_t)c.n * c.K;
+        std::vector<float> h_logits(n_logits);
+        for (auto & x : h_logits) x = dist(rng);
+
+        float * d_logits = nullptr;
+        if (cudaMalloc(&d_logits, n_logits * sizeof(float)) != cudaSuccess) {
+            printf("  cudaMalloc failed\n"); return;
+        }
+        cudaMemcpy(d_logits, h_logits.data(), n_logits * sizeof(float), cudaMemcpyHostToDevice);
+
+        std::vector<float>   lp(n_out);
+        std::vector<int32_t> ids(n_out);
+
+        // Warmup both paths — the first GPU launch pays kernel-module load.
+        for (int i = 0; i < 20; i++) {
+            extract_draft_topk(h_logits.data(), c.n, c.vocab, c.K, lp.data(), ids.data(), 1.0f);
+            geometric_extract_draft_topk_cuda(d_logits, c.n, c.vocab, c.K, lp.data(), ids.data(), 1.0f);
+        }
+
+        const auto t0 = now();
+        for (int i = 0; i < iters; i++)
+            extract_draft_topk(h_logits.data(), c.n, c.vocab, c.K, lp.data(), ids.data(), 1.0f);
+        const auto t1 = now();
+        for (int i = 0; i < iters; i++)
+            geometric_extract_draft_topk_cuda(d_logits, c.n, c.vocab, c.K, lp.data(), ids.data(), 1.0f);
+        const auto t2 = now();
+        cudaFree(d_logits);
+
+        const double cpu_us = us(t0, t1) / iters;
+        const double gpu_us = us(t1, t2) / iters;
+        printf("  n=%-3d vocab=%d K=%d  CPU %8.2f us | GPU %8.2f us (%.2fx)\n",
+               c.n, c.vocab, c.K, cpu_us, gpu_us, gpu_us > 0 ? cpu_us / gpu_us : 0.0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -123,6 +183,8 @@ int main() {
         printf("SKIP: no CUDA device available\n");
         return 0;
     }
+
+    if (std::getenv("DFLASH_TOPK_BENCH")) { draft_topk_microbench(); return 0; }
 
     // The kernel supports K up to kMaxK (=8 in geometric_draft_topk_cuda.cu); larger K is
     // handled by a documented CPU fallback (returns false), checked separately.
