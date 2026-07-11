@@ -2483,13 +2483,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     // LUCE_MMVQ_MAX_NCOLS: MMVQ ncols ceiling for plain mul_mat; above it MMQ
-    // takes small multi-token batches (spec-decode verify widths). Default 3:
-    // measured crossover on sm_86 (RTX 3090, Q4_K_M/Q6_K dense GEMVs) — MMVQ
-    // wins at ncols<=3, MMQ wins at 4-8 (laguna w6 chain 199->237 tok/s,
-    // qwen3.6 chain 127->137). Override via env for other hardware.
+    // takes small multi-token batches (spec-decode verify widths).
+    // Default 3 on NVIDIA sm_86 (RTX 3090, Q4_K_M/Q6_K dense GEMVs): MMVQ wins
+    // at ncols<=3, MMQ wins at 4-8 (laguna w6 chain 199->237 tok/s, qwen3.6
+    // 127->137). On RDNA/HIP the MMQ / dequant->rocBLAS-GEMM path is ~3x SLOWER
+    // than MMVQ at these small batches, so default to the MMVQ kernel ceiling
+    // (gfx1151 DS4 spec-verify q=4 dense projections: 311->107 ms end-to-end).
+    // Override via env for other hardware.
     static const int luce_mmvq_max_ncols = []() {
         const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
-        const int v = e ? atoi(e) : 3;
+#ifdef GGML_USE_HIP
+        const int def = MMVQ_MAX_BATCH_SIZE;
+#else
+        const int def = 3;
+#endif
+        const int v = e ? atoi(e) : def;
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
