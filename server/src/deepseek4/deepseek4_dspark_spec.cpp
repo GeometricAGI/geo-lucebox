@@ -500,7 +500,13 @@ bool run_deepseek4_dspark_spec_decode(
             const char * v = std::getenv("DFLASH_DS4_FUSED_VERIFY");
             return v && *v && *v != '0';
         }();
-        int q_step_cap = (seq_verify_mode || fused_verify_mode)
+        // Keep the ratio-4 compression boundary at the batch's LAST token: the
+        // fused/batched verify graph's fast path assumes at most one pool, at
+        // the final position (deepseek4_fused_verify.inc). A mid-batch boundary
+        // is correct but ~3x slower in compute, so cap the width to the next
+        // boundary. Sequential verify has no batch -> no boundary constraint.
+        (void) fused_verify_mode;
+        int q_step_cap = seq_verify_mode
                        ? std::min(q_cap, 4)
                        : std::min(q_cap, 4 - (pos & 3));
         if (adaptive_width && !seq_verify_mode) {
