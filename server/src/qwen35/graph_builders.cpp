@@ -370,6 +370,10 @@ bool build_target_step(
     } else {
         if (!go.logits) return false;
         sg.logits = go.logits;
+        // hidden_states is always computed by build_qwen35_graph (already an
+        // output tensor kept alive), so expose it here too at zero extra cost:
+        // calibration reads it to run the restricted head off the same build.
+        sg.hidden_states = go.hidden_states;
         ggml_set_output(sg.logits);
         sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
         ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
@@ -451,6 +455,9 @@ bool build_target_step_tree(
     } else {
         if (!go.logits) return false;
         sg.logits = go.logits;
+        // Same rationale as build_target_step: hidden_states is already
+        // computed/kept alive, expose it for off-graph calibration use.
+        sg.hidden_states = go.hidden_states;
         ggml_set_output(sg.logits);
         sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
         ggml_set_name(sg.argmax_tokens, "tree_verify_argmax");

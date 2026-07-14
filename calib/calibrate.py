@@ -147,24 +147,65 @@ def stage_run(args, bins, outdir: Path):
 def parse_block(text: str):
     """Return dict for one calib run, or None if no table present.
 
-    {positions, mean_rank, max_rank, vocab,
-     set: {metric: {M: pct}}, mass: {M: pct}, mass_bad: {M: (bad, total)}}
+    {positions, mean_rank, max_rank, vocab, mean_draft_entropy,
+     set: {metric: {M: pct}}, mass: {M: pct}, mass_bad: {M: (bad, total)},
+     entropy_buckets: {bucket_id: {lo, hi, positions,
+                                    coverage: {M: pct}, head_match: {M: pct}}}}
+
+    entropy_buckets conditions the idealized "greedy" coverage@M curve (and,
+    where DFLASH27B_HAVE_TOPK_HEAD was compiled in, the real restricted-head
+    kernel's match rate) on the draft's temperature-agnostic entropy for that
+    position -- the data needed to pick an entropy threshold T and an M for
+    the entropy-gated restricted head. mean_draft_entropy / entropy_buckets
+    are absent (None / {}) on logs captured before this field existed.
     """
     m = re.search(r"\[topk-calib\] positions=(\d+)\s+mean_rank=([\d.]+)\s+"
                   r"max_rank=(\d+)\s+\(vocab=(\d+)\)", text)
     if not m:
         return None
+    em = re.search(r"mean_draft_entropy=([\d.]+)", text)
     res = {
         "positions": int(m.group(1)),
         "mean_rank": float(m.group(2)),
         "max_rank": int(m.group(3)),
         "vocab": int(m.group(4)),
+        "mean_draft_entropy": float(em.group(1)) if em else None,
         "set": {k: {} for k in SET_METRICS},
         "mass": {},
         "mass_bad": {},
+        "entropy_buckets": {},
     }
-    cur = None
+    cur = None       # current SET_METRICS label / "__mass__", for [topk-calib] lines
+    eb_cur = None    # current bucket id, for [topk-calib-eb] coverage@M lines
+    head_cur = None  # current bucket id, for [topk-calib-head] match@M lines
     for line in text.splitlines():
+        ebh = re.search(r"\[topk-calib-eb\] entropy-bucket=(\d+) range=\[([\d.]+),(inf|[\d.]+)\) positions=(\d+)", line)
+        if ebh:
+            eb_cur = int(ebh.group(1))
+            hi = None if ebh.group(3) == "inf" else float(ebh.group(3))
+            res["entropy_buckets"].setdefault(eb_cur, {
+                "lo": float(ebh.group(2)), "hi": hi, "positions": int(ebh.group(4)),
+                "coverage": {}, "head_match": {},
+            })
+            continue
+        hh = re.search(r"\[topk-calib-head\] entropy-bucket=(\d+) positions=(\d+)", line)
+        if hh:
+            head_cur = int(hh.group(1))
+            res["entropy_buckets"].setdefault(head_cur, {
+                "lo": None, "hi": None, "positions": int(hh.group(2)),
+                "coverage": {}, "head_match": {},
+            })
+            continue
+        if line.startswith("[topk-calib-eb]") and eb_cur is not None:
+            cm = re.search(r"coverage@M=(\d+)\s*:\s*([\d.]+)%", line)
+            if cm:
+                res["entropy_buckets"][eb_cur]["coverage"][int(cm.group(1))] = float(cm.group(2))
+            continue
+        if line.startswith("[topk-calib-head]") and head_cur is not None:
+            hm = re.search(r"match@M=(\d+)\s*:\s*([\d.]+)%", line)
+            if hm:
+                res["entropy_buckets"][head_cur]["head_match"][int(hm.group(1))] = float(hm.group(2))
+            continue
         sc = re.search(r"--- (.+?): set-coverage", line)
         if sc:
             label = sc.group(1)
@@ -205,10 +246,33 @@ def aggregate(per_prompt: dict):
     mass_bad = {M: 0 for M in Ms}
     rank_w = 0.0
     max_rank = 0
+
+    # Entropy-bucket tables: coverage@M (idealized, from calib_hist_eb) and
+    # head_match@M (real restricted-head kernel, only present when
+    # DFLASH27B_HAVE_TOPK_HEAD was compiled in). Bucketed metrics are weighted
+    # by each bucket's OWN position count per prompt, not the prompt total --
+    # a true global position-weighted mean, since bucket occupancy varies a
+    # lot prompt to prompt.
+    bucket_ids = sorted({bid for b in ok.values() for bid in b.get("entropy_buckets", {})})
+    head_Ms = sorted({M for b in ok.values()
+                      for bd in b.get("entropy_buckets", {}).values()
+                      for M in bd.get("head_match", {})})
+    eb_range = {}
+    eb_pos = {bid: 0 for bid in bucket_ids}
+    eb_cov_sum = {bid: {M: 0.0 for M in Ms} for bid in bucket_ids}
+    eb_cov_w = {bid: {M: 0.0 for M in Ms} for bid in bucket_ids}
+    eb_head_sum = {bid: {M: 0.0 for M in head_Ms} for bid in bucket_ids}
+    eb_head_w = {bid: {M: 0.0 for M in head_Ms} for bid in bucket_ids}
+    entropy_sum = 0.0
+    entropy_wt = 0.0
+
     for b in ok.values():
         w = b["positions"]
         rank_w += b["mean_rank"] * w
         max_rank = max(max_rank, b["max_rank"])
+        if b.get("mean_draft_entropy") is not None:
+            entropy_sum += b["mean_draft_entropy"] * w
+            entropy_wt += w
         for m in SET_METRICS:
             for M, v in b["set"][m].items():
                 set_sum[m][M] += v * w
@@ -218,14 +282,38 @@ def aggregate(per_prompt: dict):
             mass_w[M] += w
         for M, (bad, _) in b["mass_bad"].items():
             mass_bad[M] += bad
+        for bid, bd in b.get("entropy_buckets", {}).items():
+            bw = bd["positions"]
+            eb_pos[bid] += bw
+            if bid not in eb_range and bd.get("lo") is not None:
+                eb_range[bid] = (bd["lo"], bd["hi"])
+            for M, v in bd.get("coverage", {}).items():
+                eb_cov_sum[bid][M] += v * bw
+                eb_cov_w[bid][M] += bw
+            for M, v in bd.get("head_match", {}).items():
+                eb_head_sum[bid][M] += v * bw
+                eb_head_w[bid][M] += bw
+
     set_agg = {m: {M: (set_sum[m][M] / set_w[m][M] if set_w[m][M] else None)
                    for M in Ms} for m in SET_METRICS}
     mass_agg = {M: (mass_sum[M] / mass_w[M] if mass_w[M] else None) for M in Ms}
+    entropy_buckets_agg = {
+        bid: {
+            "range": eb_range.get(bid),
+            "positions": eb_pos[bid],
+            "coverage": {M: (eb_cov_sum[bid][M] / eb_cov_w[bid][M] if eb_cov_w[bid][M] else None)
+                         for M in Ms},
+            "head_match": {M: (eb_head_sum[bid][M] / eb_head_w[bid][M] if eb_head_w[bid][M] else None)
+                           for M in head_Ms},
+        } for bid in bucket_ids
+    }
     return {
         "prompts": len(ok), "failed": len(per_prompt) - len(ok),
         "total_positions": totpos, "mean_rank": rank_w / totpos,
-        "max_rank": max_rank, "Ms": Ms,
+        "mean_draft_entropy": (entropy_sum / entropy_wt if entropy_wt else None),
+        "max_rank": max_rank, "Ms": Ms, "head_Ms": head_Ms,
         "set": set_agg, "mass": mass_agg, "mass_bad": mass_bad,
+        "entropy_buckets": entropy_buckets_agg,
         "per_prompt": {n: {"positions": b["positions"], "mean_rank": b["mean_rank"],
                            "max_rank": b["max_rank"]} for n, b in ok.items()},
     }
@@ -234,9 +322,11 @@ def aggregate(per_prompt: dict):
 def print_report(agg):
     Ms = agg["Ms"]
     print(f"\n=== top-k head calibration aggregate ===")
+    entropy_str = (f"  mean_draft_entropy={agg['mean_draft_entropy']:.3f}"
+                   if agg.get("mean_draft_entropy") is not None else "")
     print(f"prompts={agg['prompts']} (failed={agg['failed']})  "
           f"total_positions={agg['total_positions']}  "
-          f"mean_rank={agg['mean_rank']:.2f}  max_rank={agg['max_rank']}\n")
+          f"mean_rank={agg['mean_rank']:.2f}  max_rank={agg['max_rank']}{entropy_str}\n")
     def cell(v, fmt):
         return f"{'-':>10}" if v is None else f"{v:10.{fmt}f}"
     hdr = "metric".ljust(28) + "".join(f"{M:>10}" for M in Ms)
@@ -248,6 +338,33 @@ def print_report(agg):
     print("\n-- top_p=0.95 nucleus MASS coverage (mean %, + positions <99% covered) --")
     print("mass %".ljust(28) + "".join(cell(agg['mass'][M], 3) for M in Ms))
     print("bad(<99%)".ljust(28) + "".join(f"{agg['mass_bad'][M]:10d}" for M in Ms))
+
+    eb = agg.get("entropy_buckets") or {}
+    if eb:
+        # This is the table that drives the (entropy threshold T, restricted-
+        # head M) decision: for a candidate T, sum "positions" over buckets
+        # whose range is entirely below T, then read off the smallest M whose
+        # coverage@M (or, better, head_match@M once head kernels ran) clears
+        # your target hit rate across that same bucket set.
+        print("\n-- entropy-gated restricted head: idealized coverage@M by entropy bucket (%) --")
+        print("entropy range".ljust(28) + "".join(f"{M:>10}" for M in Ms))
+        for bid in sorted(eb):
+            lo, hi = eb[bid]["range"] or (None, None)
+            label = f"[{lo:.2f},{hi:.2f})" if hi is not None else (f"[{lo:.2f},inf)" if lo is not None else f"bucket {bid}")
+            row = f"{label} n={eb[bid]['positions']}"[:27].ljust(28) + \
+                "".join(cell(eb[bid]["coverage"][M], 2) for M in Ms)
+            print(row)
+        head_Ms = agg.get("head_Ms") or []
+        if head_Ms and any(eb[bid]["head_match"] for bid in eb):
+            print("\n-- entropy-gated restricted head: REAL kernel match@M by entropy bucket (%) --")
+            print("entropy range".ljust(28) + "".join(f"{M:>10}" for M in head_Ms))
+            for bid in sorted(eb):
+                lo, hi = eb[bid]["range"] or (None, None)
+                label = f"[{lo:.2f},{hi:.2f})" if hi is not None else (f"[{lo:.2f},inf)" if lo is not None else f"bucket {bid}")
+                row = f"{label} n={eb[bid]['positions']}"[:27].ljust(28) + \
+                    "".join(cell(eb[bid]["head_match"].get(M), 2) for M in head_Ms)
+                print(row)
+
     print("\n-- per-prompt --")
     for n, s in sorted(agg["per_prompt"].items()):
         print(f"  {n:<16} pos={s['positions']:<5} mean_rank={s['mean_rank']:7.2f} "

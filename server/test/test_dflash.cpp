@@ -62,6 +62,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 #ifdef _WIN32
 #define setenv(name, value, overwrite) _putenv_s(name, value)
@@ -273,6 +274,7 @@ using dflash::common::free_qwen35_layer_split_shards;
 #ifdef DFLASH27B_HAVE_TOPK_HEAD
 #include "common/restricted_lm_head_cuda.h"
 #include "common/topm_extract_cuda.h"
+#include "common/draft_entropy_cuda.h"
 #endif
 #include "common/geometric_draft_topk_cuda.h"
 using dflash::common::is_eos_tok;
@@ -3123,6 +3125,24 @@ int main(int argc, char ** argv) {
     std::vector<double>  massp95_sum(calib_Mgrid.size(), 0.0);
     std::vector<int64_t> massp95_bad(calib_Mgrid.size(), 0);
 
+    // Entropy-gated restricted head: bucket each verify position by the
+    // temperature-agnostic (raw-logit, T=1) entropy of the SAME draft row
+    // (i+1) that supplies its candidate set, so the coverage@M curve above
+    // can be conditioned on "how confident was the draft here". Buckets are
+    // fixed edges in nats; entropy is bounded by ln(vocab) (~11.93 @152k), so
+    // the last edge is comfortably an upper bound, not a hard cap.
+    static const std::vector<double> calib_entropy_edges = {
+        0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0};
+    auto entropy_bucket_of = [](double h) -> int {
+        int b = 0;
+        while (b + 1 < (int)calib_entropy_edges.size() && h >= calib_entropy_edges[b + 1]) b++;
+        return b;
+    };
+    const int calib_n_ebuckets = (int)calib_entropy_edges.size();
+    std::vector<std::vector<int64_t>> calib_hist_eb(calib_n_ebuckets); // [bucket][rank] -> count
+    std::vector<int64_t> calib_eb_count(calib_n_ebuckets, 0);
+    double calib_entropy_sum = 0.0; // overall mean, for the summary header
+
     // Candidate-restricted greedy LM head (DFLASH_TOPK_HEAD=M). On the chain
     // fast-rollback single-GPU path, replace the verify-side full-vocab head
     // with: draft top-M extract → fused Q6_K gather/dot over those candidates →
@@ -3130,8 +3150,49 @@ int main(int argc, char ** argv) {
     int    g_topk_head_M = 0;
     double tt_head_extract = 0, tt_head_kernel = 0;
     long   head_steps = 0;
+    // Entropy gate (docs/topk-head-optimization.md §5d/§5e): per verify step,
+    // gate the whole-graph restricted/full-head choice on the draft's own
+    // temperature-agnostic entropy for that step. Default +inf preserves the
+    // old ungated behavior (restricted head always on whenever M>0) so this
+    // is opt-in and backward compatible. Aggregated via MAX over the step's
+    // draft rows, not mean: a whole-graph decision should be as conservative
+    // as its least-confident row, not smoothed out by confident ones.
+    //
+    // Declared unconditionally (not just under DFLASH27B_HAVE_TOPK_HEAD)
+    // because tree_rhead/rhead reference head_entropy_gate_ok() outside any
+    // #ifdef -- g_topk_head_M is always 0 without the macro, so the `&&`
+    // chain never actually calls into CUDA code there, but it must still
+    // compile (e.g. the HIP build, which doesn't have DFLASH27B_HAVE_TOPK_HEAD).
+    float g_topk_head_entropy_T = std::numeric_limits<float>::infinity();
+    std::vector<float> head_entropy_buf;
+    long head_gate_pass = 0, head_gate_total = 0;
+    auto head_entropy_gate_ok = [&]() -> bool {
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+        if (!std::isfinite(g_topk_head_entropy_T)) return true;
+        if (!dflash::common::extract_draft_entropy_cuda(
+                (const float *)draft_sg.logits->data, (int)draft_sg.logits->ne[0], q_len,
+                head_entropy_buf.data(), 0))
+            return false;  // conservative: fail closed to the full head on a kernel error
+        float max_h = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < q_len; i++) max_h = std::max(max_h, head_entropy_buf[i]);
+        head_gate_total++;
+        const bool ok = max_h <= g_topk_head_entropy_T;
+        if (ok) head_gate_pass++;
+        return ok;
+#else
+        return true;
+#endif
+    };
+    // Tracks whether THIS iteration's verify graph was actually built
+    // restricted (rhead/tree_rhead), for whatever reason (M==0, bridged
+    // draft, sequential verify, or the entropy gate above). The calibration
+    // fidelity check below needs this to know when sg.hidden_states/argmax
+    // reflect the full head vs. the runtime-approximate one.
+    bool g_step_used_restricted_head = false;
 #ifdef DFLASH27B_HAVE_TOPK_HEAD
     if (const char * e = std::getenv("DFLASH_TOPK_HEAD")) g_topk_head_M = std::atoi(e);
+    if (const char * e = std::getenv("DFLASH_TOPK_HEAD_ENTROPY_T"))
+        g_topk_head_entropy_T = std::atof(e);
     int32_t * d_cand = nullptr, * d_cand_use = nullptr, * d_head_tok = nullptr;
     void * d_topm_scr = nullptr, * d_head_keys = nullptr;
     // Node count upper bound: chain uses q_len positions; tree uses budget+1 nodes.
@@ -3142,7 +3203,35 @@ int main(int argc, char ** argv) {
         cudaMalloc(&d_head_tok,  (size_t)topk_head_Nmax * sizeof(int32_t));
         cudaMalloc(&d_head_keys, (size_t)topk_head_Nmax * sizeof(unsigned long long));
         cudaMalloc(&d_topm_scr,  dflash::common::extract_topm_scratch_bytes(q_len));
-        std::printf("[topk-head] restricted greedy head ON, M=%d\n", g_topk_head_M);
+        head_entropy_buf.resize(q_len);
+        if (std::isfinite(g_topk_head_entropy_T)) {
+            std::printf("[topk-head] restricted greedy head ON, M=%d, entropy gate T=%.3f\n",
+                        g_topk_head_M, g_topk_head_entropy_T);
+        } else {
+            std::printf("[topk-head] restricted greedy head ON, M=%d, entropy gate OFF\n", g_topk_head_M);
+        }
+    }
+
+    // Real-kernel fidelity check (DFLASH_TOPK_CALIB=1, independent of the
+    // g_topk_head_M runtime toggle above): for each entropy bucket, run the
+    // ACTUAL extract_topm_cuda + restricted_lm_head_q6k kernels at a small M
+    // grid and compare their output against the exact full-head argmax. This
+    // measures the extractor's own approximation error, which the idealized
+    // CPU-sorted rank histogram (calib_hist_eb) cannot see.
+    static const std::vector<int> calib_head_Mgrid = {128, 256, 512, 1024, 2048};
+    const int calib_head_Mmax = calib_head_Mgrid.back();
+    int32_t * d_cal_cand = nullptr, * d_cal_cand_use = nullptr, * d_cal_head_tok = nullptr;
+    void * d_cal_topm_scr = nullptr, * d_cal_head_keys = nullptr;
+    // [bucket][Midx] -> match count / total count, against the full-head ground truth.
+    std::vector<std::vector<int64_t>> head_match_eb, head_total_eb;
+    if (g_topk_calib) {
+        cudaMalloc(&d_cal_cand,      (size_t)calib_head_Mmax * q_len * sizeof(int32_t));
+        cudaMalloc(&d_cal_cand_use,  (size_t)calib_head_Mmax * q_len * sizeof(int32_t));
+        cudaMalloc(&d_cal_head_tok,  (size_t)q_len * sizeof(int32_t));
+        cudaMalloc(&d_cal_head_keys, (size_t)q_len * sizeof(unsigned long long));
+        cudaMalloc(&d_cal_topm_scr,  dflash::common::extract_topm_scratch_bytes(q_len));
+        head_match_eb.assign(calib_n_ebuckets, std::vector<int64_t>(calib_head_Mgrid.size(), 0));
+        head_total_eb.assign(calib_n_ebuckets, std::vector<int64_t>(calib_head_Mgrid.size(), 0));
     }
 #endif
 
@@ -3442,9 +3531,13 @@ int main(int argc, char ** argv) {
             // Candidate-restricted greedy head on the tree path: single-GPU,
             // greedy only (temp>0 samples the bonus from full logits, which we
             // skip). Per node, candidates come from the draft top-M at the
-            // node's depth (same alignment as the chain path).
+            // node's depth (same alignment as the chain path). Entropy gate:
+            // fall back to the full head for this whole step when the draft's
+            // own confidence is low (see head_entropy_gate_ok above; a no-op
+            // when DFLASH_TOPK_HEAD_ENTROPY_T is unset).
             const bool tree_rhead = (g_topk_head_M > 0) && !draft_hidden_bridge
-                                  && (g_sampler.temp == 0.0f);
+                                  && (g_sampler.temp == 0.0f) && head_entropy_gate_ok();
+            g_step_used_restricted_head = tree_rhead;
             if (!build_target_step_tree(sg, w, cache, backend,
                                         /*kv_start=*/committed, /*n_tokens=*/N,
                                         g_fa_window, g_kq_stride_pad,
@@ -3863,8 +3956,11 @@ int main(int argc, char ** argv) {
             const int verify_fa_window = g_fa_window;
             // Restricted greedy head only on the single-GPU fast-rollback chain
             // path (where draft logits use the target head over the shared vocab,
-            // and the commit path never reads sg.logits).
-            const bool rhead = (g_topk_head_M > 0) && !draft_hidden_bridge && fast_rollback;
+            // and the commit path never reads sg.logits). Entropy gate: see
+            // head_entropy_gate_ok above (no-op when the gate env var is unset).
+            const bool rhead = (g_topk_head_M > 0) && !draft_hidden_bridge && fast_rollback
+                             && head_entropy_gate_ok();
+            g_step_used_restricted_head = rhead;
             if (!build_target_step(sg, w, cache, backend,
                                     /*kv_start=*/committed, /*n_tokens=*/q_len,
                                     /*with_mask=*/true, /*capture=*/true,
@@ -3968,7 +4064,10 @@ int main(int argc, char ** argv) {
             // Each call writes K/V at slot committed+i and advances SSM by 1.
             // After the loop, target cache state is identical to the batched
             // path's state (both end at committed+q_len). Restore/replay below
-            // still apply correctly.
+            // still apply correctly. Always full head (build_target_step
+            // defaults restricted_head=false here) -- reset the flag so a
+            // stale true from a prior chain/tree iteration doesn't leak in.
+            g_step_used_restricted_head = false;
             std::vector<float> single_embed(hidden);
             int32_t p4_single[4];
             for (int i = 0; i < q_len; i++) {
@@ -4026,6 +4125,8 @@ int main(int argc, char ** argv) {
                 h[r]++;
             };
             static std::vector<std::pair<int,double>> nucleus;  // (draft_rank, prob)
+            static std::vector<int> pos_ebucket;  // per-position entropy bucket, for the fidelity check below
+            pos_ebucket.assign(std::max(0, q_len - 1), 0);
             for (int i = 0; i < q_len - 1; i++) {
                 const float * drow = draft_logits_buf.data()  + (size_t)(i + 1) * vocab;
                 const float * trow = verify_logits_buf.data() + (size_t)i * vocab;
@@ -4050,6 +4151,27 @@ int main(int argc, char ** argv) {
                 bump(calib_hist, grank);
                 calib_total++; calib_rank_sum += grank;
                 if (grank > calib_max_rank) calib_max_rank = grank;
+
+                // ── temperature-agnostic (raw-logit, T=1) draft entropy over the
+                // SAME row (i+1) that supplied the candidate set above. Not
+                // scaled by ddtree_temp: the gate is meant to reflect the draft's
+                // intrinsic confidence, independent of whatever sampling
+                // temperature happens to be configured. ──
+                double dmaxz = drow[0];
+                for (int v = 1; v < vocab; v++) if (drow[v] > dmaxz) dmaxz = drow[v];
+                double dsumexp = 0.0, dweighted = 0.0;
+                for (int v = 0; v < vocab; v++) {
+                    const double e = std::exp((double)drow[v] - dmaxz);
+                    dsumexp += e;
+                    dweighted += e * (double)drow[v];
+                }
+                const double dlogZ   = dmaxz + std::log(dsumexp);
+                const double entropy = dlogZ - dweighted / dsumexp;  // nats
+                const int    ebucket = entropy_bucket_of(entropy);
+                pos_ebucket[i] = ebucket;
+                bump(calib_hist_eb[ebucket], grank);
+                calib_eb_count[ebucket]++;
+                calib_entropy_sum += entropy;
 
                 // ── target softmax(temp=1) over full vocab + sorted top-MCAP ──
                 double maxz = trow[0];
@@ -4096,6 +4218,57 @@ int main(int argc, char ** argv) {
                     if (frac < 0.99) massp95_bad[mi]++;
                 }
             }
+
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+            // Real-kernel fidelity check: run the ACTUAL extract_topm_cuda +
+            // restricted_lm_head_q6k kernels at a small M grid and compare
+            // against the exact full-head argmax, bucketed by the same
+            // per-position entropy computed above. This measures the
+            // extractor's real approximation error, which the idealized
+            // CPU-sorted rank histogram above cannot see. Only valid when this
+            // step's graph was built with the full (non-restricted) head, so
+            // sg.hidden_states covers all q_len positions and target_tok is
+            // the exact ground truth (not the runtime-approximate rhead output
+            // compared against itself). seq_verify rebuilds sg per-token, so by
+            // this point sg.hidden_states only reflects the last single-token
+            // step -- skip there. Uses g_step_used_restricted_head (set at the
+            // actual rhead/tree_rhead call site) rather than recomputing the
+            // condition here, so it stays correct now that rhead/tree_rhead
+            // also depend on the entropy gate's runtime result.
+            const bool full_head_valid = !seq_verify && !g_step_used_restricted_head;
+            if (full_head_valid && q_len > 1) {
+                const int n_fcheck = q_len - 1;  // same bound as the rank loop above
+                const int dvocab = (int)draft_sg.logits->ne[0];
+                static std::vector<int32_t> head_tok_host;
+                head_tok_host.resize(n_fcheck);
+                for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++) {
+                    const int M = calib_head_Mgrid[mi];
+                    dflash::common::extract_topm_cuda(
+                        (const float *)draft_sg.logits->data, dvocab, q_len, M,
+                        d_cal_cand, d_cal_topm_scr, 0);
+                    // Same pp -> min(pp+1, q_len-1) alignment as the runtime
+                    // rhead path; pp only reaches q_len-2 here so the clamp
+                    // never actually fires.
+                    for (int i = 0; i < n_fcheck; i++) {
+                        cudaMemcpyAsync(d_cal_cand_use + (size_t)i * M,
+                                        d_cal_cand + (size_t)(i + 1) * M,
+                                        (size_t)M * sizeof(int32_t),
+                                        cudaMemcpyDeviceToDevice, 0);
+                    }
+                    dflash::common::restricted_lm_head_q6k(
+                        w.output->data, (int)w.output->ne[0], (int)w.output->ne[1],
+                        (const float *)sg.hidden_states->data, n_fcheck,
+                        d_cal_cand_use, M, d_cal_head_tok, d_cal_head_keys, 0);
+                    cudaMemcpy(head_tok_host.data(), d_cal_head_tok,
+                               sizeof(int32_t) * n_fcheck, cudaMemcpyDeviceToHost);
+                    for (int i = 0; i < n_fcheck; i++) {
+                        const int b = pos_ebucket[i];
+                        head_total_eb[b][mi]++;
+                        if (head_tok_host[i] == target_tok[i]) head_match_eb[b][mi]++;
+                    }
+                }
+            }
+#endif
         }
 
         std::printf("[step %d] committed=%d last_tok=%d\n", n_draft_steps, committed, last_tok);
@@ -4341,10 +4514,17 @@ int main(int argc, char ** argv) {
     }
 
     if (g_topk_calib && calib_total > 0) {
-        std::printf("\n[topk-calib] positions=%lld  mean_rank=%.3f  max_rank=%d  (vocab=%d)\n",
+        // NOTE: mean_draft_entropy is appended AFTER (vocab=%d) rather than
+        // inlined earlier in the line -- calib/calibrate.py's regex for this
+        // header anchors "max_rank=(\d+)\s+\(vocab=(\d+)\)" back-to-back, and
+        // re.search doesn't care about trailing text, so this keeps the
+        // existing parser working unmodified while still exposing the field
+        // for the (separately added) mean_draft_entropy=([\d.]+) pattern.
+        std::printf("\n[topk-calib] positions=%lld  mean_rank=%.3f  max_rank=%d  (vocab=%d)  mean_draft_entropy=%.4f\n",
                     (long long)calib_total,
                     (double)calib_rank_sum / (double)calib_total,
-                    calib_max_rank, vocab);
+                    calib_max_rank, vocab,
+                    calib_entropy_sum / (double)calib_total);
         // Set-coverage: fraction of positions whose ENTIRE set is within draft top-M.
         auto cov = [&](const char * label, const std::vector<int64_t> & h) {
             std::printf("[topk-calib] --- %s: set-coverage (entire set in draft top-M) ---\n", label);
@@ -4370,6 +4550,53 @@ int main(int argc, char ** argv) {
                         100.0 * massp95_sum[mi] / (double)calib_total,
                         (long long)massp95_bad[mi], (long long)calib_total);
         }
+
+        // Entropy-conditioned greedy coverage: same idealized rank histogram
+        // as calib_hist above, split by the draft's temperature-agnostic
+        // entropy bucket for this position. Answers "for positions with
+        // entropy < T, what M gives 99.9% coverage" by summing buckets below
+        // T offline (see calib/calibrate.py::aggregate).
+        for (int b = 0; b < calib_n_ebuckets; b++) {
+            if (calib_eb_count[b] == 0) continue;
+            const double lo = calib_entropy_edges[b];
+            const bool   open_ended = (b + 1 == calib_n_ebuckets);
+            std::printf("[topk-calib-eb] entropy-bucket=%d range=[%.2f,%s) positions=%lld\n",
+                        b, lo, open_ended ? "inf" : std::to_string(calib_entropy_edges[b + 1]).c_str(),
+                        (long long)calib_eb_count[b]);
+            for (int k : calib_Mgrid) {
+                int64_t c = 0;
+                const auto & h = calib_hist_eb[b];
+                for (int r = 0; r < k && r < (int)h.size(); r++) c += h[r];
+                std::printf("[topk-calib-eb]   coverage@M=%-6d : %8.4f%%\n",
+                            k, 100.0 * (double)c / (double)calib_eb_count[b]);
+            }
+        }
+
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+        // Real-kernel fidelity: match rate of the ACTUAL restricted-head
+        // kernels against the exact full-head argmax, by entropy bucket and M.
+        // This is the number that should drive the (T, M) choice -- unlike the
+        // coverage@M table above, it is not an idealized upper bound.
+        bool any_head_data = false;
+        for (int b = 0; b < calib_n_ebuckets; b++)
+            for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++)
+                if (head_total_eb[b][mi] > 0) any_head_data = true;
+        if (any_head_data) {
+            for (int b = 0; b < calib_n_ebuckets; b++) {
+                int64_t btot = 0;
+                for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++) btot = std::max(btot, head_total_eb[b][mi]);
+                if (btot == 0) continue;
+                std::printf("[topk-calib-head] entropy-bucket=%d positions=%lld\n", b, (long long)btot);
+                for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++) {
+                    const int64_t tot = head_total_eb[b][mi];
+                    if (tot == 0) continue;
+                    std::printf("[topk-calib-head]   match@M=%-6d : %8.4f%%\n",
+                                calib_head_Mgrid[mi],
+                                100.0 * (double)head_match_eb[b][mi] / (double)tot);
+                }
+            }
+        }
+#endif
     }
 
     auto t_gen1 = std::chrono::steady_clock::now();
@@ -4394,6 +4621,12 @@ int main(int argc, char ** argv) {
                     g_topk_head_M, head_steps,
                     tt_head_extract / 1000.0 / head_steps,
                     tt_head_kernel  / 1000.0 / head_steps);
+    }
+    if (head_gate_total > 0) {
+        std::printf("  [topk-head-gate] T=%.3f  restricted=%ld/%ld steps (%.1f%%)  full-head fallback=%ld steps\n",
+                    g_topk_head_entropy_T, head_gate_pass, head_gate_total,
+                    100.0 * (double)head_gate_pass / (double)head_gate_total,
+                    head_gate_total - head_gate_pass);
     }
     std::printf("  accept         %.2f\n", avg_ms(tt_accept));
     std::printf("  restore_ssm    %.2f\n", avg_ms(tt_restore));

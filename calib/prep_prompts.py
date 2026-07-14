@@ -2,8 +2,9 @@
 """Tokenize calibration prompts to int32 .bin files for test_dflash.
 
 Pulls prompts from the same datasets the benchmark uses (HumanEval / GSM8K /
-MATH-500), applies the Qwen3.6 chat template, and writes one packed-int32 file
-per prompt into the output dir. Each file is a prompt test_dflash can decode.
+MATH-500) plus a natural-language-heavy instruction set (Alpaca), applies the
+Qwen3.6 chat template, and writes one packed-int32 file per prompt into the
+output dir. Each file is a prompt test_dflash can decode.
 
   python3 calib/prep_prompts.py --n 200 --out calib --thinking off
 
@@ -13,11 +14,18 @@ tokenizer + datasets (set HF_TOKEN to avoid rate limits).
 import argparse, struct, sys
 from pathlib import Path
 
+def _alpaca_prompt(x):
+    return x["instruction"] + (f"\n{x['input']}" if x["input"] else "")
+
 DATASETS = [
     # (label, hf_id, config, split, field-extractor)
-    ("he",   "openai/openai_humaneval", None,   "test", lambda x: x["prompt"]),
-    ("gsm",  "openai/gsm8k",            "main", "test", lambda x: f"Question: {x['question']}\nAnswer: "),
-    ("math", "HuggingFaceH4/MATH-500",  None,   "test", lambda x: f"Problem: {x['problem']}\nSolution: "),
+    ("he",   "openai/openai_humaneval", None,   "test",  lambda x: x["prompt"]),
+    ("gsm",  "openai/gsm8k",            "main", "test",  lambda x: f"Question: {x['question']}\nAnswer: "),
+    ("math", "HuggingFaceH4/MATH-500",  None,   "test",  lambda x: f"Problem: {x['problem']}\nSolution: "),
+    # Natural-language-heavy general instructions (contrast with the
+    # code/math skew above: §5b/§5d both note "general" prompts calibrate
+    # worse than code/math, so this dataset exists to quantify that directly).
+    ("nl",   "tatsu-lab/alpaca",        None,   "train", _alpaca_prompt),
 ]
 
 def main():
