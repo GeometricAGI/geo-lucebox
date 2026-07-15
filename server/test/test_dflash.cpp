@@ -62,6 +62,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 #ifdef _WIN32
 #define setenv(name, value, overwrite) _putenv_s(name, value)
@@ -270,6 +271,11 @@ using dflash::common::free_qwen35_layer_split_shards;
 #include "qwen35_layer_split_dflash_target.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_mmap.h"
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+#include "common/restricted_lm_head_cuda.h"
+#include "common/topm_extract_cuda.h"
+#include "common/draft_entropy_cuda.h"
+#endif
 #include "common/geometric_draft_topk_cuda.h"
 using dflash::common::is_eos_tok;
 
@@ -3088,6 +3094,147 @@ int main(int argc, char ** argv) {
         return ok;
     };
 
+    // ── top-k LM-head calibration (DFLASH_TOPK_CALIB=1) ──────────────────
+    // Premise test for the candidate-restricted LM head: at each chain verify
+    // position, record the rank of the target's full-vocab greedy argmax token
+    // within the draft's ranked candidate list for the SAME position (draft row
+    // i+1 predicts the token that target_tok[i] predicts). coverage@k = fraction
+    // of positions whose target greedy token falls in the draft's top-k. Chain
+    // path only (exact position alignment); run WITHOUT --ddtree.
+    static const bool g_topk_calib = [](){
+        const char * e = std::getenv("DFLASH_TOPK_CALIB");
+        return e != nullptr && std::strcmp(e, "0") != 0;
+    }();
+    std::vector<int64_t> calib_hist;          // greedy: rank (0 = top-1) -> count
+    int64_t calib_total = 0, calib_rank_sum = 0;
+    int calib_max_rank = 0;
+    // Sampling-coverage: histogram of the MAX draft-rank over the target's
+    // top-Ks set (and top-p=0.95 nucleus). coverage@M = fraction of positions
+    // whose entire target top-Ks / nucleus is within draft top-M. With the
+    // top_k -> softmax -> top_p chain order, draft-top-M ⊇ target-top-Ks makes
+    // top_k(+top_p) sampling exact under the restricted head.
+    std::vector<int64_t> samp_hist_k8, samp_hist_k20, samp_hist_p95;
+    // M grid for coverage curves (also the cap MCAP = last entry = max rank we
+    // resolve; tokens beyond MCAP count as "not covered" for every M).
+    static const std::vector<int> calib_Mgrid = {
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+    const int calib_MCAP = calib_Mgrid.back();
+    // top-p=0.95 nucleus MASS coverage: per-M sum of (covered nucleus prob mass)
+    // and count of positions where covered mass < 0.99 (the quality-relevant
+    // metric: missing a low-prob nucleus token barely distorts sampling).
+    std::vector<double>  massp95_sum(calib_Mgrid.size(), 0.0);
+    std::vector<int64_t> massp95_bad(calib_Mgrid.size(), 0);
+
+    // Entropy-gated restricted head: bucket each verify position by the
+    // temperature-agnostic (raw-logit, T=1) entropy of the SAME draft row
+    // (i+1) that supplies its candidate set, so the coverage@M curve above
+    // can be conditioned on "how confident was the draft here". Buckets are
+    // fixed edges in nats; entropy is bounded by ln(vocab) (~11.93 @152k), so
+    // the last edge is comfortably an upper bound, not a hard cap.
+    static const std::vector<double> calib_entropy_edges = {
+        0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0};
+    auto entropy_bucket_of = [](double h) -> int {
+        int b = 0;
+        while (b + 1 < (int)calib_entropy_edges.size() && h >= calib_entropy_edges[b + 1]) b++;
+        return b;
+    };
+    const int calib_n_ebuckets = (int)calib_entropy_edges.size();
+    std::vector<std::vector<int64_t>> calib_hist_eb(calib_n_ebuckets); // [bucket][rank] -> count
+    std::vector<int64_t> calib_eb_count(calib_n_ebuckets, 0);
+    double calib_entropy_sum = 0.0; // overall mean, for the summary header
+
+    // Candidate-restricted greedy LM head (DFLASH_TOPK_HEAD=M). On the chain
+    // fast-rollback single-GPU path, replace the verify-side full-vocab head
+    // with: draft top-M extract → fused Q6_K gather/dot over those candidates →
+    // argmax. Approximate-greedy (exact iff target argmax ∈ draft top-M).
+    int    g_topk_head_M = 0;
+    double tt_head_extract = 0, tt_head_kernel = 0;
+    long   head_steps = 0;
+    // Entropy gate (docs/topk-head-optimization.md §5d/§5e): per verify step,
+    // gate the whole-graph restricted/full-head choice on the draft's own
+    // temperature-agnostic entropy for that step. Default +inf preserves the
+    // old ungated behavior (restricted head always on whenever M>0) so this
+    // is opt-in and backward compatible. Aggregated via MAX over the step's
+    // draft rows, not mean: a whole-graph decision should be as conservative
+    // as its least-confident row, not smoothed out by confident ones.
+    //
+    // Declared unconditionally (not just under DFLASH27B_HAVE_TOPK_HEAD)
+    // because tree_rhead/rhead reference head_entropy_gate_ok() outside any
+    // #ifdef -- g_topk_head_M is always 0 without the macro, so the `&&`
+    // chain never actually calls into CUDA code there, but it must still
+    // compile (e.g. the HIP build, which doesn't have DFLASH27B_HAVE_TOPK_HEAD).
+    float g_topk_head_entropy_T = std::numeric_limits<float>::infinity();
+    std::vector<float> head_entropy_buf;
+    long head_gate_pass = 0, head_gate_total = 0;
+    auto head_entropy_gate_ok = [&]() -> bool {
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+        if (!std::isfinite(g_topk_head_entropy_T)) return true;
+        if (!dflash::common::extract_draft_entropy_cuda(
+                (const float *)draft_sg.logits->data, (int)draft_sg.logits->ne[0], q_len,
+                head_entropy_buf.data(), 0))
+            return false;  // conservative: fail closed to the full head on a kernel error
+        float max_h = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < q_len; i++) max_h = std::max(max_h, head_entropy_buf[i]);
+        head_gate_total++;
+        const bool ok = max_h <= g_topk_head_entropy_T;
+        if (ok) head_gate_pass++;
+        return ok;
+#else
+        return true;
+#endif
+    };
+    // Tracks whether THIS iteration's verify graph was actually built
+    // restricted (rhead/tree_rhead), for whatever reason (M==0, bridged
+    // draft, sequential verify, or the entropy gate above). The calibration
+    // fidelity check below needs this to know when sg.hidden_states/argmax
+    // reflect the full head vs. the runtime-approximate one.
+    bool g_step_used_restricted_head = false;
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+    if (const char * e = std::getenv("DFLASH_TOPK_HEAD")) g_topk_head_M = std::atoi(e);
+    if (const char * e = std::getenv("DFLASH_TOPK_HEAD_ENTROPY_T"))
+        g_topk_head_entropy_T = std::atof(e);
+    int32_t * d_cand = nullptr, * d_cand_use = nullptr, * d_head_tok = nullptr;
+    void * d_topm_scr = nullptr, * d_head_keys = nullptr;
+    // Node count upper bound: chain uses q_len positions; tree uses budget+1 nodes.
+    const int topk_head_Nmax = std::max(q_len, ddtree_budget + 1);
+    if (g_topk_head_M > 0) {
+        cudaMalloc(&d_cand,      (size_t)g_topk_head_M * q_len          * sizeof(int32_t));
+        cudaMalloc(&d_cand_use,  (size_t)g_topk_head_M * topk_head_Nmax * sizeof(int32_t));
+        cudaMalloc(&d_head_tok,  (size_t)topk_head_Nmax * sizeof(int32_t));
+        cudaMalloc(&d_head_keys, (size_t)topk_head_Nmax * sizeof(unsigned long long));
+        cudaMalloc(&d_topm_scr,  dflash::common::extract_topm_scratch_bytes(q_len));
+        head_entropy_buf.resize(q_len);
+        if (std::isfinite(g_topk_head_entropy_T)) {
+            std::printf("[topk-head] restricted greedy head ON, M=%d, entropy gate T=%.3f\n",
+                        g_topk_head_M, g_topk_head_entropy_T);
+        } else {
+            std::printf("[topk-head] restricted greedy head ON, M=%d, entropy gate OFF\n", g_topk_head_M);
+        }
+    }
+
+    // Real-kernel fidelity check (DFLASH_TOPK_CALIB=1, independent of the
+    // g_topk_head_M runtime toggle above): for each entropy bucket, run the
+    // ACTUAL extract_topm_cuda + restricted_lm_head_q6k kernels at a small M
+    // grid and compare their output against the exact full-head argmax. This
+    // measures the extractor's own approximation error, which the idealized
+    // CPU-sorted rank histogram (calib_hist_eb) cannot see.
+    static const std::vector<int> calib_head_Mgrid = {128, 256, 512, 1024, 2048};
+    const int calib_head_Mmax = calib_head_Mgrid.back();
+    int32_t * d_cal_cand = nullptr, * d_cal_cand_use = nullptr, * d_cal_head_tok = nullptr;
+    void * d_cal_topm_scr = nullptr, * d_cal_head_keys = nullptr;
+    // [bucket][Midx] -> match count / total count, against the full-head ground truth.
+    std::vector<std::vector<int64_t>> head_match_eb, head_total_eb;
+    if (g_topk_calib) {
+        cudaMalloc(&d_cal_cand,      (size_t)calib_head_Mmax * q_len * sizeof(int32_t));
+        cudaMalloc(&d_cal_cand_use,  (size_t)calib_head_Mmax * q_len * sizeof(int32_t));
+        cudaMalloc(&d_cal_head_tok,  (size_t)q_len * sizeof(int32_t));
+        cudaMalloc(&d_cal_head_keys, (size_t)q_len * sizeof(unsigned long long));
+        cudaMalloc(&d_cal_topm_scr,  dflash::common::extract_topm_scratch_bytes(q_len));
+        head_match_eb.assign(calib_n_ebuckets, std::vector<int64_t>(calib_head_Mgrid.size(), 0));
+        head_total_eb.assign(calib_n_ebuckets, std::vector<int64_t>(calib_head_Mgrid.size(), 0));
+    }
+#endif
+
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
 
@@ -3258,6 +3405,15 @@ int main(int argc, char ** argv) {
         // replay see the correct prefix.
         draft_tok[0] = last_tok;
 
+        // Calibration: the chain fast path leaves draft_logits_buf unpopulated
+        // (it reads GPU argmax). Pull the draft's full per-position logits so we
+        // can rank the target's greedy token against them after verify. The
+        // bridge path already filled draft_logits_buf above.
+        if (g_topk_calib && !draft_hidden_bridge) {
+            ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
+                                    sizeof(float) * (size_t)vocab * q_len);
+        }
+
         // DDTree top-K extraction. Positions 1..q_len-1 of the draft output
         // are the per-position distributions for the block-diffusion tree
         // (position 0 is the root/bonus slot and is fixed to last_tok). Only
@@ -3372,9 +3528,20 @@ int main(int argc, char ** argv) {
             const int N_actual = 1 + tree.n_nodes;  // actual tree size
             const int N = ddtree_budget + 1;         // fixed allocation size for gallocr reuse
 
+            // Candidate-restricted greedy head on the tree path: single-GPU,
+            // greedy only (temp>0 samples the bonus from full logits, which we
+            // skip). Per node, candidates come from the draft top-M at the
+            // node's depth (same alignment as the chain path). Entropy gate:
+            // fall back to the full head for this whole step when the draft's
+            // own confidence is low (see head_entropy_gate_ok above; a no-op
+            // when DFLASH_TOPK_HEAD_ENTROPY_T is unset).
+            const bool tree_rhead = (g_topk_head_M > 0) && !draft_hidden_bridge
+                                  && (g_sampler.temp == 0.0f) && head_entropy_gate_ok();
+            g_step_used_restricted_head = tree_rhead;
             if (!build_target_step_tree(sg, w, cache, backend,
                                         /*kv_start=*/committed, /*n_tokens=*/N,
-                                        g_fa_window, g_kq_stride_pad)) {
+                                        g_fa_window, g_kq_stride_pad,
+                                        /*restricted_head=*/tree_rhead)) {
                 std::fprintf(stderr, "ddtree verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -3463,6 +3630,36 @@ int main(int argc, char ** argv) {
             }();
             std::vector<int32_t> posterior(N_actual);
             bool logits_resident = false;  // verify_logits_buf populated this step?
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+            if (tree_rhead) {
+                // Per node: extract draft top-M, map node i (depth d) to draft
+                // row min(d+1, q_len-1), fused Q6_K gather/dot/argmax → posterior.
+                auto Th0 = sync_us();
+                const int dvocab = (int)draft_sg.logits->ne[0];
+                dflash::common::extract_topm_cuda(
+                    (const float *)draft_sg.logits->data, dvocab, q_len, g_topk_head_M,
+                    d_cand, d_topm_scr, 0);
+                for (int i = 0; i < N_actual; i++) {
+                    const int depth = (i == 0) ? 0 : (int)tree.depths[i - 1];
+                    const int src = std::min(depth + 1, q_len - 1);
+                    cudaMemcpyAsync(d_cand_use + (size_t)i * g_topk_head_M,
+                                    d_cand + (size_t)src * g_topk_head_M,
+                                    (size_t)g_topk_head_M * sizeof(int32_t),
+                                    cudaMemcpyDeviceToDevice, 0);
+                }
+                dflash::common::restricted_lm_head_q6k(
+                    w.output->data, (int)w.output->ne[0], (int)w.output->ne[1],
+                    (const float *)sg.hidden_states->data, N_actual,
+                    d_cand_use, g_topk_head_M, d_head_tok, d_head_keys, 0);
+                cudaMemcpy(posterior.data(), d_head_tok, sizeof(int32_t) * N_actual,
+                           cudaMemcpyDeviceToHost);
+                tt_head_kernel += std::chrono::duration<double, std::micro>(sync_us() - Th0).count();
+                head_steps++;
+            } else
+#endif
+            // Restricted head off (or not built): fall back to the verify-logits
+            // posterior. GPU_VERIFY_ARGMAX=1 reads the in-graph batched argmax
+            // (no bulk D2H); otherwise D2H the full logits and argmax on CPU.
             if (kGpuVerifyArgmax == 1 && sg.argmax_tokens) {
                 ggml_backend_tensor_get(sg.argmax_tokens, posterior.data(), 0,
                                         sizeof(int32_t) * N_actual);
@@ -3757,13 +3954,24 @@ int main(int argc, char ** argv) {
 
         if (!seq_verify) {
             const int verify_fa_window = g_fa_window;
+            // Restricted greedy head only on the single-GPU fast-rollback chain
+            // path (where draft logits use the target head over the shared vocab,
+            // and the commit path never reads sg.logits). Entropy gate: see
+            // head_entropy_gate_ok above (no-op when the gate env var is unset).
+            const bool rhead = (g_topk_head_M > 0) && !draft_hidden_bridge && fast_rollback
+                             && head_entropy_gate_ok();
+            g_step_used_restricted_head = rhead;
             if (!build_target_step(sg, w, cache, backend,
                                     /*kv_start=*/committed, /*n_tokens=*/q_len,
                                     /*with_mask=*/true, /*capture=*/true,
                                     /*capture_delta_intermediate=*/fast_rollback,
                                     verify_fa_window,
                                     /*last_token_logits_only=*/false,
-                                    g_kq_stride_pad)) {
+                                    g_kq_stride_pad,
+                                    /*capture_moe_router=*/false,
+                                    /*kvflash_mask=*/false,
+                                    /*capture_qk=*/false,
+                                    /*restricted_head=*/rhead)) {
                 std::fprintf(stderr, "verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -3809,14 +4017,57 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+            if (rhead) {
+                // Candidate-restricted greedy head. Extract per-position draft
+                // top-M from the (target-vocab) draft logits, remap so verify
+                // position p uses draft row min(p+1, q_len-1) (the calibrated
+                // alignment), then fused Q6_K gather/dot/argmax over the M rows.
+                auto Th0 = sync_us();
+                const int dvocab = (int)draft_sg.logits->ne[0];
+                // All on the default stream, no intermediate syncs: extract →
+                // remap → fused head → D2H (the copy forces completion).
+                dflash::common::extract_topm_cuda(
+                    (const float *)draft_sg.logits->data, dvocab, q_len, g_topk_head_M,
+                    d_cand, d_topm_scr, 0);
+                for (int pp = 0; pp < q_len; pp++) {
+                    const int src = std::min(pp + 1, q_len - 1);
+                    cudaMemcpyAsync(d_cand_use + (size_t)pp * g_topk_head_M,
+                                    d_cand + (size_t)src * g_topk_head_M,
+                                    (size_t)g_topk_head_M * sizeof(int32_t),
+                                    cudaMemcpyDeviceToDevice, 0);
+                }
+                dflash::common::restricted_lm_head_q6k(
+                    w.output->data, (int)w.output->ne[0], (int)w.output->ne[1],
+                    (const float *)sg.hidden_states->data, q_len,
+                    d_cand_use, g_topk_head_M, d_head_tok, d_head_keys, 0);
+                cudaMemcpy(target_tok.data(), d_head_tok, sizeof(int32_t) * q_len,
+                           cudaMemcpyDeviceToHost);
+                tt_head_kernel  += std::chrono::duration<double, std::micro>(sync_us() - Th0).count();
+                head_steps++;
+            } else
+#endif
+            {
             ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
                                     sizeof(int32_t) * q_len);
+            // Calibration: the batched path normally reads only the GPU argmax.
+            // Pull the full target logits so we can find the target's top-K_s /
+            // top-p nucleus for the sampling-coverage metric. (seq_verify path
+            // already fills verify_logits_buf per position.)
+            if (g_topk_calib) {
+                ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
+                                        sizeof(float) * (size_t)vocab * q_len);
+            }
+            }
         } else {
             // Sequential verify: q_len independent single-token decodes.
             // Each call writes K/V at slot committed+i and advances SSM by 1.
             // After the loop, target cache state is identical to the batched
             // path's state (both end at committed+q_len). Restore/replay below
-            // still apply correctly.
+            // still apply correctly. Always full head (build_target_step
+            // defaults restricted_head=false here) -- reset the flag so a
+            // stale true from a prior chain/tree iteration doesn't leak in.
+            g_step_used_restricted_head = false;
             std::vector<float> single_embed(hidden);
             int32_t p4_single[4];
             for (int i = 0; i < q_len; i++) {
@@ -3850,6 +4101,175 @@ int main(int argc, char ** argv) {
         }
         auto T_verify_logits = sync_us();
         tt_verify_logits += std::chrono::duration<double, std::micro>(T_verify_logits - T_verify_compute).count();
+
+        // Calibration: for each chain verify position, rank the target's tokens
+        // within draft row (i+1)'s ranked logits (rank 0 == draft top-1).
+        //   - greedy   : rank of the target argmax  -> calib_hist
+        //   - sampling : MAX draft-rank over the target's top-Ks / top-p nucleus
+        //                -> samp_hist_*  (the M needed so draft-top-M covers it)
+        if (g_topk_calib) {
+            // Stamped top-MCAP ranking avoids an O(vocab log vocab) full sort per
+            // position: nth_element+sort only the top-MCAP, and a per-token stamp
+            // marks validity so we never O(vocab)-reset draft_rank. Tokens beyond
+            // MCAP are treated as rank == MCAP (uncovered for every M in the grid).
+            static std::vector<int>     draft_rank, d_idx, t_idx;
+            static std::vector<int64_t> draft_stamp;
+            static int64_t calib_stamp = 0;
+            if ((int)draft_rank.size() != vocab) {
+                draft_rank.assign(vocab, 0); draft_stamp.assign(vocab, 0);
+                d_idx.resize(vocab); t_idx.resize(vocab);
+            }
+            const int mcap = std::min(calib_MCAP, vocab);
+            auto bump = [](std::vector<int64_t> & h, int r) {
+                if ((int)h.size() <= r) h.resize(r + 1, 0);
+                h[r]++;
+            };
+            static std::vector<std::pair<int,double>> nucleus;  // (draft_rank, prob)
+            static std::vector<int> pos_ebucket;  // per-position entropy bucket, for the fidelity check below
+            pos_ebucket.assign(std::max(0, q_len - 1), 0);
+            for (int i = 0; i < q_len - 1; i++) {
+                const float * drow = draft_logits_buf.data()  + (size_t)(i + 1) * vocab;
+                const float * trow = verify_logits_buf.data() + (size_t)i * vocab;
+
+                // ── draft top-MCAP ranks (stamped) ──
+                for (int v = 0; v < vocab; v++) d_idx[v] = v;
+                if (mcap < vocab)
+                    std::nth_element(d_idx.begin(), d_idx.begin() + mcap, d_idx.end(),
+                                     [&](int a, int b){ return drow[a] > drow[b]; });
+                std::sort(d_idx.begin(), d_idx.begin() + mcap,
+                          [&](int a, int b){ return drow[a] > drow[b]; });
+                ++calib_stamp;
+                for (int r = 0; r < mcap; r++) {
+                    draft_rank[d_idx[r]] = r; draft_stamp[d_idx[r]] = calib_stamp;
+                }
+                auto rank_of = [&](int tok)->int {
+                    return (draft_stamp[tok] == calib_stamp) ? draft_rank[tok] : calib_MCAP;
+                };
+
+                // ── greedy: rank of target argmax ──
+                const int grank = rank_of(target_tok[i]);
+                bump(calib_hist, grank);
+                calib_total++; calib_rank_sum += grank;
+                if (grank > calib_max_rank) calib_max_rank = grank;
+
+                // ── temperature-agnostic (raw-logit, T=1) draft entropy over the
+                // SAME row (i+1) that supplied the candidate set above. Not
+                // scaled by ddtree_temp: the gate is meant to reflect the draft's
+                // intrinsic confidence, independent of whatever sampling
+                // temperature happens to be configured. ──
+                double dmaxz = drow[0];
+                for (int v = 1; v < vocab; v++) if (drow[v] > dmaxz) dmaxz = drow[v];
+                double dsumexp = 0.0, dweighted = 0.0;
+                for (int v = 0; v < vocab; v++) {
+                    const double e = std::exp((double)drow[v] - dmaxz);
+                    dsumexp += e;
+                    dweighted += e * (double)drow[v];
+                }
+                const double dlogZ   = dmaxz + std::log(dsumexp);
+                const double entropy = dlogZ - dweighted / dsumexp;  // nats
+                const int    ebucket = entropy_bucket_of(entropy);
+                pos_ebucket[i] = ebucket;
+                bump(calib_hist_eb[ebucket], grank);
+                calib_eb_count[ebucket]++;
+                calib_entropy_sum += entropy;
+
+                // ── target softmax(temp=1) over full vocab + sorted top-MCAP ──
+                double maxz = trow[0];
+                for (int v = 1; v < vocab; v++) if (trow[v] > maxz) maxz = trow[v];
+                double Z = 0.0;
+                for (int v = 0; v < vocab; v++) Z += std::exp((double)trow[v] - maxz);
+                for (int v = 0; v < vocab; v++) t_idx[v] = v;
+                if (mcap < vocab)
+                    std::nth_element(t_idx.begin(), t_idx.begin() + mcap, t_idx.end(),
+                                     [&](int a, int b){ return trow[a] > trow[b]; });
+                std::sort(t_idx.begin(), t_idx.begin() + mcap,
+                          [&](int a, int b){ return trow[a] > trow[b]; });
+
+                // ── top-k set coverage (max draft-rank over target top-Ks) ──
+                int mr8 = 0, mr20 = 0;
+                for (int j = 0; j < 20 && j < mcap; j++) {
+                    const int dr = rank_of(t_idx[j]);
+                    if (j < 8 && dr > mr8) mr8 = dr;
+                    if (dr > mr20) mr20 = dr;
+                }
+                bump(samp_hist_k8,  mr8);
+                bump(samp_hist_k20, mr20);
+
+                // ── top-p=0.95 nucleus: set coverage + MASS coverage per M ──
+                nucleus.clear();
+                double cum = 0.0; int mrp = 0;
+                for (int j = 0; j < mcap; j++) {
+                    const int    tok  = t_idx[j];
+                    const double prob = std::exp((double)trow[tok] - maxz) / Z;
+                    const int    dr   = rank_of(tok);
+                    nucleus.emplace_back(dr, prob);
+                    if (dr > mrp) mrp = dr;
+                    cum += prob;
+                    if (cum >= 0.95) break;
+                }
+                bump(samp_hist_p95, mrp);
+                const double tot = cum > 0 ? cum : 1.0;
+                for (size_t mi = 0; mi < calib_Mgrid.size(); mi++) {
+                    const int M = calib_Mgrid[mi];
+                    double covered = 0.0;
+                    for (const auto & nt : nucleus) if (nt.first < M) covered += nt.second;
+                    const double frac = covered / tot;
+                    massp95_sum[mi] += frac;
+                    if (frac < 0.99) massp95_bad[mi]++;
+                }
+            }
+
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+            // Real-kernel fidelity check: run the ACTUAL extract_topm_cuda +
+            // restricted_lm_head_q6k kernels at a small M grid and compare
+            // against the exact full-head argmax, bucketed by the same
+            // per-position entropy computed above. This measures the
+            // extractor's real approximation error, which the idealized
+            // CPU-sorted rank histogram above cannot see. Only valid when this
+            // step's graph was built with the full (non-restricted) head, so
+            // sg.hidden_states covers all q_len positions and target_tok is
+            // the exact ground truth (not the runtime-approximate rhead output
+            // compared against itself). seq_verify rebuilds sg per-token, so by
+            // this point sg.hidden_states only reflects the last single-token
+            // step -- skip there. Uses g_step_used_restricted_head (set at the
+            // actual rhead/tree_rhead call site) rather than recomputing the
+            // condition here, so it stays correct now that rhead/tree_rhead
+            // also depend on the entropy gate's runtime result.
+            const bool full_head_valid = !seq_verify && !g_step_used_restricted_head;
+            if (full_head_valid && q_len > 1) {
+                const int n_fcheck = q_len - 1;  // same bound as the rank loop above
+                const int dvocab = (int)draft_sg.logits->ne[0];
+                static std::vector<int32_t> head_tok_host;
+                head_tok_host.resize(n_fcheck);
+                for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++) {
+                    const int M = calib_head_Mgrid[mi];
+                    dflash::common::extract_topm_cuda(
+                        (const float *)draft_sg.logits->data, dvocab, q_len, M,
+                        d_cal_cand, d_cal_topm_scr, 0);
+                    // Same pp -> min(pp+1, q_len-1) alignment as the runtime
+                    // rhead path; pp only reaches q_len-2 here so the clamp
+                    // never actually fires.
+                    for (int i = 0; i < n_fcheck; i++) {
+                        cudaMemcpyAsync(d_cal_cand_use + (size_t)i * M,
+                                        d_cal_cand + (size_t)(i + 1) * M,
+                                        (size_t)M * sizeof(int32_t),
+                                        cudaMemcpyDeviceToDevice, 0);
+                    }
+                    dflash::common::restricted_lm_head_q6k(
+                        w.output->data, (int)w.output->ne[0], (int)w.output->ne[1],
+                        (const float *)sg.hidden_states->data, n_fcheck,
+                        d_cal_cand_use, M, d_cal_head_tok, d_cal_head_keys, 0);
+                    cudaMemcpy(head_tok_host.data(), d_cal_head_tok,
+                               sizeof(int32_t) * n_fcheck, cudaMemcpyDeviceToHost);
+                    for (int i = 0; i < n_fcheck; i++) {
+                        const int b = pos_ebucket[i];
+                        head_total_eb[b][mi]++;
+                        if (head_tok_host[i] == target_tok[i]) head_match_eb[b][mi]++;
+                    }
+                }
+            }
+#endif
+        }
 
         std::printf("[step %d] committed=%d last_tok=%d\n", n_draft_steps, committed, last_tok);
 
@@ -4093,6 +4513,92 @@ int main(int argc, char ** argv) {
         n_draft_steps++;
     }
 
+    if (g_topk_calib && calib_total > 0) {
+        // NOTE: mean_draft_entropy is appended AFTER (vocab=%d) rather than
+        // inlined earlier in the line -- calib/calibrate.py's regex for this
+        // header anchors "max_rank=(\d+)\s+\(vocab=(\d+)\)" back-to-back, and
+        // re.search doesn't care about trailing text, so this keeps the
+        // existing parser working unmodified while still exposing the field
+        // for the (separately added) mean_draft_entropy=([\d.]+) pattern.
+        std::printf("\n[topk-calib] positions=%lld  mean_rank=%.3f  max_rank=%d  (vocab=%d)  mean_draft_entropy=%.4f\n",
+                    (long long)calib_total,
+                    (double)calib_rank_sum / (double)calib_total,
+                    calib_max_rank, vocab,
+                    calib_entropy_sum / (double)calib_total);
+        // Set-coverage: fraction of positions whose ENTIRE set is within draft top-M.
+        auto cov = [&](const char * label, const std::vector<int64_t> & h) {
+            std::printf("[topk-calib] --- %s: set-coverage (entire set in draft top-M) ---\n", label);
+            for (int k : calib_Mgrid) {
+                int64_t c = 0;
+                for (int r = 0; r < k && r < (int)h.size(); r++) c += h[r];
+                std::printf("[topk-calib]   coverage@M=%-6d : %8.4f%%\n",
+                            k, 100.0 * (double)c / (double)calib_total);
+            }
+        };
+        cov("greedy (target argmax)",       calib_hist);
+        cov("sampling top_k=8",             samp_hist_k8);
+        cov("sampling top_k=20 (Qwen def)", samp_hist_k20);
+        cov("sampling top_p=0.95 nucleus",  samp_hist_p95);
+        // Mass-coverage: mean fraction of the top-p=0.95 nucleus PROBABILITY MASS
+        // captured by draft top-M (the quality-relevant metric for sampling — a
+        // missed low-prob nucleus token barely distorts the draw), plus the count
+        // of positions where <99% of the mass is covered.
+        std::printf("[topk-calib] --- top_p=0.95 nucleus: MASS coverage (mean over positions) ---\n");
+        for (size_t mi = 0; mi < calib_Mgrid.size(); mi++) {
+            std::printf("[topk-calib]   mass@M=%-6d : %8.4f%%   (positions <99%% covered: %lld/%lld)\n",
+                        calib_Mgrid[mi],
+                        100.0 * massp95_sum[mi] / (double)calib_total,
+                        (long long)massp95_bad[mi], (long long)calib_total);
+        }
+
+        // Entropy-conditioned greedy coverage: same idealized rank histogram
+        // as calib_hist above, split by the draft's temperature-agnostic
+        // entropy bucket for this position. Answers "for positions with
+        // entropy < T, what M gives 99.9% coverage" by summing buckets below
+        // T offline (see calib/calibrate.py::aggregate).
+        for (int b = 0; b < calib_n_ebuckets; b++) {
+            if (calib_eb_count[b] == 0) continue;
+            const double lo = calib_entropy_edges[b];
+            const bool   open_ended = (b + 1 == calib_n_ebuckets);
+            std::printf("[topk-calib-eb] entropy-bucket=%d range=[%.2f,%s) positions=%lld\n",
+                        b, lo, open_ended ? "inf" : std::to_string(calib_entropy_edges[b + 1]).c_str(),
+                        (long long)calib_eb_count[b]);
+            for (int k : calib_Mgrid) {
+                int64_t c = 0;
+                const auto & h = calib_hist_eb[b];
+                for (int r = 0; r < k && r < (int)h.size(); r++) c += h[r];
+                std::printf("[topk-calib-eb]   coverage@M=%-6d : %8.4f%%\n",
+                            k, 100.0 * (double)c / (double)calib_eb_count[b]);
+            }
+        }
+
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+        // Real-kernel fidelity: match rate of the ACTUAL restricted-head
+        // kernels against the exact full-head argmax, by entropy bucket and M.
+        // This is the number that should drive the (T, M) choice -- unlike the
+        // coverage@M table above, it is not an idealized upper bound.
+        bool any_head_data = false;
+        for (int b = 0; b < calib_n_ebuckets; b++)
+            for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++)
+                if (head_total_eb[b][mi] > 0) any_head_data = true;
+        if (any_head_data) {
+            for (int b = 0; b < calib_n_ebuckets; b++) {
+                int64_t btot = 0;
+                for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++) btot = std::max(btot, head_total_eb[b][mi]);
+                if (btot == 0) continue;
+                std::printf("[topk-calib-head] entropy-bucket=%d positions=%lld\n", b, (long long)btot);
+                for (size_t mi = 0; mi < calib_head_Mgrid.size(); mi++) {
+                    const int64_t tot = head_total_eb[b][mi];
+                    if (tot == 0) continue;
+                    std::printf("[topk-calib-head]   match@M=%-6d : %8.4f%%\n",
+                                calib_head_Mgrid[mi],
+                                100.0 * (double)head_match_eb[b][mi] / (double)tot);
+                }
+            }
+        }
+#endif
+    }
+
     auto t_gen1 = std::chrono::steady_clock::now();
     double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
     double tps = n_generated / std::max(1e-9, gen_s);
@@ -4110,6 +4616,18 @@ int main(int argc, char ** argv) {
     std::printf("  verify_set     %.2f\n", avg_ms(tt_verify_set));
     std::printf("  verify_compute %.2f\n", avg_ms(tt_verify_compute));
     std::printf("  verify_logits  %.2f\n", avg_ms(tt_verify_logits));
+    if (head_steps > 0) {
+        std::printf("  [topk-head] M=%d steps=%ld  extract=%.3f ms/step  kernel=%.3f ms/step\n",
+                    g_topk_head_M, head_steps,
+                    tt_head_extract / 1000.0 / head_steps,
+                    tt_head_kernel  / 1000.0 / head_steps);
+    }
+    if (head_gate_total > 0) {
+        std::printf("  [topk-head-gate] T=%.3f  restricted=%ld/%ld steps (%.1f%%)  full-head fallback=%ld steps\n",
+                    g_topk_head_entropy_T, head_gate_pass, head_gate_total,
+                    100.0 * (double)head_gate_pass / (double)head_gate_total,
+                    head_gate_total - head_gate_pass);
+    }
     std::printf("  accept         %.2f\n", avg_ms(tt_accept));
     std::printf("  restore_ssm    %.2f\n", avg_ms(tt_restore));
     std::printf("  replay_build   %.2f\n", avg_ms(tt_replay_build));

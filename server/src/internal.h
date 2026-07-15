@@ -601,6 +601,7 @@ struct QwenGraphInputs {
     bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
+    bool          skip_lm_head = false; // if true, return hidden_states only (no full-vocab head); for the restricted greedy head
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
     // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows (carries kv_start).
     ggml_tensor * kv_write_rows = nullptr;
@@ -612,6 +613,10 @@ struct QwenGraphInputs {
 
 struct QwenGraphOutputs {
     ggml_tensor * logits;      // [vocab, n_tokens] f32
+    // Final pre-LM-head hidden [n_embd, n_tokens] f32 (always set). Used by the
+    // candidate-restricted greedy head, which gathers only the draft top-M head
+    // rows instead of the full-vocab matmul.
+    ggml_tensor * hidden_states = nullptr;
     // One entry per delta-net layer (48 for qwen35-27b). Only populated when
     // QwenGraphInputs::capture_delta_intermediate is true. Tensors are graph
     // views marked as ggml_set_output() so their data persists after

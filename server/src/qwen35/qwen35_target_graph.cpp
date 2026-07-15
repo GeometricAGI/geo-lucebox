@@ -1299,22 +1299,26 @@ QwenGraphOutputs build_qwen35_graph(
 
     // 3. LM head — optionally only for the last token (prefill optimization:
     //    reduces logits from [vocab, n_tokens] to [vocab, 1], saving ~233MB
-    //    scratch at ubatch=384 and eliminating a large matmul).
+    //    scratch at ubatch=384 and eliminating a large matmul). When
+    //    in.skip_lm_head is set (candidate-restricted greedy head) the
+    //    full-vocab matmul is skipped and only the pre-head hidden is returned.
+    QwenGraphOutputs og = std::move(og_early);
+
+    if (in.last_token_logits_only && n_tokens > 1) {
+        out = ggml_view_2d(ctx, out, hidden, 1, out->nb[1],
+                           (size_t)(n_tokens - 1) * out->nb[1]);
+    }
+    ggml_set_name(out, "result_norm");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+    og.hidden_states = out;
+
     ggml_tensor * logits = nullptr;
-    if (w.output) {
-        if (in.last_token_logits_only && n_tokens > 1) {
-            out = ggml_view_2d(ctx, out, hidden, 1, out->nb[1],
-                               (size_t)(n_tokens - 1) * out->nb[1]);
-        }
+    if (w.output && !in.skip_lm_head) {
         logits = ggml_mul_mat(ctx, w.output, out);
         ggml_set_name(logits, "logits");
         ggml_build_forward_expand(gf, logits);
-    } else {
-        ggml_set_name(out, "result_norm");
-        ggml_build_forward_expand(gf, out);
     }
-
-    QwenGraphOutputs og = std::move(og_early);
     og.logits = logits;
     return og;
 }

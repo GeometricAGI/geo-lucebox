@@ -304,19 +304,38 @@ inline int pow2_ceil(int x) {
     return p;
 }
 
+// SM count of `device`, queried once and cached (topology is static for the
+// process lifetime — matches the existing Scratch-style single-active-device
+// assumption below). Backs pick_split's device-aware block-count target.
+int sm_count(int device) {
+    static int cached_device = -1;
+    static int cached_sm     = 0;
+    if (device != cached_device) {
+        cudaDeviceProp prop{};
+        cached_sm = (cudaGetDeviceProperties(&prop, device) == cudaSuccess)
+                    ? prop.multiProcessorCount
+                    : 80;  // fallback: the ~80-SM device this heuristic was tuned on
+        cached_device = device;
+    }
+    return cached_sm;
+}
+
 // Choose how many blocks to split each position's vocab scan across. The work
 // is bandwidth bound, so we want enough total blocks (n_positions × split) to
 // saturate the device while keeping each chunk large enough that the strided
 // reads stay coalesced and per-block overhead stays amortized.
-int pick_split(int vocab, int n_positions) {
+int pick_split(int vocab, int n_positions, int device) {
     if (const char * v = std::getenv("DFLASH_TOPK_SPLIT")) {
         int s = std::atoi(v);
         if (s >= 1 && s <= kMaxSplit) return s;
     }
-    // Aim for ~240 total blocks (≈3 waves on a ~80-SM device, measured sweet
-    // spot for vocab~150k), but cap the chunk floor at ~2k elements so a block
-    // never scans too little to be worth launching.
-    int by_blocks = (240 + n_positions - 1) / n_positions;
+    // Aim for ~3 waves of blocks across the device's actual SM count (was a
+    // fixed 240 = 3*80, tuned on one ~80-SM GPU; scaling by the real SM count
+    // keeps the same sweet spot on smaller/larger GPUs), but cap the chunk
+    // floor at ~2k elements so a block never scans too little to be worth
+    // launching.
+    const int target_blocks = 3 * sm_count(device);
+    int by_blocks = (target_blocks + n_positions - 1) / n_positions;
     int by_chunk  = vocab / 2048;
     int split = by_blocks < by_chunk ? by_blocks : by_chunk;
     if (split < 1)         split = 1;
@@ -347,7 +366,7 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
 
     static const bool kProfile = std::getenv("DFLASH_TOPK_PROFILE") != nullptr;
     bool ok = false;
-    const int    split   = pick_split(vocab, n_positions);
+    const int    split   = pick_split(vocab, n_positions, dev);
     const size_t n       = (size_t)n_positions * K;
     const size_t n_parts = (size_t)n_positions * split;
     if (ensure_scratch(dev, n, n_parts)) {

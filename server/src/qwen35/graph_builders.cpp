@@ -272,7 +272,8 @@ bool build_target_step(
     int kq_stride_pad,
     bool capture_moe_router,
     bool kvflash_mask,
-    bool capture_qk) {
+    bool capture_qk,
+    bool restricted_head) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -352,18 +353,33 @@ bool build_target_step(
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
     gi.q_capture                  = capture_qk;
+    gi.skip_lm_head               = restricted_head;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
-    if (!go.logits) return false;
-    sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
     sg.moe_selected = std::move(go.moe_selected);
-    ggml_set_output(sg.logits);
 
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    if (restricted_head) {
+        // Candidate-restricted greedy head: expose the pre-head hidden; the
+        // caller runs the top-M extractor + fused Q6_K head off-graph. No
+        // full-vocab logits / argmax in this graph.
+        if (!go.hidden_states) return false;
+        sg.hidden_states = go.hidden_states;
+        ggml_set_output(sg.hidden_states);
+        ggml_build_forward_expand(sg.gf, sg.hidden_states);
+    } else {
+        if (!go.logits) return false;
+        sg.logits = go.logits;
+        // hidden_states is always computed by build_qwen35_graph (already an
+        // output tensor kept alive), so expose it here too at zero extra cost:
+        // calibration reads it to run the restricted head off the same build.
+        sg.hidden_states = go.hidden_states;
+        ggml_set_output(sg.logits);
+        sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+        ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
+        ggml_set_output(sg.argmax_tokens);
+        ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    }
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -381,7 +397,8 @@ bool build_target_step_tree(
     int kv_start,
     int n_tokens,
     int fa_window,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    bool restricted_head) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -423,17 +440,30 @@ bool build_target_step_tree(
     gi.capture_layers             = true;
     gi.capture_delta_intermediate = true;
     gi.parent_ids                 = sg.parent_ids;
+    gi.skip_lm_head               = restricted_head;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
-    if (!go.logits) return false;
-    sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
-    ggml_set_output(sg.logits);
 
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "tree_verify_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    if (restricted_head) {
+        // Candidate-restricted greedy head: expose pre-head hidden; caller runs
+        // the top-M extractor + fused Q6_K head per tree node off-graph.
+        if (!go.hidden_states) return false;
+        sg.hidden_states = go.hidden_states;
+        ggml_set_output(sg.hidden_states);
+        ggml_build_forward_expand(sg.gf, sg.hidden_states);
+    } else {
+        if (!go.logits) return false;
+        sg.logits = go.logits;
+        // Same rationale as build_target_step: hidden_states is already
+        // computed/kept alive, expose it for off-graph calibration use.
+        sg.hidden_states = go.hidden_states;
+        ggml_set_output(sg.logits);
+        sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+        ggml_set_name(sg.argmax_tokens, "tree_verify_argmax");
+        ggml_set_output(sg.argmax_tokens);
+        ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    }
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));

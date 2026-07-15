@@ -93,7 +93,8 @@ bool build_target_step(
     int kq_stride_pad = KQ_MASK_PAD,
     bool capture_moe_router = false,
     bool kvflash_mask = false,
-    bool capture_qk = false);
+    bool capture_qk = false,
+    bool restricted_head = false);  // skip full head, expose hidden for the restricted greedy head
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(
@@ -104,7 +105,8 @@ bool build_target_step_tree(
     int kv_start,
     int n_tokens,
     int fa_window = 0,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool restricted_head = false);  // skip full head, expose hidden for the restricted greedy head
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

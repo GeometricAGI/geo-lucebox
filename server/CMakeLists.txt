@@ -450,6 +450,18 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).
     target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK=1)
+    # Candidate-restricted greedy LM head (top-M extractor + fused Q6_K head),
+    # plus the entropy kernel that gates it at runtime (see draft_entropy_cuda.h).
+    target_sources(dflash_common PRIVATE
+        src/common/topm_extract_cuda.cu
+        src/common/restricted_lm_head_cuda.cu
+        src/common/draft_entropy_cuda.cu)
+    set_source_files_properties(
+        src/common/topm_extract_cuda.cu
+        src/common/restricted_lm_head_cuda.cu
+        src/common/draft_entropy_cuda.cu
+        PROPERTIES LANGUAGE CUDA)
+    target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_TOPK_HEAD=1)
     # GPU port of the sample_logits chain. Compiled in by default; the path is
     # then opted into at runtime via the DFLASH_GPU_SAMPLE env var. Turn the
     # whole thing off at configure time with -DDFLASH_GPU_SAMPLER=OFF.
@@ -711,6 +723,24 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
         target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
+    endif()
+    # GPU draft entropy kernel vs a double-precision CPU reference. CUDA only:
+    # draft_entropy_cuda.cu is only compiled under DFLASH27B_HAVE_TOPK_HEAD
+    # (the cuda-backend branch above), no HIP variant exists.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_entropy_cuda.cpp")
+        add_executable(test_draft_entropy_cuda test/test_draft_entropy_cuda.cpp)
+        target_include_directories(test_draft_entropy_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_draft_entropy_cuda PRIVATE dflash_common CUDA::cudart)
+        add_test(NAME draft_entropy_cuda COMMAND test_draft_entropy_cuda)
+    endif()
+    # GPU top-M candidate extractor vs a CPU reference of the same coarse-bin
+    # threshold algorithm. CUDA only: topm_extract_cuda.cu is only compiled
+    # under DFLASH27B_HAVE_TOPK_HEAD (the cuda-backend branch above).
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_topm_extract_cuda.cpp")
+        add_executable(test_topm_extract_cuda test/test_topm_extract_cuda.cpp)
+        target_include_directories(test_topm_extract_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_topm_extract_cuda PRIVATE dflash_common CUDA::cudart)
+        add_test(NAME topm_extract_cuda COMMAND test_topm_extract_cuda)
     endif()
     # GPU port of the sample_logits chain vs the CPU reference. CUDA only:
     # geometric_sampler_cuda.cu is compiled into dflash_common solely on the cuda backend.
