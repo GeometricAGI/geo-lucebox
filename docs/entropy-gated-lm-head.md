@@ -54,6 +54,55 @@ entropy  = (d_max + log(sumexp)) - weighted / sumexp     # nats, in [0, ln(vocab
 Alignment note: entropy for verify position `pp` must be read from the draft
 row that produced position `pp`, i.e. `pp → min(pp+1, q_len-1)`, not row `pp`.
 
+## Algorithm, step by step
+
+For one DFlash step (draft proposes a set of positions, target verifies them),
+with the gate enabled at threshold `T` and shortlist size `M`:
+
+1. **Draft forward.** Run the draft model over the current context. This yields,
+   for each draft row, a full-vocab logit vector `drow` (`draft_logits_buf`).
+
+2. **Per-position draft entropy.** For each verify position `pp`, take its
+   aligned draft row (`pp → min(pp+1, q_len-1)`) and compute the
+   temperature-agnostic entropy from `drow` using the formula above. One scalar
+   per position; a single fused pass over the row (`draft_entropy_cuda.cu`).
+
+3. **Extract top-M candidates.** From the same aligned `drow`, extract the M
+   highest-logit token ids into a per-position shortlist `cand_ids[pp][0..M)`
+   (`extract_topm_cuda` — a coarse-bin threshold select, not a full sort).
+   Only needed for positions that will take the restricted path, but it is
+   cheap enough to run for all.
+
+4. **Target forward.** Run the target model over the verify positions. The graph
+   produces, per position, the hidden vector `h` feeding the LM head
+   (`QwenGraphOutputs::hidden_states`). Do **not** yet materialize full-vocab
+   logits.
+
+5. **Gate, per position.** Compare the position's draft entropy to `T`:
+   - `entropy < T` (confident draft) → **restricted head**: run
+     `restricted_lm_head_q6k` over `h` and `cand_ids[pp]` — read only those M
+     head rows, dot each with `h`, and argmax within the shortlist. Output token
+     = the winning candidate id.
+   - `entropy ≥ T` (uncertain draft) → **full head**: the ordinary full-vocab
+     `output.weight @ h` followed by argmax over all ~152k tokens.
+
+6. **Verified token.** Either path yields one argmax token per verify position —
+   the target's greedy prediction for that position.
+
+7. **Speculative accept/reject.** Feed those verified tokens into the usual
+   DFlash accept/reject: walk the drafted sequence, accept while the verified
+   token matches the draft, stop (and take the verified token) at the first
+   mismatch. Unchanged by this feature — the gate only changes *how* each
+   verified token was computed, not what happens with it.
+
+The gate's payoff: for the fraction of positions below `T`, step 5 reads M rows
+instead of ~152k, and step 4 already avoided materializing their full logits.
+Positions above `T` cost exactly what they cost today.
+
+> This runtime path is off by default. The calibration harness below exercises
+> steps 2–6 for *every* position (both paths) to measure how often the
+> restricted path would have agreed with the full head — it does not gate.
+
 ## Calibration: picking (T, M)
 
 Two things are calibrated jointly — the entropy threshold `T` and the `M` used
