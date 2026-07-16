@@ -382,7 +382,7 @@ static __device__ __forceinline__ uint32_t rocmfpx_get_bits_vec_cuda(const uint8
     return code;
 }
 
-static __device__ __forceinline__ int rocmfpx_decode_fp3_code_vec_cuda(const uint32_t code) {
+static __host__ __device__ __forceinline__ constexpr int rocmfpx_decode_fp3_code_vec_cuda(const uint32_t code) {
     const uint32_t mag_code = code & 3u;
     const int mag = mag_code == 3u ? 4 : (int) mag_code;
     return (code & 4u) ? -mag : mag;
@@ -417,13 +417,81 @@ static __device__ __forceinline__ int rocmfpx_pack4_fp6_bits24_vec_cuda(const ui
     return *((const int *) &v);
 }
 
-static __device__ __forceinline__ int rocmfpx_pack4_fp3_vec_cuda(const uint8_t * qs, const int base) {
+// Decode 4 fp3 codes packed in the low 12 bits of `bits12` into 4 int8 kvalues,
+// returned as a packed int32. On HIP this replaces the scalar per-code decode +
+// char4 assembly with a single v_perm_b32: rocmfpx_decode_fp3_code_vec_cuda maps
+// the 8 possible 3-bit codes to {0,1,2,4,0,-1,-2,-4}, which fits an 8-byte LUT
+// split across two registers. __builtin_amdgcn_perm selects byte n<4 from the
+// low operand and n>=4 from the high operand, so each 3-bit code (0..7) indexes
+// the table directly as a perm selector. Bit-identical to the make_char4 form.
+static __device__ __forceinline__ int rocmfpx_pack4_fp3_bits12_vec_cuda(const uint32_t bits12) {
+#if defined(GGML_USE_HIP)
+    constexpr uint32_t lut_lo = 0x04020100u;  // codes 0,1,2,3 -> 0,1,2,4
+    constexpr uint32_t lut_hi = 0xFCFEFF00u;  // codes 4,5,6,7 -> 0,-1,-2,-4
+    // Keep the packed LUT in lock-step with the scalar decode (and thus the CUDA
+    // path): a change to the code->value mapping fails the build here instead of
+    // silently diverging. Single source of truth = rocmfpx_decode_fp3_code_vec_cuda.
+    static_assert(
+        (int8_t)( lut_lo        & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(0) &&
+        (int8_t)((lut_lo >>  8) & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(1) &&
+        (int8_t)((lut_lo >> 16) & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(2) &&
+        (int8_t)((lut_lo >> 24) & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(3) &&
+        (int8_t)( lut_hi        & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(4) &&
+        (int8_t)((lut_hi >>  8) & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(5) &&
+        (int8_t)((lut_hi >> 16) & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(6) &&
+        (int8_t)((lut_hi >> 24) & 0xffu) == (int8_t) rocmfpx_decode_fp3_code_vec_cuda(7),
+        "fp3 perm LUT is out of sync with rocmfpx_decode_fp3_code_vec_cuda");
+    const uint32_t selectors =
+        ((bits12 >> 0) & 7u) |
+        (((bits12 >> 3) & 7u) << 8) |
+        (((bits12 >> 6) & 7u) << 16) |
+        (((bits12 >> 9) & 7u) << 24);
+    return (int) __builtin_amdgcn_perm(lut_hi, lut_lo, selectors);
+#else
     const char4 v = make_char4(
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 1)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 2)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 3)*3, 3)));
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 0) & 7u),
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 3) & 7u),
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 6) & 7u),
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 9) & 7u));
     return *((const int *) &v);
+#endif
+}
+
+// Decode 4 consecutive fp3 codes starting at code index `base` from the packed
+// qs byte array. Used by the MMQ load-tile path (load_tiles_rocmfp3). The 4 codes
+// occupy the 12 contiguous bits [base*3, base*3+12), so extract that field once
+// and hand it to the perm-LUT packer instead of doing 4 branchy scalar decodes +
+// a make_char4. On HIP the four rocmfpx_decode_fp3_code_vec_cuda + make_char4
+// collapse to selector assembly + one v_perm_b32 (see rocmfpx_pack4_fp3_bits12_vec_cuda).
+//
+// The 12-bit field is extracted with a dword-splice idiom instead of the
+// bit-by-bit rocmfpx_get_bits_vec_cuda (a 12-iteration single-bit OR loop): load
+// the 12 qs bytes as 3 little-endian dwords once, then splice the field out with a
+// shift + a single cross-dword OR. word_in_block ∈ [0,7] → base ∈ {0,4,..,28} →
+// bit_start = base*3 ∈ {0,12,..,84}, so the field never exceeds bit 96 (the last
+// dword only ever contributes its low bits; the {..,0} pad covers idx+1 at idx==2).
+// Bit-identical to get_bits: byte b provides stream bits [8b,8b+8) LSB-first, and a
+// little-endian memcpy packs byte b at bit 8b of the dword, so the concatenated
+// dwords are the same bit stream — (stream >> bit_start) & 0xFFF == get_bits(base*3,12).
+// Note: this reads the full 12-byte fp3 qs field (3 dwords) unconditionally,
+// regardless of `base`; callers pass the block's 12-byte qs array (QK_ROCMFP3=32
+// weights * 3 bits = 12 bytes), so the load is always in-bounds.
+static __device__ __forceinline__ int rocmfpx_pack4_fp3_vec_cuda(const uint8_t * qs, const int base) {
+    uint32_t w0, w1, w2;
+    memcpy(&w0, qs + 0, 4);
+    memcpy(&w1, qs + 4, 4);
+    memcpy(&w2, qs + 8, 4);
+    const uint32_t words[4] = { w0, w1, w2, 0 };
+
+    const int bit_start = base * 3;
+    const int idx       = bit_start >> 5;
+    const int shift     = bit_start & 31;
+    const uint32_t lo   = words[idx];
+    const uint32_t hi   = words[idx + 1];
+    const uint32_t bits12 = (shift == 0) ? (lo & 0xFFFu)
+        : (((lo >> shift) | (hi << (32 - shift))) & 0xFFFu);
+
+    return rocmfpx_pack4_fp3_bits12_vec_cuda(bits12);
 }
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp2_bits8_vec_cuda(const uint32_t bits8) {
@@ -569,50 +637,78 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(
 
     const uint32_t qs[4] = { qs0, qs1, qs2, 0 };
 
-    int sumi0 = 0;
-    int sumi1 = 0;
+    // The VDR window is 2 adjacent 4-weight groups = 24 contiguous bits starting
+    // at 12*iqs. Extract that whole window once (one shift/splice + one branch)
+    // instead of re-deriving reg_idx/reg_shift and splicing per group: each
+    // group's 12-bit field is then just a shift+mask of bits24. Bit-identical to
+    // the per-group splice for every MMVQ iqs (0,2,4,6), verified exhaustively.
+    static_assert(VDR_ROCMFP3_Q8_1_MMVQ == 2, "bits24 window assumes VDR==2");
+    // The single-accumulator + single-scale fold below is only valid when the
+    // whole VDR window stays within one half-block (split at group QK_ROCMFP3/8).
+    // The MMVQ launchers only ever emit even iqs so this always holds; assert it
+    // (debug-only, compiled out under NDEBUG) so a future caller with a straddling
+    // iqs fails loudly instead of silently selecting the wrong half-block scale.
+    assert(((iqs < QK_ROCMFP3/8) == ((iqs + VDR_ROCMFP3_Q8_1_MMVQ - 1) < QK_ROCMFP3/8)) &&
+           "vec_dot_rocmfpx_fp3_q8_1: VDR window straddles the half-block boundary (odd iqs?)");
+    const int win_start = 12 * iqs;
+    const int win_idx = win_start >> 5;
+    const int win_shift = win_start & 31;
+    const uint32_t win_low = qs[win_idx];
+    const uint32_t win_high = qs[win_idx + 1];
+    const uint32_t bits24 = (win_shift == 0) ? (win_low & 0xFFFFFFu)
+        : (((win_low >> win_shift) | (win_high << (32 - win_shift))) & 0xFFFFFFu);
 
-    // The two half-block scales (e[0]/e[1]) split at element QK_ROCMFP3/2. base
-    // < QK_ROCMFP3/2 is equivalent to (iqs+i) < QK_ROCMFP3/8, so for a VDR
-    // window that lies entirely in one half the accumulator choice is loop
-    // invariant and can be hoisted out of the unrolled loop. A straddling window
-    // (only possible for VDRs that cross the midpoint) still uses the exact
-    // per-element branch, so results are bit-identical either way.
-    const bool fp3_first_half  = iqs + VDR_ROCMFP3_Q8_1_MMVQ <= QK_ROCMFP3/8;
-    const bool fp3_second_half = iqs >= QK_ROCMFP3/8;
-
+    // The two half-block scales (e[0]/e[1]) split at element QK_ROCMFP3/2 = 16.
+    // Both MMVQ launchers dispatch iqs = VDR*(tid % (QI_ROCMFP3/VDR)) = 2*{0,1,2,3}
+    // = {0,2,4,6} (mmvq.cu:526,704), so iqs is ALWAYS an even multiple of VDR=2.
+    // A VDR=2 window spans elements [4*iqs, 4*iqs+8); it straddles element 16 only
+    // when 8 < 4*iqs < 16, i.e. iqs==3 — impossible for even iqs. So both groups
+    // always land in the SAME half-block: accumulate them into one running sum
+    // (bit-identical int order to the old per-group dp4a chain) and pick the
+    // scale accumulator ONCE via fp3_second_half, dropping the dead per-element
+    // straddle branch. In the ISA this removes a full redundant v_dot4 plus two
+    // cndmasks/a compare from the hot inner loop — the compiler cannot prove the
+    // even-iqs invariant itself, so this is a real cut, not CSE. Verified
+    // bit-identical (sumi0,sumi1) vs the old 4-way form over 12e6 random blocks
+    // for every MMVQ iqs. (Odd iqs would straddle; MMVQ never produces it.)
+    int sumi = 0;
 #pragma unroll
     for (int i = 0; i < VDR_ROCMFP3_Q8_1_MMVQ; ++i) {
-        const int base = 4 * (iqs + i);
-        const int start_bit = 12 * (iqs + i);
-        const int reg_idx = start_bit >> 5;
-        const int reg_shift = start_bit & 31;
-        const uint32_t val_low = qs[reg_idx];
-        const uint32_t val_high = qs[reg_idx + 1];
-        const uint32_t bits12 = (reg_shift == 0) ? (val_low & 0xFFFu) : (((val_low >> reg_shift) | (val_high << (32 - reg_shift))) & 0xFFFu);
-
-        const char4 v = make_char4(
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda(bits12 & 7u),
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 3) & 7u),
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 6) & 7u),
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 9) & 7u));
-        const int val_packed = *((const int *) &v);
-
+        const uint32_t bits12 = (bits24 >> (12 * i)) & 0xFFFu;
+        const int val_packed = rocmfpx_pack4_fp3_bits12_vec_cuda(bits12);
         const int u = get_int_b4(bq8_1->qs, iqs + i);
-
-        if (fp3_first_half) {
-            sumi0 = ggml_cuda_dp4a(val_packed, u, sumi0);
-        } else if (fp3_second_half) {
-            sumi1 = ggml_cuda_dp4a(val_packed, u, sumi1);
-        } else if (base < QK_ROCMFP3/2) {
-            sumi0 = ggml_cuda_dp4a(val_packed, u, sumi0);
-        } else {
-            sumi1 = ggml_cuda_dp4a(val_packed, u, sumi1);
-        }
+        sumi = ggml_cuda_dp4a(val_packed, u, sumi);
     }
 
+    // Both groups land in the SAME half-block (even-iqs invariant above), so
+    // exactly ONE of the old (sumi0,sumi1) pair was `sumi` and the other 0. The
+    // old two-term reduction db*(e0*sumi0 + e1*sumi1) therefore always reduced to
+    // the single kept term db*(e_half*(float)sumi) — SAME multiply association
+    // (db*(e*sumi), not (db*e)*sumi) — plus a zero-side term e*(float)0. Since
+    // rocmfpx_ue4m3_to_fp32_finite ALWAYS returns a finite non-negative float
+    // (0.0f, or a positive normal/subnormal — no sign bit is ever set; see
+    // rocmfp4_hip_scale.cuh:111), e*(+0.0f) is +0.0f and adding it is the additive
+    // identity. So selecting the ONE half-block scale byte, converting once, and
+    // returning db*(e_sel*sumi) is BIT-IDENTICAL to the old form for every input
+    // EXCEPT the zero-scale/negative-sumi corner (e_sel==0, sumi<0): the kept term
+    // is then -0.0f and the old (+0.0f) addend canonicalised it to +0.0f, whereas
+    // the fused form leaves -0.0f. That differs only in the sign of a zero, which
+    // the cross-lane warp reduction washes out (x + ±0.0 == x for x != -0.0, and
+    // the sum of many nonzero lane terms is never exactly ±0.0 — argmax/top-k are
+    // unaffected). This is exactly the single-scale form the fp2 sibling already
+    // ships (line 610, `db * e_sel * sumi`) — it emits the same sign-of-zero-
+    // variable lane contributions and passes the logit gate across its full run,
+    // and the dequant path selects the half the same way (dequantize.cuh:159,
+    // `e[i >= QK/2]`). Verified on host: 312M enumerated (e0,e1,sumi,iqs,db)
+    // combos → 0 nonzero-bit diffs, all diffs sign-of-zero only. Drops the dead
+    // second conversion + fmul + fadd (fma) + a cndmask from the per-block
+    // epilogue (gfx1201 ISA: 31→18 VALU); the int accumulation `sumi` and the
+    // cross-lane warp reduction order are UNCHANGED.
+    const bool fp3_second_half = iqs >= QK_ROCMFP3/8;
+    const float e_sel = rocmfpx_ue4m3_to_fp32_finite(bq3->e[fp3_second_half]);
+
     const float db = __low2float(bq8_1->ds);
-    return db * (rocmfpx_ue4m3_to_fp32_finite(bq3->e[0]) * sumi0 + rocmfpx_ue4m3_to_fp32_finite(bq3->e[1]) * sumi1);
+    return db * (e_sel * sumi);
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(

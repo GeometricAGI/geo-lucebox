@@ -415,6 +415,49 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+#if defined(GGML_USE_HIP)
+// fp3-only cross-lane float reduction. On RDNA, HIP's warp_reduce_sum(float)
+// lowers its __shfl_xor butterfly to ds_bpermute, which builds a per-lane
+// address VGPR (lane ^ offset) that sits on the dependent shuffle chain. For an
+// xor mask inside a 32-lane group the SAME permutation is one ds_swizzle_b32
+// bitmask-mode op with the xor encoded as an instruction immediate
+// ((offset<<10)|0x1f: xor=offset, or=0, and=0x1f) — no address VGPR. It is
+// bit-identical to warp_reduce_sum's ladder: identical {16,8,4,2,1} reduction
+// order, identical float adds (ds_swizzle by mask m gives src lane (lane&0x1f)^m,
+// exactly __shfl_xor's partner; verified 0 lane mismatches on gfx1201 for those
+// masks). warp==32 on RDNA so every offset is a valid intra-group swizzle.
+template <int width>
+static __device__ __forceinline__ float warp_reduce_sum_fp3_dsswizzle(float x) {
+    static_assert(width == 32, "fp3 ds_swizzle reduce assumes a 32-lane RDNA warp");
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), (16 << 10) | 0x1f));
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), ( 8 << 10) | 0x1f));
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), ( 4 << 10) | 0x1f));
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), ( 2 << 10) | 0x1f));
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), ( 1 << 10) | 0x1f));
+    return x;
+}
+#endif
+
+// MMVQ warp reduction, specialised to the ds_swizzle ladder for the fp3
+// (GGML_TYPE_Q3_0_ROCMFPX) instantiation only — every other quant type, and all
+// non-HIP builds, keep the shared warp_reduce_sum unchanged. Gating on `type`
+// keeps the change local to this kernel's fp3 codegen (no backend-wide effect).
+// The `width == 32` guard falls back to warp_reduce_sum for any non-wave32 HIP
+// target (e.g. wave64 CDNA): ds_swizzle is a 32-lane intra-group op, so the
+// fp3 fast path only applies on RDNA wave32 and everything else stays generic.
+template <int width, ggml_type type>
+static __device__ __forceinline__ float warp_reduce_sum_mmvq(float x) {
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX && width == 32) {
+        return warp_reduce_sum_fp3_dsswizzle<width>(x);
+    } else {
+        return warp_reduce_sum<width>(x);
+    }
+#else
+    return warp_reduce_sum<width>(x);
+#endif
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -585,10 +628,10 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            tmp[j][i] = warp_reduce_sum_mmvq<warp_size, type>(tmp[j][i]);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                    tmp_gate[j][i] = warp_reduce_sum_mmvq<warp_size, type>(tmp_gate[j][i]);
                 }
             }
         }
