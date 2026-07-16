@@ -718,6 +718,22 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_anchor_params PRIVATE dflash_common)
         add_test(NAME anchor_params COMMAND test_anchor_params)
     endif()
+    # ROCMFPX fp3/fp2 MMVQ decode-contract unit test (host-only, no GPU): pins the
+    # code->value tables, the packed-bit unpacking, and the half-block scale split
+    # that vec_dot_rocmfpx_fp3/fp2_q8_1 decode from, against the CPU dequantizer.
+    # Self-contained (compiles rocmfpx.c directly) so it runs on the hosted CI job.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx/test_rocmfpx.c")
+        add_executable(test_rocmfpx
+            deps/llama.cpp/ggml/rocmfpx/test_rocmfpx.c
+            deps/llama.cpp/ggml/rocmfpx/rocmfpx.c)
+        target_include_directories(test_rocmfpx PRIVATE
+            deps/llama.cpp/ggml/include
+            deps/llama.cpp/ggml/rocmfpx)
+        if(NOT WIN32)
+            target_link_libraries(test_rocmfpx PRIVATE m)
+        endif()
+        add_test(NAME rocmfpx_unit COMMAND test_rocmfpx)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_early_exit_score_range.cpp")
         add_executable(test_drafter_early_exit_score_range
             test/test_drafter_early_exit_score_range.cpp)
