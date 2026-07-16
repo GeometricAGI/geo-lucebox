@@ -416,7 +416,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 }
 
 #if defined(GGML_USE_HIP)
-// fp3-only cross-lane float reduction. On RDNA, HIP's warp_reduce_sum(float)
+// ROCMFPX (fp2/fp3) cross-lane float reduction. On RDNA, HIP's warp_reduce_sum(float)
 // lowers its __shfl_xor butterfly to ds_bpermute, which builds a per-lane
 // address VGPR (lane ^ offset) that sits on the dependent shuffle chain. For an
 // xor mask inside a 32-lane group the SAME permutation is one ds_swizzle_b32
@@ -427,8 +427,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 // exactly __shfl_xor's partner; verified 0 lane mismatches on gfx1201 for those
 // masks). warp==32 on RDNA so every offset is a valid intra-group swizzle.
 template <int width>
-static __device__ __forceinline__ float warp_reduce_sum_fp3_dsswizzle(float x) {
-    static_assert(width == 32, "fp3 ds_swizzle reduce assumes a 32-lane RDNA warp");
+static __device__ __forceinline__ float warp_reduce_sum_rocmfpx_dsswizzle(float x) {
+    static_assert(width == 32, "ROCMFPX ds_swizzle reduce assumes a 32-lane RDNA warp");
     x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), (16 << 10) | 0x1f));
     x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), ( 8 << 10) | 0x1f));
     x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), ( 4 << 10) | 0x1f));
@@ -438,18 +438,20 @@ static __device__ __forceinline__ float warp_reduce_sum_fp3_dsswizzle(float x) {
 }
 #endif
 
-// MMVQ warp reduction, specialised to the ds_swizzle ladder for the fp3
-// (GGML_TYPE_Q3_0_ROCMFPX) instantiation only — every other quant type, and all
-// non-HIP builds, keep the shared warp_reduce_sum unchanged. Gating on `type`
-// keeps the change local to this kernel's fp3 codegen (no backend-wide effect).
-// The `width == 32` guard falls back to warp_reduce_sum for any non-wave32 HIP
-// target (e.g. wave64 CDNA): ds_swizzle is a 32-lane intra-group op, so the
-// fp3 fast path only applies on RDNA wave32 and everything else stays generic.
+// MMVQ warp reduction, specialised to the ds_swizzle ladder for the ROCMFPX
+// fp2 (GGML_TYPE_Q2_0_ROCMFP2) and fp3 (GGML_TYPE_Q3_0_ROCMFPX) instantiations
+// only — every other quant type, and all non-HIP builds, keep the shared
+// warp_reduce_sum unchanged. Gating on `type` keeps the change local to these
+// kernels' codegen (no backend-wide effect). The `width == 32` guard falls back
+// to warp_reduce_sum for any non-wave32 HIP target (e.g. wave64 CDNA):
+// ds_swizzle is a 32-lane intra-group op, so the fast path only applies on RDNA
+// wave32 and everything else stays generic. The ladder is bit-identical to
+// warp_reduce_sum for every type (same {16,8,4,2,1} order, same float adds).
 template <int width, ggml_type type>
 static __device__ __forceinline__ float warp_reduce_sum_mmvq(float x) {
 #if defined(GGML_USE_HIP)
-    if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX && width == 32) {
-        return warp_reduce_sum_fp3_dsswizzle<width>(x);
+    if constexpr ((type == GGML_TYPE_Q3_0_ROCMFPX || type == GGML_TYPE_Q2_0_ROCMFP2) && width == 32) {
+        return warp_reduce_sum_rocmfpx_dsswizzle<width>(x);
     } else {
         return warp_reduce_sum<width>(x);
     }

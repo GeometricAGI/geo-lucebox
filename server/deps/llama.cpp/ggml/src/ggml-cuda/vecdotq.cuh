@@ -347,7 +347,7 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_ROCMFP4_FAST_Q8_1_MMVQ GGML_ROCMFP4_FAST_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMQ  GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR
 #define VDR_ROCMFP2_Q8_1_MMVQ 1
-#define VDR_ROCMFP3_Q8_1_MMVQ 2
+#define VDR_ROCMFP3_Q8_1_MMVQ 4
 #ifndef VDR_ROCMFP6_Q8_1_MMVQ
 #define VDR_ROCMFP6_Q8_1_MMVQ 4
 #endif
@@ -613,13 +613,22 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
     // qs is a 10-byte-strided, byte-aligned array -> read byte-wise (uint8_t index); NEVER cast qs to int*/int2*.
     const block_rocmfp2 * bq2 = (const block_rocmfp2 *) vbq + kbx;
 
-    int sumi = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int val_packed = rocmfpx_pack4_fp2_bits8_vec_cuda((uint32_t) bq2->qs[4*iqs + j]);
-        const int u          = get_int_b4(bq8_1->qs, 4*iqs + j);
-        sumi = ggml_cuda_dp4a(val_packed, u, sumi);
-    }
+    // Two independent dp4a chains (bytes {0,2} and {1,3}) to hide dp4a latency.
+    // Integer accumulation is associative and exact, so sumi_a + sumi_b is
+    // BIT-IDENTICAL to the serial single-accumulator chain: this touches only the
+    // in-lane int ordering, not the float reduction or the lane assignment (VDR=1
+    // already covers one half-block per lane), so the result is byte-identical.
+    const int vp0 = rocmfpx_pack4_fp2_bits8_vec_cuda((uint32_t) bq2->qs[4*iqs + 0]);
+    const int vp1 = rocmfpx_pack4_fp2_bits8_vec_cuda((uint32_t) bq2->qs[4*iqs + 1]);
+    const int vp2 = rocmfpx_pack4_fp2_bits8_vec_cuda((uint32_t) bq2->qs[4*iqs + 2]);
+    const int vp3 = rocmfpx_pack4_fp2_bits8_vec_cuda((uint32_t) bq2->qs[4*iqs + 3]);
+    int sumi_a = 0;
+    int sumi_b = 0;
+    sumi_a = ggml_cuda_dp4a(vp0, get_int_b4(bq8_1->qs, 4*iqs + 0), sumi_a);
+    sumi_b = ggml_cuda_dp4a(vp1, get_int_b4(bq8_1->qs, 4*iqs + 1), sumi_b);
+    sumi_a = ggml_cuda_dp4a(vp2, get_int_b4(bq8_1->qs, 4*iqs + 2), sumi_a);
+    sumi_b = ggml_cuda_dp4a(vp3, get_int_b4(bq8_1->qs, 4*iqs + 3), sumi_b);
+    const int sumi = sumi_a + sumi_b;
 
     const float db = __low2float(bq8_1->ds);
     return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]) * sumi;
@@ -637,73 +646,49 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(
 
     const uint32_t qs[4] = { qs0, qs1, qs2, 0 };
 
-    // The VDR window is 2 adjacent 4-weight groups = 24 contiguous bits starting
-    // at 12*iqs. Extract that whole window once (one shift/splice + one branch)
-    // instead of re-deriving reg_idx/reg_shift and splicing per group: each
-    // group's 12-bit field is then just a shift+mask of bits24. Bit-identical to
-    // the per-group splice for every MMVQ iqs (0,2,4,6), verified exhaustively.
-    static_assert(VDR_ROCMFP3_Q8_1_MMVQ == 2, "bits24 window assumes VDR==2");
-    // The single-accumulator + single-scale fold below is only valid when the
-    // whole VDR window stays within one half-block (split at group QK_ROCMFP3/8).
-    // The MMVQ launchers only ever emit even iqs so this always holds; assert it
-    // (debug-only, compiled out under NDEBUG) so a future caller with a straddling
-    // iqs fails loudly instead of silently selecting the wrong half-block scale.
-    assert(((iqs < QK_ROCMFP3/8) == ((iqs + VDR_ROCMFP3_Q8_1_MMVQ - 1) < QK_ROCMFP3/8)) &&
-           "vec_dot_rocmfpx_fp3_q8_1: VDR window straddles the half-block boundary (odd iqs?)");
+    // VDR=4 half-block-aligned MMVQ (structural rewrite of the VDR=2 form).
+    // The MMVQ launchers dispatch iqs = VDR*(tid % (QI_ROCMFP3/VDR)) = 4*{0,1} =
+    // {0,4} (QI_ROCMFP3=8, VDR=4), so each vec_dot covers exactly ONE 16-weight
+    // half-block = 4 adjacent 4-weight groups with a SINGLE scale: iqs==0 ->
+    // weights 0..15 (e[0]); iqs==4 -> weights 16..31 (e[1]). No half-block
+    // straddle is ever possible, so the scale is selected once with no per-element
+    // branch. Versus the VDR=2 kernel this doubles work-per-lane (4 dp4a vs 2),
+    // halves lanes-per-block (2 vs 4) and the K-loop trip count, and amortises the
+    // bit-window extraction over 4 groups.
+    //
+    // NOT bit-identical to the VDR=2 form: one lane now sums 4 groups instead of
+    // 2, so the cross-lane float reduction tree is regrouped. The int dp4a sums
+    // stay exact; the only difference is <=~1 ULP per block in the int->float
+    // product ordering, far below the argmax margin. Validated by logit-tol +
+    // greedy-output SHA + spec accept_rate rather than byte-identity.
+    static_assert(VDR_ROCMFP3_Q8_1_MMVQ == 4, "half-block window assumes VDR==4");
+    assert((iqs == 0 || iqs == QK_ROCMFP3/8) &&
+           "vec_dot_rocmfpx_fp3_q8_1: VDR=4 expects half-block-aligned iqs (0 or 4)");
+
+    // The 4-group window is 48 contiguous bits starting at 12*iqs. For the two
+    // legal iqs (0 -> bit 0, 4 -> bit 48) the field lies within two adjacent
+    // dwords after the intra-dword shift (shift is 0 or 16, and shift+48 <= 64),
+    // so a single 64-bit splice extracts all 48 bits at once.
     const int win_start = 12 * iqs;
-    const int win_idx = win_start >> 5;
-    const int win_shift = win_start & 31;
-    const uint32_t win_low = qs[win_idx];
-    const uint32_t win_high = qs[win_idx + 1];
-    const uint32_t bits24 = (win_shift == 0) ? (win_low & 0xFFFFFFu)
-        : (((win_low >> win_shift) | (win_high << (32 - win_shift))) & 0xFFFFFFu);
+    const int win_idx   = win_start >> 5;   // 0 or 1
+    const int win_shift = win_start & 31;   // 0 or 16
+    const uint64_t chunk  = (uint64_t) qs[win_idx] | ((uint64_t) qs[win_idx + 1] << 32);
+    const uint64_t bits48 = (chunk >> win_shift) & 0xFFFFFFFFFFFFull;
 
-    // The two half-block scales (e[0]/e[1]) split at element QK_ROCMFP3/2 = 16.
-    // Both MMVQ launchers dispatch iqs = VDR*(tid % (QI_ROCMFP3/VDR)) = 2*{0,1,2,3}
-    // = {0,2,4,6} (mmvq.cu:526,704), so iqs is ALWAYS an even multiple of VDR=2.
-    // A VDR=2 window spans elements [4*iqs, 4*iqs+8); it straddles element 16 only
-    // when 8 < 4*iqs < 16, i.e. iqs==3 — impossible for even iqs. So both groups
-    // always land in the SAME half-block: accumulate them into one running sum
-    // (bit-identical int order to the old per-group dp4a chain) and pick the
-    // scale accumulator ONCE via fp3_second_half, dropping the dead per-element
-    // straddle branch. In the ISA this removes a full redundant v_dot4 plus two
-    // cndmasks/a compare from the hot inner loop — the compiler cannot prove the
-    // even-iqs invariant itself, so this is a real cut, not CSE. Verified
-    // bit-identical (sumi0,sumi1) vs the old 4-way form over 12e6 random blocks
-    // for every MMVQ iqs. (Odd iqs would straddle; MMVQ never produces it.)
-    int sumi = 0;
-#pragma unroll
-    for (int i = 0; i < VDR_ROCMFP3_Q8_1_MMVQ; ++i) {
-        const uint32_t bits12 = (bits24 >> (12 * i)) & 0xFFFu;
-        const int val_packed = rocmfpx_pack4_fp3_bits12_vec_cuda(bits12);
-        const int u = get_int_b4(bq8_1->qs, iqs + i);
-        sumi = ggml_cuda_dp4a(val_packed, u, sumi);
-    }
+    // Two independent dp4a chains (groups {0,2} and {1,3}) to hide dp4a latency;
+    // the int sums are exact so the final int add is order-independent.
+    const int vp0 = rocmfpx_pack4_fp3_bits12_vec_cuda((uint32_t)( bits48        & 0xFFFu));
+    const int vp1 = rocmfpx_pack4_fp3_bits12_vec_cuda((uint32_t)((bits48 >> 12) & 0xFFFu));
+    const int vp2 = rocmfpx_pack4_fp3_bits12_vec_cuda((uint32_t)((bits48 >> 24) & 0xFFFu));
+    const int vp3 = rocmfpx_pack4_fp3_bits12_vec_cuda((uint32_t)((bits48 >> 36) & 0xFFFu));
+    int sumi_a = 0;
+    int sumi_b = 0;
+    sumi_a = ggml_cuda_dp4a(vp0, get_int_b4(bq8_1->qs, iqs + 0), sumi_a);
+    sumi_b = ggml_cuda_dp4a(vp1, get_int_b4(bq8_1->qs, iqs + 1), sumi_b);
+    sumi_a = ggml_cuda_dp4a(vp2, get_int_b4(bq8_1->qs, iqs + 2), sumi_a);
+    sumi_b = ggml_cuda_dp4a(vp3, get_int_b4(bq8_1->qs, iqs + 3), sumi_b);
+    const int sumi = sumi_a + sumi_b;
 
-    // Both groups land in the SAME half-block (even-iqs invariant above), so
-    // exactly ONE of the old (sumi0,sumi1) pair was `sumi` and the other 0. The
-    // old two-term reduction db*(e0*sumi0 + e1*sumi1) therefore always reduced to
-    // the single kept term db*(e_half*(float)sumi) — SAME multiply association
-    // (db*(e*sumi), not (db*e)*sumi) — plus a zero-side term e*(float)0. Since
-    // rocmfpx_ue4m3_to_fp32_finite ALWAYS returns a finite non-negative float
-    // (0.0f, or a positive normal/subnormal — no sign bit is ever set; see
-    // rocmfp4_hip_scale.cuh:111), e*(+0.0f) is +0.0f and adding it is the additive
-    // identity. So selecting the ONE half-block scale byte, converting once, and
-    // returning db*(e_sel*sumi) is BIT-IDENTICAL to the old form for every input
-    // EXCEPT the zero-scale/negative-sumi corner (e_sel==0, sumi<0): the kept term
-    // is then -0.0f and the old (+0.0f) addend canonicalised it to +0.0f, whereas
-    // the fused form leaves -0.0f. That differs only in the sign of a zero, which
-    // the cross-lane warp reduction washes out (x + ±0.0 == x for x != -0.0, and
-    // the sum of many nonzero lane terms is never exactly ±0.0 — argmax/top-k are
-    // unaffected). This is exactly the single-scale form the fp2 sibling already
-    // ships (line 610, `db * e_sel * sumi`) — it emits the same sign-of-zero-
-    // variable lane contributions and passes the logit gate across its full run,
-    // and the dequant path selects the half the same way (dequantize.cuh:159,
-    // `e[i >= QK/2]`). Verified on host: 312M enumerated (e0,e1,sumi,iqs,db)
-    // combos → 0 nonzero-bit diffs, all diffs sign-of-zero only. Drops the dead
-    // second conversion + fmul + fadd (fma) + a cndmask from the per-block
-    // epilogue (gfx1201 ISA: 31→18 VALU); the int accumulation `sumi` and the
-    // cross-lane warp reduction order are UNCHANGED.
     const bool fp3_second_half = iqs >= QK_ROCMFP3/8;
     const float e_sel = rocmfpx_ue4m3_to_fp32_finite(bq3->e[fp3_second_half]);
 
