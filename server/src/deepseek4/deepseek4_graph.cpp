@@ -6640,7 +6640,13 @@ bool deepseek4_step_layer_range(
             ggml_context * ctx = ggml_init(params);
             if (!ctx) return false;
 
-            const bool last_only = n_tokens > 1;
+            // The DSpark verify batch reads logits for every column via
+            // verify_hooks->all_logits_out, so the last-token-only shortcut
+            // must be disabled when the full set is requested — otherwise the
+            // lm_head graph is built for a single column and the all_logits
+            // readback runs past the tensor (out-of-bounds crash).
+            const bool need_all_logits = verify_hooks && verify_hooks->all_logits_out;
+            const bool last_only = n_tokens > 1 && !need_all_logits;
             const int output_tokens = last_only ? 1 : n_tokens;
             ggml_tensor * inp = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_embd, output_tokens);
