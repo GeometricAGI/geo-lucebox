@@ -118,6 +118,7 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
 
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return 0;
         case GGML_TYPE_IQ1_S:   return 6;
         case GGML_TYPE_IQ1_M:   return 6;
         case GGML_TYPE_IQ2_S:   return 4;
@@ -144,6 +145,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
 
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return 0;
         case GGML_TYPE_IQ2_S:   return 7;
         case GGML_TYPE_IQ3_S:   return 6;
         case GGML_TYPE_IQ3_XXS: return 7;
@@ -156,6 +158,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
 
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_gcn(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return 0;
         case GGML_TYPE_IQ1_S:   return 5;
         case GGML_TYPE_IQ1_M:   return 5;
         case GGML_TYPE_IQ2_S:   return 4;
@@ -184,6 +187,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_cdna(ggml_type 
         case GGML_TYPE_IQ2_XXS: return 5;
         case GGML_TYPE_IQ3_S:   return 4;
         case GGML_TYPE_IQ3_XXS: return 5;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return 0;  // no MMVQ; dequant->cuBLAS
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -200,6 +204,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna1_rdna2(ggm
         case GGML_TYPE_Q4_K:    return 5;
         case GGML_TYPE_Q5_K:    return 6;
         case GGML_TYPE_Q6_K:    return 5;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return 0;  // no MMVQ; dequant->cuBLAS
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -218,6 +223,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
         case GGML_TYPE_Q4_K:    return 4;
         case GGML_TYPE_Q5_K:    return 4;
         case GGML_TYPE_Q6_K:    return 4;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return 0;  // no MMVQ; dequant->cuBLAS
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -243,6 +249,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
         case GGML_TYPE_Q5_K:    return 5;
         case GGML_TYPE_Q6_K:    return 5;
         case GGML_TYPE_Q8_0:    return 7;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return 0;  // no MMVQ; dequant->cuBLAS
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
