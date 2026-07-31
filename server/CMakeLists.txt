@@ -735,6 +735,16 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_GGML_BACKEND_TARGET}
             hip::host)
         add_test(NAME rocmfp_mix_gateup_glu COMMAND test_rocmfp_mix_gateup_glu)
+
+        # Benchmark, not a test: built with the tests but NOT registered via add_test, so ctest
+        # stays deterministic. Measures the launch-count claim the fusion rests on.
+        add_executable(bench_rocmfp_mix_gateup_glu test/bench_rocmfp_mix_gateup_glu.cpp)
+        set_source_files_properties(test/bench_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(bench_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(bench_rocmfp_mix_gateup_glu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_rocmfp_mix_gateup_glu PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
     endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
