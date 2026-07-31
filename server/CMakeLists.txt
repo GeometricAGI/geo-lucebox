@@ -723,6 +723,18 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_GGML_BACKEND_TARGET}
             hip::host)
         add_test(NAME rocmfp_mix_slice_matvec COMMAND test_rocmfp_mix_slice_matvec)
+
+        add_executable(test_rocmfp_mix_gateup_glu test/test_rocmfp_mix_gateup_glu.cpp)
+        set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        add_test(NAME rocmfp_mix_gateup_glu COMMAND test_rocmfp_mix_gateup_glu)
     endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
