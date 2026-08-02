@@ -6640,7 +6640,11 @@ bool deepseek4_step_layer_range(
             ggml_context * ctx = ggml_init(params);
             if (!ctx) return false;
 
-            const bool last_only = n_tokens > 1;
+            // The verify hook reads logits for every position, so the last-only
+            // shortcut is not available when it is set: that graph materialises a
+            // single position and the hook's n_vocab*n_tokens read runs off the end.
+            const bool want_all_logits = verify_hooks && verify_hooks->all_logits_out;
+            const bool last_only = n_tokens > 1 && !want_all_logits;
             const int output_tokens = last_only ? 1 : n_tokens;
             ggml_tensor * inp = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_embd, output_tokens);
