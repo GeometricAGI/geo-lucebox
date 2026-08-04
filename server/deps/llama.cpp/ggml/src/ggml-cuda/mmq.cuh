@@ -4506,3 +4506,7 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+// Whether an MMQ kernel exists and this arch can run it, ignoring the
+// MMQ-vs-cuBLAS performance preference. For callers that have no fallback.
+bool ggml_cuda_mmq_kernel_available(enum ggml_type type, int cc);

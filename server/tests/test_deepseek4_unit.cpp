@@ -1255,6 +1255,47 @@ static void test_hc_state_dimensions() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+// The device-side HC helpers cast hc_*_fn straight to const __half * with no
+// type dispatch. DeepSeek-V4-Flash stores that tensor as a ROCmFPX quant, and
+// reading those blocks as F16 gives NaN mix values that propagate through
+// every remaining layer and detokenize to an empty string. Guard the predicate
+// that keeps the fast path off anything but a real F16 device buffer.
+static void test_hc_fn_device_f16_gate() {
+    std::fprintf(stderr, "  test_hc_fn_device_f16_gate ...");
+
+    TEST_ASSERT(!deepseek4_hc_fn_is_device_f16(nullptr));
+
+    ggml_init_params params{};
+    params.mem_size = 16 * ggml_tensor_overhead() + 4096;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+
+    ggml_tensor * f16 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 4);
+    ggml_tensor * f32 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+    ggml_tensor * q8 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, 4);
+
+    // no_alloc leaves ->data null, which alone must disqualify the tensor.
+    TEST_ASSERT(!deepseek4_hc_fn_is_device_f16(f16));
+
+    // Point each at a scratch buffer so only the type distinguishes them.
+    std::vector<uint8_t> scratch(64 * 4 * sizeof(float), 0);
+    f16->data = scratch.data();
+    f32->data = scratch.data();
+    q8->data = scratch.data();
+
+    TEST_ASSERT(deepseek4_hc_fn_is_device_f16(f16));
+    TEST_ASSERT(!deepseek4_hc_fn_is_device_f16(f32));
+    TEST_ASSERT(!deepseek4_hc_fn_is_device_f16(q8));
+
+    f16->data = nullptr;
+    f32->data = nullptr;
+    q8->data = nullptr;
+    ggml_free(ctx);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_layer_split_request_propagates_sampler() {
     std::fprintf(stderr, "  test_layer_split_request_propagates_sampler ...");
 
@@ -3236,6 +3277,7 @@ int main() {
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();
+    test_hc_fn_device_f16_gate();
     test_layer_split_request_propagates_sampler();
     test_layer_split_sampler_uses_prompt_history();
     test_layer_split_sampler_appends_generated_tokens();
