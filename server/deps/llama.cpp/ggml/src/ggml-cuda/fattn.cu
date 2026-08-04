@@ -7,7 +7,29 @@
 #include "fattn-chunked.cuh"
 #include "fattn.cuh"
 
+// ─── DeepSeek4 D=512 MLA flash attention ────────────────────────────────
+// These kernels back --ds4-prefill dense|sparse. They are plain scalar
+// CUDA/HIP: no matrix intrinsics, no inline asm, and no wave-width arithmetic
+// (ballot masks are 64-bit and decoded with __clzll, and every lane loop
+// strides by warpSize, so wave32 and wave64 both work).
+//
+// The one non-portable spelling is the ballot itself. HIP's __ballot() takes
+// a predicate and returns a 64-bit mask; CUDA spells it __ballot_sync() with
+// an explicit participation mask and returns 32 bits. Every call site below
+// sits inside `if (tid < warpSize)` or after `if (lane >= warpSize) return`,
+// so warp 0 is fully converged and the full mask is the correct one. Zero-
+// extending the CUDA result keeps the shared `63 - __clzll(active)` decoding
+// exact: with only bits 0..31 ever set, __clzll lands in [32,63].
+//
+// Variadic because two of the predicates call ds4_fa_load<Mask, Mask>(...):
+// the preprocessor splits on that template comma, and __VA_ARGS__ puts it
+// back verbatim.
 #if defined(GGML_USE_HIP)
+#define DS4_FA_BALLOT(...) __ballot((__VA_ARGS__))
+#else
+#define DS4_FA_BALLOT(...) \
+    ((unsigned long long) __ballot_sync(0xffffffffu, (__VA_ARGS__)))
+#endif
 
 __device__ static float ds4_fa_block_sum(float v) {
     __shared__ float smem[256];
@@ -267,7 +289,7 @@ __global__ static void ds4_fa_visibility_bounds_kernel(
 
     for (int base = 0; base < raw_rows; base += warpSize) {
         const int r = base + lane;
-        const unsigned long long active = __ballot(
+        const unsigned long long active = DS4_FA_BALLOT(
             r < raw_rows &&
             ds4_fa_load<Mask, Mask>(token_mask + r) > -1.0e20f);
         if (lane == 0 && active != 0) {
@@ -279,7 +301,7 @@ __global__ static void ds4_fa_visibility_bounds_kernel(
     }
     for (int base = raw_rows; base < n_kv; base += warpSize) {
         const int r = base + lane;
-        const unsigned long long active = __ballot(
+        const unsigned long long active = DS4_FA_BALLOT(
             r < n_kv &&
             ds4_fa_load<Mask, Mask>(token_mask + r) > -1.0e20f);
         if (lane == 0 && active != 0) {
@@ -522,7 +544,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         }
         for (int base = 0; base < raw_rows; base += warpSize) {
             const int r = base + lane;
-            const unsigned long long active = __ballot(
+            const unsigned long long active = DS4_FA_BALLOT(
                 r < raw_rows && scores[r] != 0.0f);
             if (lane == 0 && active != 0) {
                 if (value_bounds[0] == raw_rows) {
@@ -533,7 +555,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         }
         for (int base = raw_rows; base < n_kv; base += warpSize) {
             const int r = base + lane;
-            const unsigned long long active = __ballot(
+            const unsigned long long active = DS4_FA_BALLOT(
                 r < n_kv && scores[r] != 0.0f);
             if (lane == 0 && active != 0) {
                 if (value_bounds[2] == n_kv) {
@@ -779,7 +801,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
             }
             for (int base = 0; base < raw_rows; base += warpSize) {
                 const int r = base + lane;
-                const unsigned long long active = __ballot(
+                const unsigned long long active = DS4_FA_BALLOT(
                     r < raw_rows &&
                     scores[(size_t) j * n_kv + r] != 0.0f);
                 if (lane == 0 && active != 0) {
@@ -791,7 +813,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
             }
             for (int base = raw_rows; base < n_kv; base += warpSize) {
                 const int r = base + lane;
-                const unsigned long long active = __ballot(
+                const unsigned long long active = DS4_FA_BALLOT(
                     r < n_kv && scores[(size_t) j * n_kv + r] != 0.0f);
                 if (lane == 0 && active != 0) {
                     if (bounds[2] == n_kv) {
@@ -1350,6 +1372,39 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
     }
 }
 
+// gfx1151 hands a workgroup its full 64 KiB of LDS with no ceremony, so the
+// launcher below sizes its kernel choice directly against that budget. CUDA
+// instead caps *dynamic* shared memory at 48 KiB per block unless the kernel
+// opts in, and counts static __shared__ against the same 48 KiB — which puts
+// the existing `group2_shmem <= 48 * 1024` bound exactly on the cliff. Raise
+// the per-kernel cap so those bounds mean on CUDA what they already mean on
+// HIP, and refuse the launch outright if even the device maximum is too small
+// rather than letting cudaLaunchKernel fail with an invalid argument.
+//
+// No-op under HIP: the request always fits and the attribute does not exist.
+static bool ds4_fa_set_dynamic_smem(const void * kernel, size_t shmem) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(kernel);
+    GGML_UNUSED(shmem);
+    return true;
+#else
+    int max_optin = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        ggml_cuda_get_device()));
+    if (shmem > (size_t) max_optin) {
+        return false;
+    }
+    if (cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int) shmem) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+#endif // defined(GGML_USE_HIP)
+}
+
 template <int HEADS_PER_BLOCK>
 static bool ds4_launch_flash_attn_d512_grouped(
         ggml_tensor       * dst,
@@ -1375,6 +1430,19 @@ static bool ds4_launch_flash_attn_d512_grouped(
     dim3 grid(
         (unsigned) n_tokens,
         (unsigned) (n_heads / HEADS_PER_BLOCK), 1);
+    // The type check below picks one of these three; raising the cap on all of
+    // them keeps the branch bodies unchanged and costs one cached driver call.
+    if (!ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_grouped_kernel<
+                half, half, HEADS_PER_BLOCK>, shmem) ||
+        !ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_grouped_kernel<
+                float, float, HEADS_PER_BLOCK>, shmem) ||
+        !ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_grouped_kernel<
+                float, half, HEADS_PER_BLOCK>, shmem)) {
+        return false;
+    }
     if (kv_f16 && (!mask || mask->type == GGML_TYPE_F16)) {
         ds4_flash_attn_d512_shared_kv_grouped_kernel<
             half, half, HEADS_PER_BLOCK>
@@ -1452,6 +1520,20 @@ static bool ds4_launch_flash_attn_d512_grouped_compact(
     dim3 grid(
         (unsigned) n_tokens,
         (unsigned) (n_heads / HEADS_PER_BLOCK), 1);
+    if (!ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
+                half, half, HEADS_PER_BLOCK, INDEXED_MASK,
+                VALUES_PER_THREAD>, shmem) ||
+        !ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
+                float, float, HEADS_PER_BLOCK, INDEXED_MASK,
+                VALUES_PER_THREAD>, shmem) ||
+        !ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
+                float, half, HEADS_PER_BLOCK, INDEXED_MASK,
+                VALUES_PER_THREAD>, shmem)) {
+        return false;
+    }
     if (kv_f16 && mask->type == GGML_TYPE_F16) {
         ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
             half, half, HEADS_PER_BLOCK, INDEXED_MASK, VALUES_PER_THREAD>
@@ -1810,6 +1892,17 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             group2_shmem, stream);
     }
 
+    // The single-head fallback sizes its scratch straight off n_kv, so it is
+    // the one path whose shared-memory request grows without bound with
+    // context length. Same treatment as the grouped launchers above.
+    if (!ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_kernel<half, half>, shmem) ||
+        !ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_kernel<float, float>, shmem) ||
+        !ds4_fa_set_dynamic_smem((const void *)
+            ds4_flash_attn_d512_shared_kv_kernel<float, half>, shmem)) {
+        return false;
+    }
     if (kv_f16 && (!mask || mask->type == GGML_TYPE_F16)) {
         ds4_flash_attn_d512_shared_kv_kernel<half, half>
             <<<grid, 256, shmem, stream>>>(
@@ -1851,8 +1944,6 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     }
     return true;
 }
-
-#endif // defined(GGML_USE_HIP)
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2418,14 +2509,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     if (ggml_flash_attn_ext_is_ds4(dst)) {
-#if defined(GGML_USE_HIP)
         if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {
             GGML_ABORT("unsupported DeepSeek4 D=512 flash-attention contract");
         }
         return;
-#else
-        GGML_ABORT("DeepSeek4 D=512 flash attention is only available on HIP");
-#endif // defined(GGML_USE_HIP)
     }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
@@ -2450,11 +2537,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (ggml_flash_attn_ext_is_ds4(dst)) {
-#if defined(GGML_USE_HIP)
         return ggml_cuda_ds4_flash_attn_d512_f32_supported(dst);
-#else
-        return false;
-#endif // defined(GGML_USE_HIP)
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

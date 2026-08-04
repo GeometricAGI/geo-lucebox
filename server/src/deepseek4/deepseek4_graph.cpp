@@ -4444,10 +4444,16 @@ bool deepseek4_step(
 // while a variant recurs, which is what the ggml-cuda/HIP graph cache keys
 // on, enabling graph replay for the bulk of decode steps.
 
-static bool ds4_fused_decode_enabled() {
-    static const bool enabled =
+// Two independent enables. w.fused_decode carries --ds4-fused-decode through
+// DeepSeek4BackendConfig; DFLASH_DS4_FUSED_DECODE predates the flag and stays
+// live on its own, so a deployment that sets the env var keeps the behaviour
+// it has today regardless of how the server was invoked. Until this read the
+// flag was inert on every backend: it reached w.fused_decode and was only
+// printed in the ready banner.
+static bool ds4_fused_decode_enabled(const DeepSeek4Weights & w) {
+    static const bool env_enabled =
         ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
-    return enabled;
+    return w.fused_decode || env_enabled;
 }
 
 struct DeepSeek4FusedDecodeGraph {
@@ -6760,7 +6766,7 @@ bool deepseek4_step_layer_range(
     if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         !(verify_hooks && verify_hooks->capture_layer_ids &&
           verify_hooks->capture_out) &&
-        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled()) {
+        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled(w)) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
