@@ -2946,9 +2946,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     if (grouped_src) {
         // Only MMQ's grouped activation quantizer understands the physical
-        // [K/group,N,group] source layout.
+        // [K/group,N,group] source layout. use_mul_mat_q carries the
+        // MMQ-vs-cuBLAS preference, which is meaningless here because there is
+        // no cuBLAS path to prefer: DS4's grouped output projection reached
+        // this assert on sm_90 purely because should_use_mmq() declines
+        // ROCmFPX outside RDNA3.5/RDNA4. Ask the capability question instead.
         GGML_ASSERT(!split);
-        GGML_ASSERT(use_mul_mat_q);
+        GGML_ASSERT(ggml_cuda_mmq_kernel_available(
+            src0->type, ggml_cuda_info().devices[ctx.device].cc));
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
@@ -5884,8 +5889,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            physical->ne[3] == 1 &&
                            b->ne[0] % (4 * QK8_1) == 0 &&
                            ggml_is_contiguous(physical) &&
-                           ggml_cuda_should_use_mmq(
-                               a->type, cc, b->ne[1], /*n_experts=*/0);
+                           ggml_cuda_mmq_kernel_available(a->type, cc);
                 }
                 if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
                     if (a->ne[2] > 1 || a->ne[3] > 1) {

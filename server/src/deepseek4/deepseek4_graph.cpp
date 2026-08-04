@@ -3771,6 +3771,10 @@ static bool ds4_hc_cuda_enabled() {
 #endif
 }
 
+// Defined below; the CUDA HC fast paths need its F16 check before it appears.
+static const void * hc_fn_device_ptr(const HcWeightsCpu & weights,
+                                     ggml_tensor * fn);
+
 static HcPreResult hc_pre_auto(const float * hc_state,
                                const HcWeightsCpu & weights,
                                ggml_tensor * fn_tensor,
@@ -3779,14 +3783,22 @@ static HcPreResult hc_pre_auto(const float * hc_state,
                                int sinkhorn_iters,
                                float hc_eps) {
 #if defined(DFLASH27B_BACKEND_CUDA)
-    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
-        float mix[24];
-        if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
-                                      n_embd, n_hc, hc_eps, mix)) {
-            return finish_hc_pre_from_mix(hc_state, mix,
-                                          weights.scale_data.data(),
-                                          weights.base_data.data(),
-                                          n_embd, n_hc, sinkhorn_iters);
+    // hc_fn_device_ptr(), not fn_tensor->data: deepseek4_cuda_hc_pre_mix()
+    // casts the pointer straight to const __half *, so it is only meaningful
+    // for an F16 tensor. DeepSeek-V4-Flash stores hc_*_fn as a ROCmFPX quant,
+    // and reading those blocks as F16 yields NaN mix values that poison the
+    // whole forward pass. The CPU fallback below reads weights.fn_data, which
+    // load_tensor_to_f16_cpu() converted properly.
+    if (ds4_hc_cuda_enabled()) {
+        if (const void * fn_f16 = hc_fn_device_ptr(weights, fn_tensor)) {
+            float mix[24];
+            if (deepseek4_cuda_hc_pre_mix(hc_state, fn_f16,
+                                          n_embd, n_hc, hc_eps, mix)) {
+                return finish_hc_pre_from_mix(hc_state, mix,
+                                              weights.scale_data.data(),
+                                              weights.base_data.data(),
+                                              n_embd, n_hc, sinkhorn_iters);
+            }
         }
     }
 #else
@@ -3811,15 +3823,18 @@ static void hc_pre_auto_into(float * working,
                              float * mix_scratch,
                              bool serial_fn) {
 #if defined(DFLASH27B_BACKEND_CUDA)
-    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
-        float mix[24];
-        if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
-                                      n_embd, n_hc, hc_eps, mix)) {
-            finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
-                                        weights.scale_data.data(),
-                                        weights.base_data.data(),
-                                        n_embd, n_hc, sinkhorn_iters);
-            return;
+    // Same F16-only contract as hc_pre_auto() above.
+    if (ds4_hc_cuda_enabled()) {
+        if (const void * fn_f16 = hc_fn_device_ptr(weights, fn_tensor)) {
+            float mix[24];
+            if (deepseek4_cuda_hc_pre_mix(hc_state, fn_f16,
+                                          n_embd, n_hc, hc_eps, mix)) {
+                finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
+                                            weights.scale_data.data(),
+                                            weights.base_data.data(),
+                                            n_embd, n_hc, sinkhorn_iters);
+                return;
+            }
         }
     }
 #else
@@ -4051,10 +4066,16 @@ struct DeepSeek4HybridRuntime {
 
 static thread_local DeepSeek4HybridRuntime ds4_hybrid_runtime;
 
+bool deepseek4_hc_fn_is_device_f16(const ggml_tensor * fn) {
+    return fn != nullptr && fn->data != nullptr &&
+           fn->type == GGML_TYPE_F16;
+}
+
+// The device-side HC helpers all read this buffer as packed F16. Anything
+// else — DeepSeek-V4-Flash quantizes hc_*_fn to ROCmFPX — has to go through
+// the converted host mirror instead.
 static const void * hc_fn_device_ptr(const HcWeightsCpu &, ggml_tensor * fn) {
-    if (!fn) return nullptr;
-    if (fn->type == GGML_TYPE_F16) return fn->data;
-    return nullptr;
+    return deepseek4_hc_fn_is_device_f16(fn) ? fn->data : nullptr;
 }
 
 static bool load_hash_routing_cpu(HashRoutingTableCpu & dst, ggml_tensor * table) {

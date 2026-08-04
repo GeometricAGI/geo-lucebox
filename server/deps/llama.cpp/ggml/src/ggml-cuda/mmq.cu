@@ -642,6 +642,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // that contract; the latter is required by the grouped DS4
             // prefill projection because no BLAS path understands its
             // strided [K/group, N, group] activation layout.
+            //
+            // This is a preference, not a capability: the kernels themselves
+            // build and run anywhere (the ROCmFPX unpackers have portable
+            // non-HIP branches and the vec-dots are the stock Q8_0/Q8_0_16
+            // ones), so NVIDIA keeps its dequantize->cuBLAS path here but can
+            // still reach MMQ through ggml_cuda_mmq_kernel_available() where
+            // there is no alternative.
             mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc) ||
                             GGML_CUDA_CC_IS_RDNA4(cc);
             break;
@@ -765,4 +772,28 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_mmq_kernel_available(enum ggml_type type, int cc) {
+    // "Is there an MMQ kernel that will run here", as opposed to
+    // ggml_cuda_should_use_mmq()'s "is MMQ the faster choice". Callers with no
+    // fallback want this one: a grouped [K/group, N, group] source has no
+    // cuBLAS or dequantize path at all, so refusing MMQ there is not a
+    // performance decision, it is an abort.
+    switch (type) {
+        case GGML_TYPE_Q2_0_ROCMFP2:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            break;
+        default:
+            return ggml_cuda_should_use_mmq(type, cc, /*ne11=*/1,
+                                            /*n_experts=*/0);
+    }
+    // The three ROCmFPX types are the only ones should_use_mmq() turns down on
+    // capability-neutral grounds. Their MMQ instances are compiled for every
+    // backend, the tile loaders are written against
+    // ggml_cuda_get_physical_warp_size(), and the packed-int unpackers fall
+    // back to make_char4() wherever __builtin_amdgcn_perm is unavailable, so
+    // the requirement is just an arch that can run MMQ at all.
+    return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A;
 }

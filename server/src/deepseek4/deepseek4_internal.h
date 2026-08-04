@@ -332,6 +332,13 @@ void free_deepseek4_weights(DeepSeek4Weights & w);
 // This must run before the owning ggml context is destroyed.
 void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w);
 
+// Whether an hc_*_fn tensor may be handed to the device-side HC helpers.
+// Those read the buffer as packed F16 with no type dispatch, so a quantized
+// hc_*_fn (DeepSeek-V4-Flash stores ROCmFPX there) must take the host mirror
+// that load_tensor_to_f16_cpu() converted instead. Reading quant blocks as
+// F16 produces NaN, and one NaN in the HC mix poisons every later layer.
+bool deepseek4_hc_fn_is_device_f16(const ggml_tensor * fn);
+
 bool create_deepseek4_cache(ggml_backend_t backend,
                              const DeepSeek4Weights & w,
                              int max_ctx,
