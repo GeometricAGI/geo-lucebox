@@ -2578,8 +2578,18 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
+    // qtype-105 (Q3_1_ROCMFP3_MIX) and qtype-106 (Q2_1_ROCMFP2_MIX) have no
+    // MMVQ case: their per-expert codebook lives in an out-of-band registry
+    // the block-local quant kernels cannot reach, exactly as the plain
+    // mul_mat path documents. Without this exclusion a mix qtype whose fused
+    // ROCmFPX GLU launcher declined above (unregistered codebook, shape the
+    // direct-vector layout does not cover) falls through to
+    // ggml_cuda_mul_mat_vec_q and dies on its default GGML_ABORT.
+    const bool is_mix_qtype = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX ||
+                              src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const int64_t ncols_dst = is_mul_mat_id ? dst->ne[2] : src1->ne[1];
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype &&
+                             !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
 

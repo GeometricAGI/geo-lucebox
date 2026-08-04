@@ -506,7 +506,23 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
+// Types that ggml_cuda_mul_mat_vec_q()'s switch does not implement -- it ends
+// at GGML_ABORT for them. Every per-architecture table below records this as a
+// 0 ceiling, but the NVIDIA shortcuts in get_mmvq_mmid_max_batch() return a
+// fixed ceiling without consulting the type at all, so on Volta / Ada / Hopper
+// / Blackwell the tables never get a say. Hence the check has to come first.
+//
+// This is why the abort was NVIDIA-only: every AMD branch reads its table and
+// correctly reports 0, sending these through dequantize->cuBLAS as intended.
+static constexpr bool mmvq_type_has_no_kernel(ggml_type type) {
+    return type == GGML_TYPE_Q3_1_ROCMFP3_MIX ||
+           type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+}
+
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    if (mmvq_type_has_no_kernel(type)) {
+        return 0;
+    }
     // [TAG_MMID_GROUPED] the grouped kernel handles any supported type up to the
     // MoE batch ceiling; this also keeps CUDA graphs on for these batches.
     // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.
