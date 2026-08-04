@@ -207,16 +207,13 @@ std::string check_feature_compatibility(
                arch + "')";
     }
 
-    // Approximate prefill and fused decode are implemented only in the
-    // monolithic HIP DeepSeek4 backend. Expert top-k is model policy handled
-    // by either monolithic backend, but the layer-split adapter does not yet
-    // propagate it.
+    // Approximate prefill and the fused decode options are implemented only in
+    // the monolithic DeepSeek4 backend. Both build one graph spanning the whole
+    // layer stack, which requires every layer's weights on a single device: the
+    // layer-split adapter and the remote target shard have no equivalent. The
+    // restriction is about placement, not about the GPU vendor — the layer-major
+    // prefill and fused decode graphs both dispatch on ds4_backend_is_gpu().
     const bool monolithic_ds4 =
-        arch == "deepseek4" &&
-        target_backend == PlacementBackend::Hip &&
-        !args.device.is_layer_split() &&
-        !args.remote_target_shard.enabled();
-    const bool local_ds4 =
         arch == "deepseek4" &&
         !args.device.is_layer_split() &&
         !args.remote_target_shard.enabled();
@@ -227,20 +224,17 @@ std::string check_feature_compatibility(
         !monolithic_ds4) {
         return std::string("DS4 ") +
                prefill_attention_mode_name(args.ds4_prefill_mode) +
-               " prefill requires a single local HIP target; use "
-               "--ds4-prefill exact for split, remote, or CUDA placement";
+               " prefill runs the whole layer stack as one layer-major graph "
+               "and needs every layer on one device; use --ds4-prefill exact "
+               "for split or remote target placement";
     }
 
-    // ── --ds4-fused-decode × placement
-    if (args.ds4_fused_decode && !monolithic_ds4) {
-        return "--ds4-fused-decode currently requires single-device HIP "
-               "DeepSeek4";
-    }
-
-    // ── --ds4-expert-top-k × architecture/adapter
-    if (args.ds4_expert_top_k != 0 && !local_ds4) {
-        return "--ds4-expert-top-k currently requires a single local "
-               "DeepSeek4 backend";
+    // ── --ds4-fused-decode / --ds4-expert-top-k × placement
+    if ((args.ds4_fused_decode || args.ds4_expert_top_k != 0) &&
+        !monolithic_ds4) {
+        return "--ds4-fused-decode and --ds4-expert-top-k need a single-device "
+               "DeepSeek4 target; the layer-split adapter and remote target "
+               "shards have no fused-decode graph";
     }
 
     return {};

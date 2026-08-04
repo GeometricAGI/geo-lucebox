@@ -243,20 +243,30 @@ static void test_feature_gate_ds4_prefill_requires_deepseek4() {
         args, "deepseek4", PlacementBackend::Hip).empty());
 }
 
-static void test_feature_gate_approximate_ds4_prefill_requires_local_hip() {
+static void test_feature_gate_approximate_ds4_prefill_requires_monolithic() {
     BackendArgs args = gate_args_hip_deepseek4();
     args.ds4_prefill_mode_set = true;
     args.ds4_prefill_mode = PrefillAttentionMode::Sparse;
 
-    // CUDA has no approximate prefill path.
-    TEST_ASSERT(!gate_result(
-        args, "deepseek4", PlacementBackend::Cuda).empty());
+    // The restriction is placement, not vendor: a single local CUDA target
+    // runs the same layer-major prefill graph as a single local HIP one.
+    BackendArgs cuda = args;
+    cuda.device.backend = PlacementBackend::Cuda;
+    TEST_ASSERT(gate_result(
+        cuda, "deepseek4", PlacementBackend::Cuda).empty());
 
-    // Neither does the layer-split adapter, even on HIP.
+    // The layer-split adapter has no layer-major prefill, on either backend.
     BackendArgs split = args;
     TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", split.device));
     TEST_ASSERT(!gate_result(
         split, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs split_cuda = args;
+    split_cuda.device.backend = PlacementBackend::Cuda;
+    TEST_ASSERT(parse_placement_device_list(
+        "cuda:0,cuda:1", split_cuda.device));
+    TEST_ASSERT(!gate_result(
+        split_cuda, "deepseek4", PlacementBackend::Cuda).empty());
 
     // Nor a remote target shard.
     BackendArgs remote = args;
@@ -264,7 +274,7 @@ static void test_feature_gate_approximate_ds4_prefill_requires_local_hip() {
     TEST_ASSERT(!gate_result(
         remote, "deepseek4", PlacementBackend::Hip).empty());
 
-    // Single local HIP device is the supported placement.
+    // Single local HIP device is still supported.
     TEST_ASSERT(gate_result(
         args, "deepseek4", PlacementBackend::Hip).empty());
 
@@ -276,13 +286,30 @@ static void test_feature_gate_approximate_ds4_prefill_requires_local_hip() {
         exact, "deepseek4", PlacementBackend::Cuda).empty());
 }
 
-static void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
+static void test_feature_gate_ds4_decode_options_require_monolithic() {
     BackendArgs fused = gate_args_hip_deepseek4();
     fused.ds4_fused_decode = true;
-    TEST_ASSERT(!gate_result(
-        fused, "deepseek4", PlacementBackend::Cuda).empty());
     TEST_ASSERT(gate_result(
         fused, "deepseek4", PlacementBackend::Hip).empty());
+
+    // Fused decode and expert top-k are graph-shape options, not HIP kernels:
+    // a single local CUDA target accepts both.
+    BackendArgs fused_cuda = fused;
+    fused_cuda.device.backend = PlacementBackend::Cuda;
+    TEST_ASSERT(gate_result(
+        fused_cuda, "deepseek4", PlacementBackend::Cuda).empty());
+
+    // A split or remote target still has no fused-decode graph.
+    BackendArgs fused_split = fused;
+    TEST_ASSERT(parse_placement_device_list(
+        "hip:0,hip:1", fused_split.device));
+    TEST_ASSERT(!gate_result(
+        fused_split, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs fused_remote = fused;
+    fused_remote.remote_target_shard.ipc_bin = "/usr/bin/shard";
+    TEST_ASSERT(!gate_result(
+        fused_remote, "deepseek4", PlacementBackend::Hip).empty());
 
     BackendArgs topk = gate_args_hip_deepseek4();
     topk.ds4_expert_top_k = 4;
@@ -575,8 +602,8 @@ int main() {
     RUN_TEST(test_feature_gate_validates_target_split_topology);
     RUN_TEST(test_feature_gate_tensor_parallel_requirements);
     RUN_TEST(test_feature_gate_ds4_prefill_requires_deepseek4);
-    RUN_TEST(test_feature_gate_approximate_ds4_prefill_requires_local_hip);
-    RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);
+    RUN_TEST(test_feature_gate_approximate_ds4_prefill_requires_monolithic);
+    RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic);
     RUN_TEST(test_feature_gate_remote_draft_requires_supported_arch);
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
     RUN_TEST(test_feature_gate_paged_attention_requires_qwen35_monolithic);

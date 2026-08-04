@@ -682,14 +682,14 @@ bool DeepSeek4Backend::validate_prefill_mode() const {
     if (cfg_.prefill_mode == PrefillAttentionMode::Exact) {
         return true;
     }
-    const PlacementBackend target_backend =
-        cfg_.device.backend == PlacementBackend::Auto
-            ? compiled_placement_backend()
-            : cfg_.device.backend;
-    if (target_backend != PlacementBackend::Hip ||
-        cfg_.device.is_layer_split()) {
+    // Layer-major prefill chains every layer into one graph, so it needs the
+    // whole stack on one device. It has no vendor requirement: the graph is
+    // selected by ds4_backend_is_gpu() and the D=512 attention kernels build
+    // for CUDA and HIP alike.
+    if (cfg_.device.is_layer_split()) {
         std::fprintf(stderr,
-            "[deepseek4] %s prefill requires a single HIP target\n",
+            "[deepseek4] %s prefill needs every layer on one device; "
+            "the layer-split adapter has no layer-major prefill graph\n",
             prefill_attention_mode_name(cfg_.prefill_mode));
         return false;
     }
@@ -715,8 +715,11 @@ bool DeepSeek4Backend::load_model() {
     const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
     const bool need_monolithic =
         requires_monolithic_model() && !heterogeneous_tp;
-    if (target_backend == PlacementBackend::Hip &&
-        (force_full || need_monolithic)) {
+    // The monolithic requirement follows from the requested serving options,
+    // not from the vendor. Previously only HIP could take this branch, so a
+    // CUDA target that asked for fused decode or approximate prefill silently
+    // fell through to the hybrid fallback below and lost both.
+    if (force_full || need_monolithic) {
         std::fprintf(stderr,
                      "[deepseek4] monolithic execution requested "
                      "(forced=%s, fused_decode=%s, prefill=%s)\n",
@@ -726,12 +729,12 @@ bool DeepSeek4Backend::load_model() {
         if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
             if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
                 std::fprintf(stderr,
-                    "[deepseek4] monolithic HIP load required for %s prefill\n",
+                    "[deepseek4] monolithic load required for %s prefill\n",
                     prefill_attention_mode_name(cfg_.prefill_mode));
                 return false;
             }
             std::fprintf(stderr,
-                         "[deepseek4] explicit HIP full-model load failed: %s\n",
+                         "[deepseek4] explicit full-model load failed: %s\n",
                          cfg_.model_path);
             return false;
         }
