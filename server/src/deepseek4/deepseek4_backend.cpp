@@ -624,20 +624,37 @@ bool DeepSeek4Backend::init_hybrid_model() {
     // Fail at load with a clear message instead of starting a server that
     // crashes or emits garbage at first decode. (The all-hot case above reloads
     // the full monolithic model and never reaches here.)
+    // ... and the same applies to qtype-106 (Q2_1_ROCMFP2_MIX) on ANY expert
+    // surface (gate/up/down): its codebook registry keys the resident tensor,
+    // which hybrid slicing destroys, and there is no CPU vec_dot either. But
+    // refusing outright is wrong when the MONOLITHIC footprint fits the device
+    // -- the mix formats are 2.5-3.5 bpw precisely so the whole file fits where
+    // a hybrid split of a larger quant was needed. Mirror the all-hot branch:
+    // drop the partial load and attempt the full load, failing with the
+    // allocator's error if it genuinely does not fit.
     for (const auto & L : w_.layers) {
-        if (L.ffn_down_exps &&
-            L.ffn_down_exps->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        const bool mix =
+            (L.ffn_down_exps &&
+             (L.ffn_down_exps->type == GGML_TYPE_Q3_1_ROCMFP3_MIX ||
+              L.ffn_down_exps->type == GGML_TYPE_Q2_1_ROCMFP2_MIX)) ||
+            (L.ffn_gate_exps &&
+             L.ffn_gate_exps->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) ||
+            (L.ffn_up_exps &&
+             L.ffn_up_exps->type == GGML_TYPE_Q2_1_ROCMFP2_MIX);
+        if (!mix) {
+            continue;
+        }
+        std::fprintf(stderr,
+            "[deepseek4] mixed-codebook experts (qtype 105/106) cannot decode "
+            "from hybrid/cold placement; falling back to monolithic full load\n");
+        free_deepseek4_weights(w_);
+        if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
             std::fprintf(stderr,
-                "[deepseek4] qtype-105 (mixed ROCmFP3) experts require monolithic "
-                "residency — hybrid/cold expert placement cannot decode them. "
-                "Enable fused decode or provide enough VRAM to keep all experts "
-                "resident.\n");
-            // Release the weights this hybrid attempt already loaded before
-            // bailing, so w_ is left empty rather than holding a live context +
-            // GPU buffer on the failure path.
-            free_deepseek4_weights(w_);
+                "[deepseek4] monolithic fallback failed (model does not fit "
+                "resident): %s\n", cfg_.model_path);
             return false;
         }
+        return true;
     }
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
