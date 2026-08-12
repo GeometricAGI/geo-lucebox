@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "mix-mmq.h"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
@@ -472,9 +473,18 @@ void ggml_cuda_op_mul_mat_q(
 }
 
 #ifndef GGML_CUDA_MIX_MMQ_DEFAULT
-// Default OFF until the correctness gate (test_rocmfp_mix_mmq) has run on both
-// vendors; flipped on once it does.
-#define GGML_CUDA_MIX_MMQ_DEFAULT false
+// ON by default. Gated on:
+//   - test_rocmfp_mix_mmq (MMQ vs the validated matvec kernel, 1% relative-rms
+//     bar) passing on gfx1151, gfx1201 and NVIDIA;
+//   - muse-glimmer r1 scoring 103/122 on the agentic golden suite with MMQ on,
+//     against 101/122 for the AR baseline, at 81.0 tok/s vs 43.5 with MMQ off.
+// Set DFLASH_MIX_MMQ=0 to fall back to dequantize-to-bf16 + dense GEMM.
+//
+// Note this default is a no-op for DS4: its 105/106 tensors are MoE experts
+// reached through ggml_mul_mat_id, which does not take the MMQ path. Measured
+// inert, not measured correct — six serving configs and a 3974-token prefill
+// were byte-identical with the flag on and off.
+#define GGML_CUDA_MIX_MMQ_DEFAULT true
 #endif
 
 // ── Batched path for the mix qtypes (105/106) ───────────────────────────

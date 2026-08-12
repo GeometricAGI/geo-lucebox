@@ -253,13 +253,14 @@ on each one. Quality is inside the ±2 band the suite is noisy to. This is why
 the 1.20× measured on a short chat set understates the effect on real
 reasoning/code traffic.
 
-**`muse-lowbpw-r1` + `--draft` needs `DFLASH_DS4_MIX_MMQ_PREFILL=1`.** Without
-it, `ne11 > 1` for qtypes 105/106 falls back to dequantize-to-bf16 + dense
+**Mix MMQ is on by default** (`DFLASH_MIX_MMQ=0` to disable; the old
+`DFLASH_DS4_MIX_MMQ_PREFILL` spelling is still read as a fallback). With it
+off, `ne11 > 1` for qtypes 105/106 falls back to dequantize-to-bf16 + dense
 GEMM — **48% of a 16-token verify's GPU time sits in
 `dequantize_rocmfp{2,3}_mix_kernel`** (nsys), i.e. the multiply throws away the
 3.3 bpw artifact and runs 16-bit. Batched MMQ kernels for both mix qtypes
 already exist and already plumb the out-of-band codebooks; they were simply
-gated to RDNA3.5/RDNA4 behind that env var. Enabling it:
+gated behind that env var. Enabling it:
 
 | | verify tok/s | vs AR | drift | verify == sequential |
 |---|---|---|---|---|
@@ -272,6 +273,13 @@ gated to RDNA3.5/RDNA4 behind that env var. Enabling it:
 verify), and it is *more* numerically faithful, because the dequant path rounds
 through bf16 where MMQ keeps integer dot products. On CUDA it is 1.20× and r1
 remains a net loss.
+
+**The default flip is a no-op for DS4**, despite the flag's original name. DS4's
+105/106 tensors are MoE experts reached through `ggml_mul_mat_id`, which does not
+take the MMQ path — so the flag was measured *inert* there, not measured correct.
+Six serving configs (11-token prompts) and a 3974-token prefill were byte-identical
+with it on and off, the long prefill landing at 184.1 s ±0.1% either way. The
+evidence backing the default is muse's, not DS4's.
 
 **Why CUDA gains less, measured rather than guessed.** The mix types already
 have an MMA tile and already use it on NVIDIA: `vec_dot_mma` is
