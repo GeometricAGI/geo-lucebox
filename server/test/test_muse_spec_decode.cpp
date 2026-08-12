@@ -172,10 +172,15 @@ int main() {
     // margins fall inside the drift band within a few tokens (measured:
     // position 1 at margin 0.23), which makes it useless for identity but
     // representative for the acceptance rate.
+    // Numeric counting rather than words: the continuation is as close to
+    // forced as this model gets, which keeps the top-2 margins far outside the
+    // drift band for a long run. Word-counting was tried first and its margins
+    // fell inside the band by position 19 on gfx1201, where the kernels are
+    // noisiest — not wrong, just too little coverage to prove anything.
     const std::vector<int32_t> prompt_identity = make_prompt(
         have_tok ? &tok : nullptr,
-        "Count in words, one per line.\none\ntwo\nthree\nfour\nfive\nsix\n"
-        "seven\neight\nnine\nten\neleven\ntwelve\n",
+        "Continue this sequence, one number per line, nothing else.\n"
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n",
         prompt_len, 1000);
     const std::vector<int32_t> prompt = make_prompt(
         have_tok ? &tok : nullptr,
@@ -296,6 +301,27 @@ int main() {
     }
     check_identity("natural-prompt", ar, sp, /*min_coverage=*/1);
 
+    // Throughput has to be measured with the instrumentation OFF. Collecting
+    // margins forces verify_batch to keep its full [16 x 202048] f32 logits
+    // (13 MB per round) and adds a host-side top-2 scan over all of it, which
+    // on gfx1201 turned a real ~0.6x into a reported 0.32x. Every number below
+    // comes from this uninstrumented pair.
+    RunOut ar_t, sp_t;
+    {
+        GenerateRequest req;
+        req.prompt = prompt; req.n_gen = n_gen; req.do_sample = false;
+        DaemonIO io;
+        be.spec_collect_margins(nullptr);
+        req.force_ar_decode = true;
+        GenerateResult r1 = be.generate(req, io);
+        req.force_ar_decode = false;
+        GenerateResult r2 = be.generate(req, io);
+        if (!r1.ok() || !r2.ok()) { fail("uninstrumented timing pass failed"); }
+        ar_t.decode_s = r1.decode_s; ar_t.tokens = r1.tokens;
+        sp_t.decode_s = r2.decode_s; sp_t.tokens = r2.tokens;
+        sp_t.accept_rate = r2.accept_rate;
+    }
+
     // Control: the comparison above must be capable of failing. Two streams
     // that are both one EOS token long match trivially.
     if (ar.tokens.size() < 8) {
@@ -361,11 +387,13 @@ int main() {
         }
     }
 
-    std::printf("\nacceptance: %.1f%% (%d tokens, %.3f s spec vs %.3f s AR, "
-                "%.2fx)\n",
-                100.0 * sp.accept_rate, (int)sp.tokens.size(),
-                sp.decode_s, ar.decode_s,
-                sp.decode_s > 0.0 ? ar.decode_s / sp.decode_s : 0.0);
+    std::printf("\nuninstrumented: acceptance %.1f%% over %d tokens; decode "
+                "%.3f s spec vs %.3f s AR = %.2fx (%.1f vs %.1f tok/s)\n",
+                100.0 * sp_t.accept_rate, (int)sp_t.tokens.size(),
+                sp_t.decode_s, ar_t.decode_s,
+                sp_t.decode_s > 0.0 ? ar_t.decode_s / sp_t.decode_s : 0.0,
+                sp_t.decode_s > 0.0 ? sp_t.tokens.size() / sp_t.decode_s : 0.0,
+                ar_t.decode_s > 0.0 ? ar_t.tokens.size() / ar_t.decode_s : 0.0);
 
     be.shutdown();
 
