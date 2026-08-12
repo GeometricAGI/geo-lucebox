@@ -213,6 +213,36 @@ D AR steps it replaces, and on these AMD kernels it does not — the same
 batched-GEMM weakness the dense mix matvec work exposed from the other
 direction. The backend prints the measured ratio for its platform at startup.
 
+**It also depends on the artifact, and one pairing is a trap.** Same drafter,
+same H200, same prompts; only the target changes:
+
+| target | GB | accept | AR tok/s | draft tok/s | ratio |
+|---|---|---|---|---|---|
+| bf16 | 55.73 | 0.225 | 55.0 | 121.7 | **2.21×** |
+| official kquant-17gb | 16.76 | 0.222 | 73.4 | 114.7 | 1.56× |
+| `muse-v4` | 16.76 | 0.182 | 70.7 | 91.1 | 1.29× |
+| `muse-lowbpw-r1` | 11.50 | 0.181 | 52.6 | 43.5 | **0.83×** |
+
+Acceptance barely moves across these (0.18–0.23); the ratio moves 2.7×. What
+predicts the payoff is AR-step cost ÷ batched-verify cost — bf16 wins *because*
+its AR step is expensive enough to amortise the block.
+
+**Do not combine `--draft` with `muse-lowbpw-r1`:** it is a slowdown even on
+CUDA. The qtype-105/106 kernels were tuned for the batch-1 matvec path (the
+2.06× win recorded below); nothing serves batch 16, so the verify is
+disproportionately expensive. Speculative decode currently wants a K-quant
+artifact on CUDA.
+
+**Acceptance rate is not a quality signal.** A deliberately broken 9.2 GB
+`q2k-pure` control scored the *highest* mean acceptance of any artifact tested
+(0.246, above bf16) while emitting 256 tokens of empty visible output — a
+degenerate model is trivially draftable. Full write-up in the geo-quant
+research log; do not use acceptance to rank artifacts.
+
+**Unsloth GGUFs do not load here** (`GGML_ASSERT(buf != NULL && "tensor buffer
+not set")` for both UD-Q4_K_XL and UD-IQ2_XS). The muse loader binds the tensor
+set our own and the first-party builds carry; use llama.cpp for those.
+
 On CUDA it is still short of the vendor's 3.1× llama.cpp figure, for two
 measured reasons:
 
