@@ -70,8 +70,21 @@ port afterthought:
   CPU-only and backend-agnostic, so they run identically under the CUDA and
   HIP builds. The capability-table row lands with S2 — it is cross-checked
   at compile time against a backend config struct that does not exist yet.
-- **S2 — loader.** Tensor map for the muse topology including `attn_gate`,
-  reusing the gemma4 loader's norm/SWA/softcap plumbing.
+- **S2 — loader. DONE.** `src/muse/{muse_internal.h,muse_loader.cpp}`:
+  hparams, interleaved-SWA pattern, tokenizer ids, and the per-layer tensor
+  map including `attn_gate`. Dense-only — none of gemma4's MoE / per-layer
+  embedding / KV-sharing machinery. Verified against BOTH shipped artifacts
+  (`test_muse_loader`, `MUSE_GGUF=…`, skips without one): 52 layers, 6656 /
+  19968, 32q-2kv @128, vocab 202048, window 2048, softcap 20.0,
+  logit_scale 0.1961, and 39/52 SWA layers from the period-8 pattern. Two
+  traps it closes: the pattern array is 8 long for 52 layers (read as
+  per-layer, 44 layers silently get the wrong span), and the lm_head is
+  UNTIED — falling back to `token_embd` would still emit fluent text, so
+  the loader refuses instead. `<|eom|>` has no KV key and is resolved from
+  the token list (200007); without it the ATEM sampler cannot end a
+  reasoning turn or a chained tool call.
+  Note for S4: the 105/106 artifact already loads here — lucebox's ggml
+  knows those qtypes — so S4 is sidecar registration, not type plumbing.
 - **S3 — graph.** Dense 52-layer forward with the attn-gate node, softcap,
   logit scale. Numerical parity target: logits vs `llama.cpp` on the
   `muse-rocmfpx-cuda` branch for a fixed prompt.

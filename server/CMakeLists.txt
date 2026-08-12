@@ -363,6 +363,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/muse
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
@@ -381,6 +382,7 @@ add_library(dflash_common STATIC
     src/qwen3/qwen3_graph.cpp
     src/qwen3/qwen3_backend.cpp
     src/qwen3/qwen3_daemon.cpp
+    src/muse/muse_loader.cpp
     src/gemma4/gemma4_loader.cpp
     src/gemma4/gemma4_graph.cpp
     src/gemma4/gemma4_backend.cpp
@@ -1450,6 +1452,18 @@ if(DFLASH27B_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     list(APPEND _raw_unit_test_targets test_qwen35_split_tree_guard)
 
+    # Muse-Glimmer loader against a real artifact (skips without MUSE_GGUF).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_muse_loader.cpp")
+        add_executable(test_muse_loader test/test_muse_loader.cpp)
+        target_include_directories(test_muse_loader PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/muse
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        target_link_libraries(test_muse_loader PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_muse_loader)
+    endif()
+
     # ── Muse-Glimmer ATEM chat format (CPU-only; backend-agnostic) ──
     # Two levels: a grammar unit test, and a byte-exact comparison against
     # prompts rendered by the MODEL's own chat template (fixtures under
@@ -1632,6 +1646,11 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name paged_kv_pool)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
+                if(_unit_target STREQUAL "test_muse_loader")
+                    # Exit 77 = skipped (no artifact on this machine).
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES
+                        SKIP_RETURN_CODE 77)
+                endif()
                 if(_unit_target STREQUAL "test_muse_atem_reference_prompts")
                     # Fixtures live with the sources, not in the build tree.
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES
