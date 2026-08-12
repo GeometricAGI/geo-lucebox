@@ -252,12 +252,33 @@ gated to RDNA3.5/RDNA4 behind that env var. Enabling it:
 **On AMD this flips speculative decode from a loss to a win** (1.7–1.9× on the
 verify), and it is *more* numerically faithful, because the dequant path rounds
 through bf16 where MMQ keeps integer dot products. On CUDA it is 1.20× and r1
-remains a net loss — the profile shows why: dequant disappears, but the mix MMQ
-kernel itself costs ~554 µs against ~90 µs for a K-quant MMQ of comparable
-shape. The mix types get no MMA tile on NVIDIA (`GGML_CUDA_ROCMFPX_MMQ_TILE` is
-never defined and the tile choice is gated to RDNA), so that is where new
-kernel work would actually pay — not in writing a batched path, which exists,
-but in giving it a tensor-core tile.
+remains a net loss.
+
+**Why CUDA gains less, measured rather than guessed.** The mix types already
+have an MMA tile and already use it on NVIDIA: `vec_dot_mma` is
+`vec_dot_q8_0_16_q8_1_mma`, `GGML_CUDA_ROCMFPX_MMQ_TILE` *is* defined (each
+generated `template-instances/mmq-instance-*_mix.cu` sets it before including
+`mmq.cuh`), and `TURING_MMA_AVAILABLE` selects the MMA path on sm90. Adding a
+tensor-core tile is therefore not the missing piece — it is already there. ncu
+on `mul_mat_q<(ggml_type)106, 24, 0>` against the K-quant `mul_mat_q<11, 24, 0>`
+in the same forward:
+
+| | mix MMQ (106) | K-quant MMQ (11) |
+|---|---|---|
+| duration | 666 µs | 130 µs |
+| memory throughput | **7.7 %** | 50.7 % |
+| L1/TEX throughput | **7.9 %** | 53.0 % |
+| compute (SM) throughput | 20.2 % | 43.8 % |
+| warp cycles / issued instr | **9.65** | 4.35 |
+| avg active threads / warp | **23.9** / 32 | 32 / 32 |
+
+Neither bandwidth- nor compute-bound: it is latency-bound *and* divergent —
+a quarter of every warp's lanes are predicated off, and each issued instruction
+costs 2.2× the warp cycles the K-quant tile does. The cost is in the tile
+loader (`load_tiles_rocmfp{2,3}_mix`, which does per-element codebook lookups),
+not in the dot product, so a different MMA tile cannot reach it. The fix is the
+same class as the 2.06× dense-matvec win recorded below: widen the weight
+staging and cut the dependent narrow loads and lane divergence.
 
 The env var is DS4-owned and still defaults off; flipping the default is the
 DS4 line's call, not this one's. K-quant artifacts (`muse-v4`) are unaffected
