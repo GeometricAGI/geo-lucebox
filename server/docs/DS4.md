@@ -64,18 +64,53 @@ options are available:
   load because the fused graph must reference every expert tensor directly.
   If that allocation fails, the backend logs the fallback and continues with
   hybrid expert placement and layered decode.
+- **Adaptive (qtype-105/106) artifacts require MONOLITHIC EXPERT RESIDENCY.** Hybrid or
+  cold expert placement cannot decode them: the per-expert codebooks are registered against
+  resident tensor bases, so an expert paged to the host has nowhere to read its codebook
+  from. The backend says so and refuses rather than producing wrong output:
+
+  ```
+  [deepseek4] qtype-105 (mixed ROCmFP3) down experts require monolithic residency —
+  hybrid/cold expert placement cannot decode them. Enable fused decode or provide
+  enough VRAM to keep all experts resident.
+  ```
+
+  Practical floor: the 0731 adaptive artifacts are ~102.3 GB, so they need a device that can
+  hold that plus KV and activations. Measured 2026-08-05 — an 80 GB H100 fails at load
+  (`cudaMalloc failed` on a 97161 MiB expert buffer, then hybrid is refused for the reason
+  above), while a 140 GB H200 and Strix Halo's 125 GiB unified memory both serve them. A
+  UNIFORM artifact has no such constraint and runs fine under hybrid placement, so this is
+  specific to the adaptive formats and worth checking before choosing a deployment target.
+
 - `--ds4-expert-top-k N` keeps the highest-ranked `N` routed experts and
   renormalizes their weights. `0` uses the model default. Reducing this value is an
   approximate inference policy and must be quality-validated for the target
   workload.
+
+  **Do not reduce it on an adaptive (qtype-105/106) artifact without measuring.**
+  Measured 2026-08-05 on DeepSeek-V4-Flash-0731, exact-copy fidelity over 20
+  identifiers x 3 repeats at temperature 0 — the model is asked to echo a line of
+  Python that is already in its prompt, so anything but a verbatim copy is a defect:
+
+  | artifact | `--ds4-expert-top-k 6` (model default) | `--ds4-expert-top-k 4` |
+  |---|---|---|
+  | adaptive (105 down-experts) | 95.0% | **60.0%** |
+  | uniform (104 down-experts) | 100% | 100% |
+
+  The adaptive failures are not degraded paraphrases, they are degenerate output —
+  `" 0 0 0 0 0 ..."`, repeated markdown fragments, empty strings — on prompts as
+  trivial as "repeat this line". Deterministic, and reproducible across context
+  sizes and with fusion on or off. The uniform artifact tolerates the same
+  approximation perfectly, so top-4 leaves no error margin and the adaptive
+  formats' different error profile crosses the threshold. Serve adaptive artifacts
+  at the model default.
 
 For the validated single-device Strix Halo profile:
 
 ```bash
 ./server/build-hip/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
   --target-device hip:0 \
-  --ds4-fused-decode \
-  --ds4-expert-top-k 4
+  --ds4-fused-decode
 ```
 
 ### In-process heterogeneous expert parallel
@@ -112,7 +147,6 @@ export LUCE_MMVQ_MAX_NCOLS=4
 ./server/build-hip-dual/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
   --peer-access \
-  --ds4-expert-top-k 4 \
   --ds4-prefill sparse
 ```
 
@@ -161,7 +195,6 @@ export DFLASH_DS4_DRAFT_GPU=0
 
 ./server/build-cuda-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
-  --ds4-expert-top-k 4 \
   --ds4-prefill sparse
 ```
 
@@ -318,8 +351,7 @@ export DFLASH_DS4_SPEC_Q=4
 
 ./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
-  --ds4-fused-decode \
-  --ds4-expert-top-k 4
+  --ds4-fused-decode
 ```
 
 `DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
@@ -364,7 +396,11 @@ tok/s weighted at fixed q=4 and 31.94 tok/s with confidence-adaptive width,
 versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
 same five GSM and five Math prompts. The run used `--ds4-expert-top-k 4`, the
 platform `performance` profile, and the GPU `high` performance level; fixed
-q=4 with the model-default six routed experts measured 28.26 tok/s. Enabling
+q=4 with the model-default six routed experts measured 28.26 tok/s. Those
+throughput figures were taken on a UNIFORM artifact, where top-4 is harmless;
+on an adaptive artifact the same setting costs 35 points of exact-copy fidelity
+(see `--ds4-expert-top-k` above), so the 32.12 vs 28.26 tok/s trade is not
+available there. Enabling
 DSpark alone therefore does not guarantee 30 tok/s. Set
 `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
 and other HIP architectures retain the shared dispatch default.
