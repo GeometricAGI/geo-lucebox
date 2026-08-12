@@ -472,6 +472,7 @@ add_library(dflash_common STATIC
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
+    src/server/atem_stream.cpp
     src/server/tool_parser.cpp
     src/server/tool_hint.cpp
     src/server/reasoning.cpp
@@ -1479,7 +1480,8 @@ if(DFLASH27B_TESTS)
     # test/data/muse_atem). The reference test is the one that matters —
     # ATEM drift is silent, degrading tool calling while text stays fluent.
     foreach(_muse_atem_test test_muse_atem_chat_template
-                            test_muse_atem_reference_prompts)
+                            test_muse_atem_reference_prompts
+                            test_atem_stream)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_muse_atem_test}.cpp")
             add_executable(${_muse_atem_test} test/${_muse_atem_test}.cpp)
             target_include_directories(${_muse_atem_test} PRIVATE

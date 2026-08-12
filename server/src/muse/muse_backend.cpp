@@ -180,13 +180,16 @@ GenerateResult MuseBackend::generate_impl(const GenerateRequest & req,
         result.tokens.push_back(tok);
         history.push_back(tok);
 
-        // <|eot|> ends the turn; <|eom|> ends a CONTINUING turn (the reasoning
-        // channel, a chained tool call). Both terminate this generation — the
-        // caller decides whether to start the next turn — but only <|eom|> and
-        // <|eot|> are structural; anything else counts as visible output.
-        const bool is_stop = (tok == w_.eos_id) || (tok == w_.eos_chat_id) ||
-                             (tok == w_.eom_id);
-        if (!is_stop) visible_emitted = true;
+        // <|eot|> (and eos) end the TURN. <|eom|> does NOT: it closes one
+        // SEGMENT and the model continues with the next — the reasoning
+        // channel is followed by the user-addressed answer, and chained tool
+        // calls are separated the same way. Stopping on <|eom|> truncated
+        // every reply at the end of its reasoning and returned an empty
+        // answer with finish_reason=stop (observed live before this fix).
+        // Structural tokens never count as visible output.
+        const bool is_stop = (tok == w_.eos_id) || (tok == w_.eos_chat_id);
+        const bool is_structural = is_stop || (tok == w_.eom_id);
+        if (!is_structural) visible_emitted = true;
 
         io.emit(tok);
         if (req.on_token && !req.on_token(tok)) break;

@@ -2047,12 +2047,45 @@ enum class TokenDelivery {
 // MUST classify identically, or the reasoning/content split diverges
 // between streamed and non-streamed responses.
 TokenDelivery classify_generated_token(
-        Tokenizer & tokenizer, int32_t token, std::string & text) {
+        Tokenizer & tokenizer, int32_t token, std::string & text,
+        AtemSegmenter * atem = nullptr) {
     if (token == tokenizer.eos_id() || token == tokenizer.eos_chat_id()) {
         return TokenDelivery::kSkip;
     }
 
     const std::string & raw = tokenizer.raw_token(token);
+
+    // ── ATEM (muse-glimmer) ────────────────────────────────────────────
+    // This family does not mark reasoning with a tag pair; it addresses
+    // whole SEGMENTS (`<|start|>assistant to=self<|message|>…<|eom|>`).
+    // Without routing them, the recipient marker and the entire reasoning
+    // channel land in the visible answer — observed live before this
+    // existed. The segmenter maps those transitions onto the same
+    // think-tag protocol the emitter already understands, so the streaming
+    // and non-streaming paths stay identical.
+    if (atem) {
+        const AtemStep step = atem->feed(raw);
+        switch (step.action) {
+        case AtemAction::OpenReasoning:
+            text = "<think>";
+            return TokenDelivery::kThinkTag;
+        case AtemAction::CloseReasoning:
+            text = "</think>\n";
+            return TokenDelivery::kThinkTag;
+        case AtemAction::EndTurn:
+        case AtemAction::Drop:
+            return TokenDelivery::kSkip;
+        case AtemAction::EmitText:
+            // Tool-addressed segments currently flow as text: the ATEM
+            // <atem:function_calls> block is not yet a dialect the tool
+            // parser recognizes, so surfacing it verbatim keeps it
+            // readable (and keeps the agentic suite, which parses the
+            // block itself, working) instead of dropping it.
+            text = tokenizer.token_text(token);
+            return TokenDelivery::kText;
+        }
+        return TokenDelivery::kSkip;
+    }
 
     // Gemma4 thinking channel (<|channel> / <channel|>) and Qwen3.6
     // thinking markers share one mapped dialect. The Qwen markers
@@ -2086,11 +2119,14 @@ TokenDelivery classify_generated_token(
 
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
+        SseEmitter & emitter, bool atem_format) {
+    // Fresh per replay: the segmenter is stateful.
+    std::unique_ptr<AtemSegmenter> atem =
+        atem_format ? std::make_unique<AtemSegmenter>(true) : nullptr;
     for (int32_t token : tokens) {
         std::string text;
         const TokenDelivery delivery =
-            classify_generated_token(tokenizer, token, text);
+            classify_generated_token(tokenizer, token, text, atem.get());
         if (delivery == TokenDelivery::kSkip) continue;
 
         emitter.emit_token(text);
@@ -2332,9 +2368,9 @@ json build_responses_api_response(
 json build_non_streaming_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
+        SseEmitter & emitter, bool atem_format) {
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter);
+        result.tokens, tokenizer, emitter, atem_format);
     switch (req.format) {
     case ApiFormat::OPENAI_CHAT:
         return build_openai_completion_response(
@@ -3410,6 +3446,9 @@ void HttpServer::configure_generation_io(
         broadcast_status();
     };
 
+    if (chat_format_ == ChatFormat::ATEM && !output.atem) {
+        output.atem = std::make_unique<AtemSegmenter>(true);
+    }
     io.on_token = [this, job, &req, &emitter, &output](
             int32_t token) -> bool {
         if (output.client_disconnected ||
@@ -3426,7 +3465,8 @@ void HttpServer::configure_generation_io(
 
         std::string text;
         const TokenDelivery delivery =
-            classify_generated_token(tokenizer_, token, text);
+            classify_generated_token(tokenizer_, token, text,
+                                     output.atem.get());
         if (delivery == TokenDelivery::kSkip) return true;
 
         if (!text.empty()) {
@@ -3705,7 +3745,8 @@ void HttpServer::process_job(ServerJob * job) {
         }
     } else if (!req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
-            req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+            req, result, n_gen_cap, gen_timings, tokenizer_, emitter,
+            chat_format_ == ChatFormat::ATEM);
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
         const int flags = sock_get_flags(fd);
