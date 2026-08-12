@@ -1,0 +1,128 @@
+{
+ "user_only": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "tools": null
+ },
+ "system_user": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null
+ },
+ "tools": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "read a.txt"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "fs.read_file",
+     "description": "Read a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "web.search",
+     "description": "Search",
+     "parameters": {
+      "type": "object"
+     }
+    }
+   }
+  ]
+ },
+ "tool_roundtrip": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "read a.txt"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "fs.read_file",
+       "arguments": {
+        "path": "a.txt"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "name": "fs.read_file",
+    "tool_call_id": "call_1",
+    "content": "hello"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "fs.read_file",
+     "description": "Read a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "multi_assistant": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "thinking out loud"
+   },
+   {
+    "role": "assistant",
+    "content": "the answer"
+   }
+  ],
+  "tools": null
+ }
+}

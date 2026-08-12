@@ -9,6 +9,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <memory>
 #include <stdexcept>
 
@@ -44,10 +48,69 @@ static const char QWEN3_TOOL_SUFFIX[] =
     "current knowledge and do not tell the user about function calls\n"
     "</IMPORTANT>";
 
+// Serialise JSON the way the reference ATEM template's `tojson` filter does:
+// insertion order preserved, `", "` between items and `": "` after keys.
+// nlohmann's dump() sorts keys (json is a std::map) and emits no spaces, so
+// a straight dump() produces a prompt that differs from the model's own
+// rendering in every tool schema — invisible in a smoke test, and exactly
+// the kind of drift that costs tool-calling accuracy.
+static void atem_json_dump(const nlohmann::ordered_json & v, std::string & out) {
+    if (v.is_object()) {
+        out += '{';
+        bool first = true;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (!first) out += ", ";
+            first = false;
+            out += nlohmann::json(it.key()).dump();
+            out += ": ";
+            atem_json_dump(it.value(), out);
+        }
+        out += '}';
+    } else if (v.is_array()) {
+        out += '[';
+        bool first = true;
+        for (const auto & e : v) {
+            if (!first) out += ", ";
+            first = false;
+            atem_json_dump(e, out);
+        }
+        out += ']';
+    } else {
+        out += v.dump();
+    }
+}
+
+static std::string atem_json_str(const nlohmann::ordered_json & v) {
+    std::string out;
+    atem_json_dump(v, out);
+    return out;
+}
+
+// Current UTC date as YYYY-MM-DD — the ATEM system turn's `Current date:`
+// line (the template calls strftime_now). Overridable via
+// DFLASH_ATEM_CURRENT_DATE so prompt rendering can be pinned in tests and
+// in reproducible eval harnesses.
+static std::string atem_current_date() {
+    if (const char * override_date = std::getenv("DFLASH_ATEM_CURRENT_DATE")) {
+        if (*override_date) return override_date;
+    }
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#if defined(_WIN32)
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &utc);
+    return std::string(buf);
+}
+
 ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
+    if (arch == "muse-glimmer") return ChatFormat::ATEM;
     // qwen35, qwen3 use the Qwen3/ChatML format
     return ChatFormat::QWEN3;
 }
@@ -410,6 +473,196 @@ std::string render_chat_template(
         if (add_generation_prompt) {
             result += "<｜Assistant｜>";
             result += enable_thinking ? "<think>" : "</think>";
+        }
+        break;
+    }
+
+    case ChatFormat::ATEM: {
+        // ATEM (Muse-Glimmer). Ported from the chat template embedded in the
+        // artifact's GGUF metadata; the turn grammar is:
+        //
+        //   <|start|>system<|message|>{system}\n\nReasoning strength: high.
+        //   [\n\n{tool defs}]\n\n# Valid recipients: …<|eot|>
+        //   <|start|>user<|message|>{msg}<|eot|>
+        //   <|start|>tool {name}<|message|><tool_output name="{name}">
+        //   {result}\n</tool_output><|eot|>
+        //   <|start|>assistant[ to={recipient}]<|message|>{msg}<|eot|>
+        //   <|start|>assistant                      ← generation prompt
+        //
+        // `<|eom|>` ends a turn that CONTINUES the same role (reasoning
+        // channel, chained tool calls); `<|eot|>` ends the turn outright.
+        // Both are control tokens the sampler must be able to emit: serving
+        // that strips them scores TOOL 0/30 on the muse golden suite even
+        // when the model's ATEM blocks are perfect.
+        //
+        // Assistant tool-call turns are replayed verbatim: normalize_chat_
+        // messages() feeds back the model's own raw <atem:function_calls>
+        // text, so no re-serialisation happens here (and none should — the
+        // arguments-to-XML mapping is the model's, not ours).
+        const std::string kReasoning = "Reasoning strength: high.";
+        // Template default (`knowledge_cutoff`); the artifact ships no
+        // override, so it is a constant of the format, not a policy choice.
+        const std::string kKnowledgeCutoff = "2026-01-04";
+
+        result = "<|begin_of_text|>";
+
+        // Recipient list: "self" (reasoning channel), one entry per tool
+        // namespace, then "user".
+        std::string recipients = "# Valid recipients: \"self\"";
+        std::vector<std::string> namespaces;
+        if (has_tools) {
+            try {
+                const auto tools = nlohmann::ordered_json::parse(tools_json);
+                for (const auto & t : tools) {
+                    const nlohmann::ordered_json & fn =
+                        t.contains("function") ? t["function"] : t;
+                    const std::string fname = fn.value("name", "");
+                    if (fname.empty()) continue;
+                    const std::string ns = fname.substr(0, fname.find('.'));
+                    if (std::find(namespaces.begin(), namespaces.end(), ns) ==
+                        namespaces.end()) {
+                        namespaces.push_back(ns);
+                    }
+                }
+            } catch (const std::exception &) {
+                // Malformed tools JSON: fall through with no namespaces
+                // rather than refusing the request. The tool-definition
+                // block below surfaces the raw JSON so it is not silently
+                // dropped.
+            }
+        }
+        for (const auto & ns : namespaces) {
+            recipients += ", \"" + ns + ".*\"";
+        }
+        recipients += ", \"user\".";
+
+        std::string tool_defs;
+        if (has_tools) {
+            tool_defs =
+                "In this environment you have access to a set of tools you "
+                "can use to answer the user's question.\n\n"
+                "You can invoke a function by writing a "
+                "\"<atem:function_calls>\" block like the following:\n"
+                "<atem:function_calls>\n"
+                "<atem:invoke name=\"$FUNCTION_NAME\">\n"
+                "<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE"
+                "</atem:parameter>\n...\n</atem:invoke>\n"
+                "</atem:function_calls>\n\n"
+                "String and scalar parameters should be specified as is, "
+                "while lists and objects should use JSON format. Note that "
+                "spaces for string values are not stripped. The output is "
+                "not expected to be valid XML and is parsed with regular "
+                "expressions.\n"
+                "Here are the functions available in JSONSchema format:\n"
+                "// Tool metadata\n";
+            for (const auto & ns : namespaces) {
+                tool_defs += "{\"name\": \"" + ns + "\", \"description\": \"\"}\n";
+            }
+            tool_defs += "// Function schemas";
+            try {
+                const auto tools = nlohmann::ordered_json::parse(tools_json);
+                for (const auto & t : tools) {
+                    const nlohmann::ordered_json & fn =
+                        t.contains("function") ? t["function"] : t;
+                    tool_defs += "\n{\"name\": " +
+                                 nlohmann::json(fn.value("name", "")).dump() +
+                                 ", \"description\": " +
+                                 nlohmann::json(fn.value("description", "")).dump() +
+                                 ", \"parameters\": " +
+                                 (fn.contains("parameters")
+                                      ? atem_json_str(fn["parameters"])
+                                      : std::string("{}")) +
+                                 "}";
+                }
+            } catch (const std::exception &) {
+                tool_defs += "\n" + tools_json;
+            }
+            tool_defs +=
+                "\n\nHere's an example of how to call a function in the tool "
+                "set:\n"
+                "(If the tool namespace is not specified, invoke the function "
+                "directly as `example_function_name` rather than "
+                "`example_tool_name.example_function_name`)\n\n"
+                "to=example_tool_name.example_function_name\n\n"
+                "<atem:function_calls>\n"
+                "<atem:invoke name=\"example_tool_name.example_function_name\">\n"
+                "<atem:parameter name=\"example_parameter_1\">value_1"
+                "</atem:parameter>\n"
+                "<atem:parameter name=\"example_parameter_2\">This is the "
+                "value for the second parameter\nthat can span\n"
+                "\"multiple\" lines\n</atem:parameter>\n"
+                "</atem:invoke>\n</atem:function_calls>";
+        }
+
+        auto emit_system = [&](const std::string & content, bool synthesized) {
+            result += "<|start|>system<|message|>";
+            result += content;
+            if (synthesized) {
+                // Only the SYNTHESIZED system turn carries the dateline; a
+                // caller-supplied system message replaces it wholesale.
+                result += "\nKnowledge cutoff: " + kKnowledgeCutoff + ".";
+                result += "\nCurrent date: " + atem_current_date() + ".";
+            }
+            result += "\n\n" + kReasoning;
+            if (has_tools) result += "\n\n" + tool_defs;
+            result += "\n\n" + recipients;
+            result += "<|eot|>";
+        };
+
+        bool has_system = false;
+        for (const auto & m : messages) {
+            if (m.role == "system") { has_system = true; break; }
+        }
+        if (!has_system) {
+            emit_system("You are a helpful AI assistant.", /*synthesized=*/true);
+        }
+
+        for (size_t i = 0; i < messages.size(); i++) {
+            const auto & msg = messages[i];
+            // A turn whose successor repeats the role continues the same
+            // channel, so it closes with <|eom|> rather than <|eot|>.
+            const bool same_role_next =
+                (i + 1 < messages.size()) && messages[i + 1].role == msg.role;
+            const char * end_token = same_role_next ? "<|eom|>" : "<|eot|>";
+
+            if (msg.role == "system") {
+                emit_system(msg.content, /*synthesized=*/false);
+            } else if (msg.role == "user") {
+                result += "<|start|>user<|message|>" + msg.content + "<|eot|>";
+            } else if (msg.role == "tool") {
+                const std::string tname =
+                    !msg.name.empty() ? msg.name : msg.tool_call_id;
+                result += "<|start|>tool " + tname + "<|message|>";
+                result += "<tool_output name=\"" + tname + "\">\n";
+                result += msg.content;
+                result += "\n</tool_output><|eot|>";
+            } else if (msg.role == "assistant") {
+                // Every assistant turn is addressed: a replayed tool-call
+                // turn to the tool it invokes, anything else to the user.
+                // The bare `<|start|>assistant<|message|>` form does not
+                // occur in the reference rendering.
+                const size_t k = msg.content.find("<atem:invoke name=\"");
+                std::string recipient = "user";
+                if (k != std::string::npos) {
+                    const size_t b = k + std::strlen("<atem:invoke name=\"");
+                    const size_t e = msg.content.find('"', b);
+                    if (e != std::string::npos) {
+                        recipient = msg.content.substr(b, e - b);
+                    }
+                }
+                const bool is_tool_call = recipient != "user";
+                result += "<|start|>assistant to=" + recipient + "<|message|>";
+                result += msg.content;
+                // A turn addressed to the user ends it (<|eot|>). A tool-call
+                // turn takes the continuation rule: <|eom|> only when the
+                // NEXT message repeats the assistant role (chained calls),
+                // otherwise <|eot|> because a `tool` turn follows.
+                result += is_tool_call ? end_token : "<|eot|>";
+            }
+        }
+
+        if (add_generation_prompt) {
+            result += "<|start|>assistant";
         }
         break;
     }

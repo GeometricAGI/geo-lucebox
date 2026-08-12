@@ -39,13 +39,37 @@ Deltas to implement:
    channel, `<|eom|>`/`<|eot|>`). Control tokens MUST be emitted; suppressing
    them measured TOOL 0/30 on the golden suite.
 
+## AMD / HIP
+
+The target hardware includes Strix Halo (gfx1151, unified memory) and the
+R9700 AI (gfx120x), so HIP is a first-class build for this family, not a
+port afterthought:
+
+- S1 adds no device code — the ATEM renderer and its tests are plain C++,
+  compiled and run identically under both backends.
+- S2/S3 must stay inside the ops the HIP backend already carries for gemma4
+  (that family builds and runs on HIP today), so the muse graph should reuse
+  its node vocabulary rather than reaching for CUDA-only primitives.
+- S4 inherits the ROCmFPX mix kernels, which are HIP-native by origin (the
+  DS4/Strix line) and carry `.hip.cu` paths plus wave64-safe reductions
+  upstream. The 128-weight row-alignment and full-offload refusals are the
+  same on both backends.
+- Strix Halo caveat carried from the ds4 line: unified memory means "GPU
+  resident" and "host resident" are not the memory-space distinction they
+  are on discrete parts — the mix registry's host-resident refusal must be
+  re-verified there rather than assumed from the CUDA result.
+
 ## Staged plan
 
-- **S1 — recognition (no kernels, no graph).** `gguf_inspect` + `model_card`
-  + `chat_template` + capability-table row for `muse-glimmer`; a test that
-  parses the real artifact's KV (52 / 6656 / 32q-2kv / softcap 20.0) and
-  asserts the family resolves. Cheap, testable, and it is what tells us the
-  artifact is legible to the server at all.
+- **S1 — recognition (no kernels, no graph). DONE.** `ChatFormat::ATEM`
+  (native renderer, `muse-glimmer` → ATEM dispatch), `model_card` family
+  row, and `ChatMessage::name` so tool turns can be addressed by name.
+  Verified byte-exact against prompts rendered by the model's OWN chat
+  template (`test/data/muse_atem`, five cases incl. a tool round trip):
+  `test_muse_atem_reference_prompts` + a grammar unit test. Both are
+  CPU-only and backend-agnostic, so they run identically under the CUDA and
+  HIP builds. The capability-table row lands with S2 — it is cross-checked
+  at compile time against a backend config struct that does not exist yet.
 - **S2 — loader.** Tensor map for the muse topology including `attn_gate`,
   reusing the gemma4 loader's norm/SWA/softcap plumbing.
 - **S3 — graph.** Dense 52-layer forward with the attn-gate node, softcap,

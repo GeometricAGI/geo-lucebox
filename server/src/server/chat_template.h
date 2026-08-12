@@ -18,6 +18,11 @@ struct ChatMessage {
     std::string content;    // message text
     // Optional tool_call_id for tool result messages.
     std::string tool_call_id;
+    // Optional tool NAME for tool result messages. ATEM addresses tool
+    // turns by name (`<|start|>tool <name>`), not by call id, and carries
+    // the name again inside the <tool_output> wrapper; formats that key on
+    // the id ignore this. Falls back to tool_call_id when absent.
+    std::string name;
 };
 
 // Chat template format.
@@ -26,6 +31,7 @@ enum class ChatFormat {
     LAGUNA,    // <|begin_of_sentence|><|User|>...<|Assistant|>
     GEMMA4,    // <bos><|turn>role\n...<turn|>\n
     DEEPSEEK4, // <｜begin▁of▁sentence｜>...<｜User｜>...<｜Assistant｜>
+    ATEM,      // <|start|>role[ to=recipient]<|message|>...<|eom|>/<|eot|>
 };
 
 // Render chat messages into the model-specific prompt string.

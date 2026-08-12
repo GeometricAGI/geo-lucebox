@@ -1450,6 +1450,26 @@ if(DFLASH27B_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     list(APPEND _raw_unit_test_targets test_qwen35_split_tree_guard)
 
+    # ── Muse-Glimmer ATEM chat format (CPU-only; backend-agnostic) ──
+    # Two levels: a grammar unit test, and a byte-exact comparison against
+    # prompts rendered by the MODEL's own chat template (fixtures under
+    # test/data/muse_atem). The reference test is the one that matters —
+    # ATEM drift is silent, degrading tool calling while text stays fluent.
+    foreach(_muse_atem_test test_muse_atem_chat_template
+                            test_muse_atem_reference_prompts)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_muse_atem_test}.cpp")
+            add_executable(${_muse_atem_test} test/${_muse_atem_test}.cpp)
+            target_include_directories(${_muse_atem_test} PRIVATE
+                ${DFLASH27B_SRC_INCLUDE_DIRS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/server
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+            target_link_libraries(${_muse_atem_test} PRIVATE
+                dflash_common nlohmann_json::nlohmann_json)
+            list(APPEND _raw_unit_test_targets ${_muse_atem_test})
+        endif()
+    endforeach()
+    unset(_muse_atem_test)
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_recurrent_snapshot.cpp")
         add_executable(test_recurrent_snapshot test/test_recurrent_snapshot.cpp)
         target_include_directories(test_recurrent_snapshot PRIVATE
@@ -1612,6 +1632,12 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name paged_kv_pool)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
+                if(_unit_target STREQUAL "test_muse_atem_reference_prompts")
+                    # Fixtures live with the sources, not in the build tree.
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES
+                        ENVIRONMENT
+                        "DFLASH_TEST_DATA_DIR=${CMAKE_CURRENT_SOURCE_DIR}/test/data/muse_atem")
+                endif()
                 if(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
                 endif()
