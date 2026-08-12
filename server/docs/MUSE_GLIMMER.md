@@ -208,12 +208,38 @@ Remaining headroom, for whoever picks this up:
   needs a 24 B window (14 B block at a 2-aligned offset), which overruns the
   tensor end by up to 10 B — so it needs the same registration-time shape guard
   fp2 carries, not a bare port. Deliberately not attempted here.
-- **These changes are untested on AMD.** The shapes they replace were tuned on
-  wave64/CDNA-era parts and the fp2 kernel still carries an
-  `amdgpu_waves_per_eu(12,12)` pin chosen against a measured occupancy cliff.
-  Wider loads and register blocking *should* help there too, but that is a
-  hypothesis until measured on gfx1151/gfx1201 — and a divergent result is the
-  case for genuinely forking the launch config per backend.
+### AMD: measured, and the win does NOT transfer
+
+Same artifact, same bench, both lucebox4 GPUs, patched vs the same tree with
+only the two `.cu` files reverted:
+
+| GPU | baseline | with the change | delta |
+|---|---|---|---|
+| gfx1201 (R9700 AI, 32 GB) | 35.84 ms/tok (27.90 tok/s) | 35.17 ms/tok (28.43 tok/s) | **−1.9 %** |
+| gfx1151 (Strix Halo, unified) | 60.94 ms/tok (16.41 tok/s) | 60.68 ms/tok (16.48 tok/s) | **−0.4 %** |
+| H200 (CUDA, for contrast) | 38.53 ms/tok (25.95 tok/s) | 18.67 ms/tok (53.56 tok/s) | **−51.5 %** |
+
+So the optimal kernel shape genuinely **is** backend-dependent here — but the
+useful conclusion is the opposite of "fork the code". The change is a 2.06× win
+on NVIDIA and neutral-to-marginally-positive on both AMD parts, so **one path
+serves both and no per-backend fork is warranted**. The AMD kernel was already
+at its local optimum for these shapes: it had been hand-tuned (load-from-floor
+wide staging, the `amdgpu_waves_per_eu(12,12)` pin against a measured occupancy
+cliff), and the load-issue ceiling that dominated on NVIDIA is simply not what
+binds on wave32 RDNA.
+
+The corollary matters more than the result. Before this change the AMD parts
+beat CUDA on their home kernels (35.8 vs 38.5 ms); after it, **CUDA is nearly
+2× faster than the R9700 AI** (18.7 vs 35.2 ms). The ROCmFPX line now has
+untapped headroom *on AMD*, bound by something this fix does not address — and
+finding it wants the same treatment that worked here: profile first (rocprof /
+`omniperf`), do not reason from the source.
+
+Strix Halo unified-memory note: **71 of 71** mix tensors registered with no
+false host-residency refusal, so the flagged unified-memory concern is closed
+by measurement rather than assumption. One first-timed-step outlier (1.1 s) was
+seen in a run with a short warmup and did not reproduce with a longer one;
+medians were stable to ±0.2 % across runs.
 
 S1–S3 make `muse-v4` (the byte-parity artifact that beats the vendor GGUF)
 servable with no kernel work at all. S4 adds the 3.30 bpw artifact.
