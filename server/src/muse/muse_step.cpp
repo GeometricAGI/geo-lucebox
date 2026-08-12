@@ -87,6 +87,7 @@ bool create_muse_cache(ggml_backend_t backend, const MuseWeights & w,
 }
 
 void free_muse_cache(MuseCache & c) {
+    free_muse_target_feat(c);
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     c.k.clear(); c.v.clear();
@@ -167,9 +168,16 @@ void fill_swa_mask(std::vector<ggml_fp16_t> & m, int kv_pad, int q_pad,
 
 }  // namespace
 
-bool muse_step(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
-               const float * embed, int n_tokens, int kv_start,
-               std::vector<float> & out_logits) {
+namespace {
+
+// Shared implementation. `all_positions` selects whether the caller gets logits
+// for the last token only (decode/prefill) or for every token (speculative
+// verify). The graph is identical either way -- build_muse_head already computes
+// [n_vocab, n_tokens] and the single-token path simply discarded the rest -- so
+// verify costs no extra compute, only the larger readback.
+bool muse_forward(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
+                  const float * embed, int n_tokens, int kv_start,
+                  std::vector<float> & out_logits, bool all_positions) {
     if (n_tokens <= 0) { set_last_error("muse_step: n_tokens <= 0"); return false; }
     if (kv_start + n_tokens > cache.max_ctx) {
         set_last_error("muse_step: kv_start+n_tokens exceeds max_ctx");
@@ -228,11 +236,18 @@ bool muse_step(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
     ggml_tensor * cur = build_muse_inp_norm(ctx, w, inp);
     for (int il = 0; il < w.n_layer; ++il) {
         const bool swa = muse_is_swa_layer(w, il);
+        // -1 unless this layer is a capture layer (and a ring exists at all).
+        int cap_idx = -1;
+        if (cache.target_feat) {
+            for (int k = 0; k < cache.n_capture_layers; ++k) {
+                if (cache.capture_layer_ids[(size_t)k] == il) { cap_idx = k; break; }
+            }
+        }
         cur = build_muse_layer(ctx, gf, w,
                                cache.k[(size_t)il], cache.v[(size_t)il], il, cur,
                                positions, swa ? mask_swa : mask_full,
                                swa ? kvi_swa : kvi_full,
-                               kv_start, n_tokens);
+                               kv_start, n_tokens, &cache, cap_idx);
     }
     cur = build_muse_head(ctx, w, cur);
     ggml_build_forward_expand(gf, cur);
@@ -274,11 +289,96 @@ bool muse_step(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
         return false;
     }
 
-    out_logits.resize((size_t)w.n_vocab);
-    ggml_backend_tensor_get(cur, out_logits.data(),
-                            (size_t)(n_tokens - 1) * w.n_vocab * sizeof(float),
-                            out_logits.size() * sizeof(float));
+    if (all_positions) {
+        out_logits.resize((size_t)n_tokens * w.n_vocab);
+        ggml_backend_tensor_get(cur, out_logits.data(), 0,
+                                out_logits.size() * sizeof(float));
+    } else {
+        out_logits.resize((size_t)w.n_vocab);
+        ggml_backend_tensor_get(cur, out_logits.data(),
+                                (size_t)(n_tokens - 1) * w.n_vocab * sizeof(float),
+                                out_logits.size() * sizeof(float));
+    }
     return true;
+}
+
+}  // namespace
+
+bool muse_step(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
+               const float * embed, int n_tokens, int kv_start,
+               std::vector<float> & out_logits) {
+    return muse_forward(backend, w, cache, embed, n_tokens, kv_start,
+                        out_logits, /*all_positions=*/false);
+}
+
+bool muse_verify_batch(ggml_backend_t backend, const MuseWeights & w,
+                       MuseCache & cache, const float * embed,
+                       int n_tokens, int kv_start,
+                       std::vector<int32_t> & argmax_out,
+                       std::vector<float> * all_logits) {
+    std::vector<float> local;
+    std::vector<float> & lg = all_logits ? *all_logits : local;
+    if (!muse_forward(backend, w, cache, embed, n_tokens, kv_start, lg,
+                      /*all_positions=*/true)) {
+        return false;
+    }
+    argmax_out.resize((size_t)n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * row = lg.data() + (size_t)t * w.n_vocab;
+        int best = 0;
+        for (int v = 1; v < w.n_vocab; ++v) if (row[v] > row[best]) best = v;
+        argmax_out[(size_t)t] = best;
+    }
+    return true;
+}
+
+// ── DFlash feature-capture ring ─────────────────────────────────────────────
+bool create_muse_target_feat(ggml_backend_t backend, const MuseWeights & w,
+                             MuseCache & cache,
+                             const std::vector<int> & capture_ids, int cap) {
+    free_muse_target_feat(cache);
+    if (capture_ids.empty() || cap <= 0) {
+        set_last_error("muse target_feat: empty capture set or cap <= 0");
+        return false;
+    }
+    for (int il : capture_ids) {
+        if (il < 0 || il >= w.n_layer) {
+            set_last_error("muse target_feat: capture layer " + std::to_string(il) +
+                           " out of range");
+            return false;
+        }
+    }
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 8;
+    ip.no_alloc = true;
+    cache.feat_ctx = ggml_init(ip);
+    if (!cache.feat_ctx) { set_last_error("muse target_feat: ggml_init"); return false; }
+
+    const int64_t fc_in = (int64_t)capture_ids.size() * w.n_embd;
+    cache.target_feat = ggml_new_tensor_2d(cache.feat_ctx, GGML_TYPE_F32, fc_in, cap);
+    cache.feat_buf = ggml_backend_alloc_ctx_tensors(cache.feat_ctx, backend);
+    if (!cache.feat_buf) {
+        set_last_error("muse target_feat: backend alloc failed");
+        ggml_free(cache.feat_ctx); cache.feat_ctx = nullptr;
+        cache.target_feat = nullptr;
+        return false;
+    }
+    ggml_backend_tensor_memset(cache.target_feat, 0, 0, ggml_nbytes(cache.target_feat));
+
+    cache.target_feat_cap  = cap;
+    cache.n_capture_layers = (int)capture_ids.size();
+    cache.capture_layer_ids = capture_ids;
+    return true;
+}
+
+void free_muse_target_feat(MuseCache & cache) {
+    if (cache.feat_buf) { ggml_backend_buffer_free(cache.feat_buf); cache.feat_buf = nullptr; }
+    if (cache.feat_ctx) { ggml_free(cache.feat_ctx); cache.feat_ctx = nullptr; }
+    cache.target_feat = nullptr;
+    cache.target_feat_cap = 0;
+    cache.n_capture_layers = 0;
+    cache.capture_layer_ids.clear();
 }
 
 }  // namespace dflash::common

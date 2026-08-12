@@ -1461,7 +1461,8 @@ if(DFLASH27B_TESTS)
     # Muse-Glimmer loader + forward-graph parity against a real artifact
     # (both skip with 77 when the artifact / reference dump is absent).
     foreach(_muse_art_test test_muse_loader test_muse_graph_parity
-                          test_muse_generate test_muse_kv_snapshot)
+                          test_muse_generate test_muse_kv_snapshot
+                          test_muse_verify_capture)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_muse_art_test}.cpp")
             add_executable(${_muse_art_test} test/${_muse_art_test}.cpp)
             target_include_directories(${_muse_art_test} PRIVATE

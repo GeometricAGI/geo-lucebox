@@ -142,13 +142,18 @@ ggml_tensor * build_muse_attn_block(ggml_context * ctx, ggml_cgraph * gf,
                                     ggml_tensor * kv_idx,
                                     int kv_start, int n_tokens);
 
+// Defined below; the layer builder only needs a pointer for feature capture.
+struct MuseCache;
+
 ggml_tensor * build_muse_layer(ggml_context * ctx, ggml_cgraph * gf,
                                const MuseWeights & w,
                                ggml_tensor * cache_k, ggml_tensor * cache_v,
                                int il, ggml_tensor * inpL,
                                ggml_tensor * positions, ggml_tensor * attn_mask,
                                ggml_tensor * kv_idx,
-                               int kv_start, int n_tokens);
+                               int kv_start, int n_tokens,
+                               const MuseCache * feat_cache = nullptr,
+                               int capture_idx = -1);
 
 ggml_tensor * build_muse_inp_norm(ggml_context * ctx, const MuseWeights & w,
                                   ggml_tensor * inp_embd);
@@ -210,6 +215,18 @@ struct MuseCache {
     // which is exactly how tool calling breaks. Treat any non-zero value as
     // needing a golden-suite run before it is trusted, not as a free speedup.
     int fa_window  = 0;
+
+    // ── DFlash feature capture ring (allocated only when a draft is active) ──
+    // [n_capture_layers * n_embd, target_feat_cap]: the hidden state after each
+    // capture layer, stacked along dim 0 for one position per column. The
+    // universal DFlash drafter cross-attends to this, which is why the target
+    // has to expose it at all.
+    ggml_tensor *         target_feat = nullptr;
+    ggml_context *        feat_ctx    = nullptr;
+    ggml_backend_buffer_t feat_buf    = nullptr;
+    int                   target_feat_cap  = 0;
+    int                   n_capture_layers = 0;
+    std::vector<int>      capture_layer_ids;
     int swa_ring   = 0;   // allocated ring rows = window + headroom
     int n_layer    = 0;
 
@@ -226,6 +243,30 @@ struct MuseCache {
 // uses `window` — they are different numbers. Exposed for unit testing.
 bool muse_swa_slot_visible(int total, int q_abs, int slot, int ring_rows,
                            int window);
+
+// Allocate the DFlash feature-capture ring. Separate from the KV cache so a
+// draft can be attached (or parked) without rebuilding it. `capture_ids` are the
+// layer indices whose OUTPUT hidden state is captured, in the order the drafter
+// expects them stacked.
+bool create_muse_target_feat(ggml_backend_t backend, const MuseWeights & w,
+                             MuseCache & cache,
+                             const std::vector<int> & capture_ids, int cap);
+void free_muse_target_feat(MuseCache & cache);
+
+// The evenly-spaced capture layers this family reports when the draft does not
+// name its own. Skips layer 0 (its output is barely past the embedding) and the
+// last layer (already what the head sees).
+std::vector<int> muse_default_capture_layers(const MuseWeights & w, int n);
+
+// Forward over `n_tokens` returning the argmax at EVERY position, which is what
+// speculative verify needs (a chain of draft tokens is accepted up to the first
+// position where the target disagrees). `all_logits`, when non-null, also
+// receives the full [n_tokens * n_vocab] f32 block for sampled verify.
+bool muse_verify_batch(ggml_backend_t backend, const MuseWeights & w,
+                       MuseCache & cache, const float * embed,
+                       int n_tokens, int kv_start,
+                       std::vector<int32_t> & argmax_out,
+                       std::vector<float> * all_logits = nullptr);
 
 // KV snapshot for speculative-decode rollback.
 //

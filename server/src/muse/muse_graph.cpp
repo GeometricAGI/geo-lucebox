@@ -175,7 +175,9 @@ ggml_tensor * build_muse_layer(
     ggml_tensor *       attn_mask,
     ggml_tensor *       kv_idx,
     int                 kv_start,
-    int                 n_tokens)
+    int                 n_tokens,
+    const MuseCache *   feat_cache,
+    int                 capture_idx)
 {
     const MuseLayer & L = w.layers[(size_t)il];
 
@@ -197,7 +199,62 @@ ggml_tensor * build_muse_layer(
 
     // (2) post-FFN norm at 1e-8, then residual.
     cur = muse_rms_norm_mul(ctx, cur, L.ffn_post_norm, kMusePostNormEps);
-    return ggml_add(ctx, cur, ffn_inp);
+    cur = ggml_add(ctx, cur, ffn_inp);
+
+    // DFlash feature capture: stash this layer's OUTPUT hidden state into the
+    // ring so the drafter can cross-attend to it. Writes into
+    // target_feat[capture_idx * n_embd .. +n_embd, slot] for each position, in
+    // one or two spans depending on whether the range wraps the ring.
+    //
+    // Placed here, after the residual, so what the drafter sees is exactly the
+    // layer's output — the same tensor the next layer consumes. Capturing the
+    // pre-residual value would be a different representation and the drafter was
+    // not trained on it.
+    if (capture_idx >= 0 && feat_cache && feat_cache->target_feat) {
+        ggml_tensor * feat = feat_cache->target_feat;
+        const int    hidden     = w.n_embd;
+        const int    cap        = feat_cache->target_feat_cap;
+        const size_t elt        = ggml_element_size(feat);
+        const size_t col_stride = feat->nb[1];
+        const int    slot0      = kv_start % cap;
+        const int    pre_n      = std::min(n_tokens, cap - slot0);
+        const int    post_n     = n_tokens - pre_n;
+        const size_t row_off    = (size_t)capture_idx * hidden * elt;
+
+        ggml_tensor * src2d = ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+        {
+            ggml_tensor * dst = ggml_view_2d(ctx, feat, hidden, pre_n, col_stride,
+                                             (size_t)slot0 * col_stride + row_off);
+            ggml_tensor * src = ggml_view_2d(ctx, src2d, hidden, pre_n,
+                                             src2d->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+        }
+        if (post_n > 0) {
+            ggml_tensor * dst = ggml_view_2d(ctx, feat, hidden, post_n,
+                                             col_stride, row_off);
+            ggml_tensor * src = ggml_view_2d(ctx, src2d, hidden, post_n,
+                                             src2d->nb[1],
+                                             (size_t)pre_n * src2d->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+        }
+    }
+    return cur;
+}
+
+// Evenly spaced over the interior layers. Layer 0's output is barely past the
+// embedding and the last layer's output is what the head already sees, so both
+// carry little the drafter cannot get elsewhere.
+std::vector<int> muse_default_capture_layers(const MuseWeights & w, int n) {
+    std::vector<int> ids;
+    if (n <= 0 || w.n_layer <= 2) return ids;
+    ids.reserve((size_t)n);
+    const int lo = 1, hi = w.n_layer - 2;          // inclusive interior range
+    for (int k = 0; k < n; ++k) {
+        const int idx = (n == 1) ? (lo + hi) / 2
+                                 : lo + (int)((int64_t)k * (hi - lo) / (n - 1));
+        ids.push_back(idx);
+    }
+    return ids;
 }
 
 // Embedding entry: (1) an UNWEIGHTED RMS norm over the token embeddings.
