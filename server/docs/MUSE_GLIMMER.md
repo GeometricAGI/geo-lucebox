@@ -13,7 +13,7 @@ C++ that compiles and runs identically under either.
 | Backend | Verified on | Notes |
 |---|---|---|
 | **CUDA** | **H200 (sm90)** | Full quality gate + parity + throughput. No sm90-specific code; other archs should build but are unverified. |
-| **HIP/ROCm** | **gfx1201** (R9700 AI), **gfx1151** (Strix Halo) | Both targets in one binary, ROCm 7.2.2. Spec-decode correctness verified on both (token-identical to greedy); `--draft` is a throughput *loss* here. |
+| **HIP/ROCm** | **gfx1201** (R9700 AI), **gfx1151** (Strix Halo) | Both targets in one binary, ROCm 7.2.2. **Full quality gate run on both** (101/122 each, matching H200) with spec decode on, plus token-identity to greedy. `--draft` is a throughput loss unless the mix MMQ path is enabled — see below. |
 
 ## Artifacts
 
@@ -36,22 +36,25 @@ Both land inside their reference bands, so this serving path costs no quality.
 
 **Quality is unchanged by GPU vendor and by speculative decode.** The same
 122-item suite, `muse-lowbpw-r1`, served through `dflash_server` at pinned
-geometry, scored **101/122 on gfx1201 with `--draft` on** against **101/122 on
-H200** — identical totals, with the per-axis counts moving by at most one item,
-inside the ±2 the suite is noisy to:
+geometry, on three GPUs across two vendors — the two AMD runs with `--draft`
+on — lands on the **same total every time**, with per-axis counts moving by at
+most two items against a suite that is ±2 noisy:
 
-| axis | H200 (CUDA, AR) | gfx1201 (HIP, `--draft`) |
-|---|---|---|
-| MATH | 30/40 | 31/40 |
-| CODE | 37/40 | 38/40 |
-| TOOL | 25/30 | 24/30 |
-| AGENT | 9/12 | 8/12 |
-| **total** | **101/122** | **101/122** |
+| axis | H200 (CUDA, AR) | gfx1201 (HIP, `--draft`) | gfx1151 (HIP, `--draft`) |
+|---|---|---|---|
+| MATH | 30/40 | 31/40 | 32/40 |
+| CODE | 37/40 | 38/40 | 36/40 |
+| TOOL | 25/30 | 24/30 | 24/30 |
+| AGENT | 9/12 | 8/12 | 9/12 |
+| **total** | **101/122** | **101/122** | **101/122** |
 
 That is the whole point of an output-verified drafter: it is not a quality
-trade. Mean acceptance across the suite's 148 requests was **0.314** — higher
-than the 0.15–0.24 of open-ended chat, because reasoning and code
-continuations are more predictable.
+trade. Mean acceptance over each run's 148 requests was **0.314** (gfx1201) and
+**0.310** (gfx1151) — higher than the 0.15–0.24 of open-ended chat, because
+reasoning and code continuations are more predictable. Median decode was 24.4
+and 8.7 tok/s respectively; both gates ran concurrently on the one box, so
+those are not clean throughput figures (the isolated ones are in the table
+below).
 
 ## Feature support
 
