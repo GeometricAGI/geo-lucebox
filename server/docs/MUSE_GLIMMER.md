@@ -37,10 +37,10 @@ Both land inside their reference bands, so this serving path costs no quality.
 ## Feature support
 
 muse-glimmer is currently the **least-featured** backend in the tree: dense AR
-prefill + decode, and nothing else. Every optional feature is `Never` in
+prefill + decode, plus `--fa-window`. Everything else is `Never` in
 `model_capabilities.h` because `MuseBackendConfig` carries no field for it, and
-the table is cross-checked against that struct at compile time so this cannot
-drift silently.
+the table is cross-checked against that struct at compile time so the two cannot
+drift silently — adding a config field forces the row to be updated.
 
 | Feature | Flag | muse-glimmer | For contrast |
 |---|---|---|---|
@@ -77,9 +77,10 @@ full-attention layers and they are what carry global context, so windowing them
 can drop the system prompt and tool definitions out of view — which is exactly
 how tool calling breaks. Nothing here has been scored on the golden suite at any
 non-zero window, and the backend prints a warning at startup saying so. It is
-also not a free speedup: at a 128-token prompt it measured 13.819 vs 13.819
-ms/tok (i.e. nothing), because the attention span is trivial at that length. Any
-benefit is a long-context effect and is unmeasured.
+also not a free speedup: at a 128-token prompt a 32-token window measured
+13.819 ms/tok against 13.837 unwindowed — i.e. nothing beyond run-to-run noise,
+because the attention span is trivial at that length. Any benefit is a
+long-context effect and is unmeasured.
 
 A/B it without standing a server up:
 
@@ -87,14 +88,35 @@ A/B it without standing a server up:
 MUSE_FA_WINDOW=512 MUSE_N_PROMPT=2048 MUSE_GGUF=… ./bench_muse_decode
 ```
 
-**Speculative decode is the gap worth knowing about.** The vendor ships
-`dflash-kquant.gguf`, a quantized DFlash drafter intended exactly for this —
-speed with no quality change — so users of this model will expect `--draft` to
-work. Wiring it needs a `MuseBackendConfig` draft field, a drafter hook in
-`MuseBackend`, and a `decode_draft` row change. The step driver is already
-shaped for it (`muse_step` takes an arbitrary token count and a `kv_start`, and
-the KV append is `set_rows`-based with graph-stable node properties), so this is
-plumbing rather than new numerics.
+### Speculative decode — the gap worth knowing about, and what it actually costs
+
+The vendor ships `dflash-kquant.gguf`, a quantized DFlash drafter (arch
+`dflash`, 5 blocks, `n_embd` 6656 matching the target) intended exactly for
+this — speed with no quality change — so users of this model will expect
+`--draft` to work.
+
+It is **not** a config-plumbing job. `DFlashTarget` (`common/dflash_target.h`)
+requires:
+
+- `verify_batch(...)` which, during the forward, **captures intermediate
+  activations at `capture_layer_ids()` into the draft's feature ring** — the
+  drafter cross-attends to `target_hidden_cat` of shape `[5*hidden, ctx_len]`;
+- `read_verify_logits(...)`;
+- `snapshot_kv()` / `restore_kv()` so a rejected speculation can be rolled back.
+
+Two of those are missing outright. There is **no feature-capture tap anywhere in
+`muse_graph.cpp` or `muse_step.cpp`**, so the capture contract needs new graph
+work, not a hook. And there is no KV snapshot/restore: on the SWA layers the
+cache is a *rotated ring*, so rolling back past an eviction is not recoverable
+in principle — the row has been overwritten. That needs a sizing argument
+(ring headroom ≥ max speculation depth) before it is correct, not just an
+implementation. For scale, gemma4's `DFlashTarget` is 159 lines sitting on a
+1369-line backend with capture wired through its graph; `muse_backend.cpp` is
+223 lines.
+
+What *is* already favourable: `muse_step` takes an arbitrary token count plus a
+`kv_start`, so the verify forward itself needs no new driver, and the KV append
+is `set_rows`-based with graph-stable node properties.
 
 ## Architecture — a gemma4-shaped model
 
