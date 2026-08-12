@@ -301,6 +301,21 @@ struct DraftWeights {
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;  // sliding window size (0 = disabled)
     float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
+    // RoPE pairing convention. GGUF carries no key for it, so it cannot be read
+    // from the file; it was previously hardcoded at the ggml_rope_ext call
+    // sites, which hid the assumption. NEOX for every drafter measured so far.
+    // Choosing wrong leaves the drafter producing plausible-but-unrelated
+    // tokens — nothing fails, the acceptance rate just drops.
+    int   rope_type = 2;  // GGML_ROPE_TYPE_NEOX
+    // Attention among the noise slots WITHIN a draft block. The DFlash paper
+    // (arXiv:2602.06036, Fig. 2/4) trains the block bidirectionally — "tokens
+    // attend bidirectionally within the same block" — and the muse-glimmer
+    // vendor drafter follows it. The Qwen3-style drafters in this tree were
+    // converted against a causal-in-block mask and keep it. Like rope_type,
+    // no GGUF key carries this; running a bidirectional-trained drafter under
+    // a causal mask starves every slot of the block context it was trained
+    // with — nothing fails, the acceptance rate just collapses.
+    bool  block_bidirectional = false;
 
     // YaRN rope scaling (populated by loader; 0 = disabled / plain RoPE).
     float rope_freq_scale = 1.0f;   // 1/factor (e.g. 1/64 for factor=64)

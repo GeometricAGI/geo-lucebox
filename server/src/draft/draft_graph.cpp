@@ -177,7 +177,9 @@ DraftGraphOutputs build_draft_graph(
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_V", il);
             ggml_set_name(V, probe_name);
 
-            // ── 2d. RoPE (NEOX, theta=10M)
+            // ── 2d. RoPE. The pairing convention is w.rope_type (NEOX for the
+            //   Qwen3-style drafters, NORMAL for the muse-glimmer one) — GGUF
+            //   carries no key for it, so the loader sets it per family.
             //   Q: positions_q  [q_len]           values [ctx_len..ctx_len+q_len-1]
             //   K: positions_k  [eff_total_k]     — for SWA, starts from ctx_offset
             ggml_tensor * pk = in.positions_k;
@@ -186,12 +188,12 @@ DraftGraphOutputs build_draft_graph(
                                   ctx_offset * ggml_element_size(in.positions_k));
             }
             Q = ggml_rope_ext(ctx, Q, in.positions_q, /*freq_factors=*/nullptr,
-                              head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
+                              head_dim, w.rope_type, /*n_ctx_orig=*/0,
                               rope_base, /*freq_scale=*/1.0f,
                               /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
                               /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
             K = ggml_rope_ext(ctx, K, pk, nullptr,
-                              head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                              head_dim, w.rope_type, 0,
                               rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
             // ── 2e. Permute into the layout flash_attn_ext wants
@@ -310,7 +312,7 @@ static void draft_ctx_kv_rows(
     K = ggml_rms_norm(ctx, K, eps);
     K = ggml_mul     (ctx, K, L.k_norm);
     K = ggml_rope_ext(ctx, K, positions, /*freq_factors=*/nullptr,
-                      w.head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
+                      w.head_dim, w.rope_type, /*n_ctx_orig=*/0,
                       w.rope_theta, /*freq_scale=*/1.0f,
                       /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
                       /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
@@ -381,7 +383,7 @@ DraftGraphOutputs build_draft_kv_step(
         Q = ggml_rms_norm(ctx, Q, eps);
         Q = ggml_mul     (ctx, Q, L.q_norm);
         Q = ggml_rope_ext(ctx, Q, in.positions_q, nullptr,
-                          head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                          head_dim, w.rope_type, 0,
                           rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // ── noise K/V into the scratch cache slots
@@ -390,7 +392,7 @@ DraftGraphOutputs build_draft_kv_step(
         Kn = ggml_rms_norm(ctx, Kn, eps);
         Kn = ggml_mul     (ctx, Kn, L.k_norm);
         Kn = ggml_rope_ext(ctx, Kn, in.positions_q, nullptr,
-                           head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                           head_dim, w.rope_type, 0,
                            rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         ggml_tensor * Kn_rows = ggml_view_2d(ctx, Kn,
             (int64_t)head_dim * n_kv, q_len, Kn->nb[2], 0);

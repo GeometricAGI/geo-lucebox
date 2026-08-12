@@ -350,6 +350,20 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
         ggml_backend_buft_is_meta(
             ggml_backend_buffer_get_type(src_target_feat->buffer));
 
+    // Both paths below decode the source as BF16. muse-glimmer's capture ring
+    // is F32, and reading F32 bytes as BF16 does not fault — it silently
+    // halves the row and feeds the drafter garbage, which costs acceptance
+    // rate and fails nothing. Refuse anything this function cannot actually
+    // read; the F32 fast path is handled separately.
+    if (src_target_feat->type != GGML_TYPE_BF16 &&
+        src_target_feat->type != GGML_TYPE_F32) {
+        std::fprintf(stderr,
+                     "[dflash-feature] unsupported target feature dtype %s "
+                     "(expected BF16 or F32)\n",
+                     ggml_type_name(src_target_feat->type));
+        return false;
+    }
+
     if (meta_source) {
         // Bound host scratch for long prefix restores. Qwen3.6-27B has
         // fc_in=25,600, so gathering all 4,096 rows at once used roughly
@@ -445,9 +459,13 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
             (const char *)src_target_feat->data + (size_t)src_slot * src_stride;
         void * dst =
             (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
-        if (!convert_bf16_feature_to_storage(mirror, src, mirror.target_device, dst, elems)) {
-            return false;
-        }
+        const bool converted =
+            src_target_feat->type == GGML_TYPE_F32
+                ? convert_device_f32_to_feature_type(mirror, src,
+                                                     mirror.target_device, dst, elems)
+                : convert_bf16_feature_to_storage(mirror, src,
+                                                  mirror.target_device, dst, elems);
+        if (!converted) return false;
         cudaError_t err = cudaGetLastError();
         if (feature_cuda_failed("cudaGetLastError", err)) return false;
         done += run;
