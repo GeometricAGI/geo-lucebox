@@ -126,4 +126,32 @@ bool load_muse_gguf_partial(const std::string & path,
 
 void free_muse_weights(MuseWeights & w);
 
+// ── Graph builders (muse_graph.cpp) ────────────────────────────────────
+// `cur` for the attention block is the PRE-attention normed hidden state:
+// the attention gate is projected from it. `kv_idx` (I32, n_tokens) selects
+// cache rows for the set_rows append; pass nullptr for the offset-view path.
+
+ggml_tensor * build_muse_attn_block(ggml_context * ctx, ggml_cgraph * gf,
+                                    const MuseWeights & w, const MuseLayer & L,
+                                    ggml_tensor * cache_k, ggml_tensor * cache_v,
+                                    int il, ggml_tensor * cur,
+                                    ggml_tensor * positions,
+                                    ggml_tensor * attn_mask,
+                                    ggml_tensor * kv_idx,
+                                    int kv_start, int n_tokens);
+
+ggml_tensor * build_muse_layer(ggml_context * ctx, ggml_cgraph * gf,
+                               const MuseWeights & w,
+                               ggml_tensor * cache_k, ggml_tensor * cache_v,
+                               int il, ggml_tensor * inpL,
+                               ggml_tensor * positions, ggml_tensor * attn_mask,
+                               ggml_tensor * kv_idx,
+                               int kv_start, int n_tokens);
+
+ggml_tensor * build_muse_inp_norm(ggml_context * ctx, const MuseWeights & w,
+                                  ggml_tensor * inp_embd);
+
+ggml_tensor * build_muse_head(ggml_context * ctx, const MuseWeights & w,
+                              ggml_tensor * cur);
+
 }  // namespace dflash::common

@@ -85,9 +85,32 @@ port afterthought:
   reasoning turn or a chained tool call.
   Note for S4: the 105/106 artifact already loads here — lucebox's ggml
   knows those qtypes — so S4 is sidecar registration, not type plumbing.
-- **S3 — graph.** Dense 52-layer forward with the attn-gate node, softcap,
-  logit scale. Numerical parity target: logits vs `llama.cpp` on the
-  `muse-rocmfpx-cuda` branch for a fixed prompt.
+- **S3 — graph builders. DONE (block level).** `src/muse/muse_graph.cpp`
+  ports the semantics from llama.cpp's `src/models/muse-glimmer.cpp` — the
+  implementation the artifacts were gated against — as
+  `build_muse_{inp_norm,attn_block,layer,head}`. **Parity verified on the
+  real 16.76 GB artifact**: full 52-layer forward, argmax and top-8 identical
+  to llama.cpp, rms 0.120 (CUDA ref) / 0.131 (CPU ref).
+
+  Six details are not inferable from tensor names, and the harness earned
+  its keep on the last one:
+  1. input embeddings get an UNWEIGHTED RMS norm before layer 0;
+  2. post-attention / post-FFN norms use eps **1e-8**, not the model's
+     1e-5 `f_norm_rms_eps`;
+  3. RoPE runs on the **SWA layers only** — full-attention layers are NoPE;
+  4. the attention gate projects the PRE-attention normed hidden state, is
+     sigmoid'd, and multiplies the attention output BEFORE `wo`;
+  5. SDPA scale is the standard `1/sqrt(head_dim)` — gemma4 next door uses
+     1.0 because its Q/K norms absorb it; muse does not;
+  6. rope type is **NORMAL**, not NeoX. Copying gemma4's NeoX measured
+     rms 1.08 / max 4.63 against the reference while leaving argmax intact
+     on a short prompt — i.e. it looks fine until it is benchmarked.
+
+  Tolerance is calibrated, not guessed: llama.cpp's own CUDA-vs-CPU logits
+  on this artifact differ by rms 0.107, so the gate is rms <= 0.25 plus
+  exact argmax and top-8 agreement. Remaining for a servable path: the
+  daemon-side step loop (batching, KV ring management, CUDA-graph replay)
+  and the backend/factory/capability wiring.
 - **S4 — qtype 105/106.** Register the dmix2 sidecar (KV-embedded, name-keyed)
   through the existing `ggml_cuda_rocmfp{2,3}_mix_register_host` registry that
   the ds4 line already carries; full-offload refusal identical to ds4.
