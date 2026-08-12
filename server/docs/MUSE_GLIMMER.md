@@ -13,7 +13,7 @@ C++ that compiles and runs identically under either.
 | Backend | Verified on | Notes |
 |---|---|---|
 | **CUDA** | **H200 (sm90)** | Full quality gate + parity + throughput. No sm90-specific code; other archs should build but are unverified. |
-| **HIP/ROCm** | **gfx1201** (R9700 AI), **gfx1151** (Strix Halo) | Both targets in one binary, ROCm 7.2.2. Quality gate not yet re-run here; load, decode and mix registration verified. |
+| **HIP/ROCm** | **gfx1201** (R9700 AI), **gfx1151** (Strix Halo) | Both targets in one binary, ROCm 7.2.2. Spec-decode correctness verified on both (token-identical to greedy); `--draft` is a throughput *loss* here. |
 
 ## Artifacts
 
@@ -45,7 +45,7 @@ a config field forces the row to be updated.
 
 | Feature | Flag | muse-glimmer | For contrast |
 |---|---|---|---|
-| Speculative decode | `--draft` | **Yes** (monolithic; measured 1.05–1.45× — see below) | qwen35 both, gemma4 monolithic |
+| Speculative decode | `--draft` | **Yes** (monolithic). 1.05–1.45× on CUDA; a **slowdown on AMD** — see below | qwen35 both, gemma4 monolithic |
 | Draft over IPC | `--draft-ipc-bin` | **No** | qwen35 |
 | Draft tree / budget / temp | `--ddtree*` | **No** | qwen35 both |
 | Verify width | `--verify-width` | **No** | laguna |
@@ -89,7 +89,7 @@ A/B it without standing a server up:
 MUSE_FA_WINDOW=512 MUSE_N_PROMPT=2048 MUSE_GGUF=… ./bench_muse_decode
 ```
 
-### Speculative decode — implemented, verified-correct, 1.05–1.45× measured
+### Speculative decode — verified-correct on CUDA and HIP; a speedup only on CUDA
 
 `--draft ~/models/muse-glimmer-gguf/dflash-kquant.gguf` loads the vendor
 drafter (arch `dflash`, 5 blocks, `n_embd` 6656, block size 16, mask token
@@ -128,18 +128,38 @@ bite — the first version of that test failed its own control, which is how the
 property above was found.
 
 **Correctness is the tested property.** `test_muse_spec_decode` asserts the
-speculative output is token-identical to greedy AR — measured 64/64 identical
-on a rigid-continuation prompt — with one calibrated exception no
-implementation can remove: ggml uses a matrix-vector kernel at one token and a
-GEMM at many, and one batched verify shifts the logits by up to **0.42 (rms
-0.08)** against one-at-a-time decode (same order as llama.cpp's own CUDA-vs-CPU
-rms 0.107 that the parity gate is calibrated against; K/V bytes shift ≤ 0.5
-against magnitudes of ~16). Where the target's top-2 margin is inside that
-drift band, which token wins is kernel-scheduling luck; the test therefore
-requires identity up to the first in-band margin and fails any divergence at a
-wide margin. Its mechanism control double-norms the drafter's hidden states:
+speculative output is token-identical to greedy AR: **64/64 identical on H200
+and on gfx1151**, and on gfx1201 the check covered 19 tokens before the
+target's own margins fell inside that GPU's (widest) drift band — its coverage
+guard failed the run rather than let a short demonstration pass as a long one,
+which is why the identity prompt now counts numerically instead of in words.
+There is one calibrated exception no implementation can remove: ggml uses a
+matrix-vector
+kernel at one token and a GEMM at many, so one batched verify shifts the logits
+against one-at-a-time decode. Where the target's top-2 margin is inside that
+drift band, which token wins is kernel-scheduling luck; the test requires
+identity up to the first in-band margin and fails any divergence at a wide
+margin. Its mechanism control double-norms the drafter's hidden states:
 acceptance must drop (proves the projection is on the path) while output stays
 identical (proves verification governs).
+
+**The drift is platform-dependent, so the threshold is measured, not fixed.**
+Same 16-token batch, same artifact:
+
+| | max Δlogit | rms | K/V max Δ |
+|---|---|---|---|
+| H200 (CUDA) | 0.42 | 0.082 | 0.41 |
+| gfx1151 (HIP) | 0.56 | 0.091 | 0.36 |
+| gfx1201 (HIP) | **0.77** | 0.143 | 0.73 |
+
+The AMD kernels drift ~1.8× further than CUDA — the same order as llama.cpp's
+own CUDA-vs-CPU rms 0.107 that the graph-parity gate is calibrated against.
+`test_muse_verify_capture` therefore uses the drift it measures *in that run*
+as its own tie threshold (self-calibrating, and tighter on H200 than the
+constant it replaced), and `test_muse_spec_decode`, which drives the backend
+and cannot measure drift itself, carries 1.0 to clear all three platforms. A
+0.5 constant calibrated on H200 alone sat *below* gfx1201's real drift and
+would have reported a legitimate tie-break there as an implementation bug.
 
 **The one convention that mattered: the block mask is BIDIRECTIONAL.** The
 generic draft graph masked the noise block causally (the Qwen3-style drafters
@@ -156,10 +176,25 @@ indistinguishable from NORMAL, and NEOX is what the reference uses) and RAW
 noise embeddings (`ggml_get_rows` of the target table, no norm — measured
 within noise of the RMS-normed variant, reference behaviour kept).
 
-**Performance** (H200, muse-v4, chat traffic through the server): ~2.4–3.2
-tokens committed per verify round, **73–101 tok/s vs ~70 AR = 1.05–1.45×**.
-Real, but short of the vendor's 3.1× llama.cpp figure, for two measured
-reasons:
+**Performance is a CUDA-only win. Do not enable `--draft` on the AMD parts.**
+Same code, same drafter, same 5-prompt chat set at 256 tokens; acceptance is
+statistically indistinguishable across all three GPUs, so the difference is
+entirely the cost of the batched verify:
+
+| GPU | artifact | AR | with `--draft` | ratio | accept |
+|---|---|---|---|---|---|
+| H200 (CUDA) | muse-v4 | ~70 tok/s | 73–101 | **1.05–1.45×** | 0.15–0.20 |
+| gfx1201 (R9700 AI) | muse-lowbpw-r1 | 27.6–27.8 | 13.6–21.1 | **0.49–0.76×** | 0.15–0.24 |
+| gfx1151 (Strix Halo) | muse-lowbpw-r1 | 16.7 | 4.7–7.6 | **0.28–0.46×** | 0.14–0.23 |
+
+The 16-token verify forward costs ~1.9 AR steps on H200, ~4.4 on gfx1201 and
+~6.6 on gfx1151. Speculation can only pay when a batch of D costs less than the
+D AR steps it replaces, and on these AMD kernels it does not — the same
+batched-GEMM weakness the dense mix matvec work exposed from the other
+direction. The backend prints the measured ratio for its platform at startup.
+
+On CUDA it is still short of the vendor's 3.1× llama.cpp figure, for two
+measured reasons:
 
 1. **A 16-token verify forward costs ~1.9 AR steps on these kernels** (26.7 ms
    vs 14.3 ms after moving verify argmax onto the GPU; it was 33 ms before).

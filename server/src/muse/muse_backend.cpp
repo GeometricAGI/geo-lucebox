@@ -220,18 +220,26 @@ bool MuseBackend::load_decode_draft() {
 
     std::printf("[muse] spec-decode ready: depth=%d mirror_cap=%d\n",
                 dw_.block_size, feat_cap);
-    // Honest expectation-setting, same spirit as the --fa-window warning.
-    // Measured on H200 + muse-v4 (chat traffic through the server): ~2.4-3.2
-    // tokens committed per verify round, 73-101 vs ~70 tok/s AR = 1.05-1.45x.
-    // Real but well short of the vendor's 3.1x llama.cpp figure, mostly
-    // because a 16-token verify forward costs ~1.9 AR steps on these kernels
-    // and the context features are re-projected every round instead of cached.
-    // The per-request "[muse-spec]" line reports the live rate.
+    // Honest expectation-setting, same spirit as the --fa-window warning, and
+    // platform-specific because the measurement is: acceptance is the same
+    // everywhere (~0.15-0.24) but the batched verify is not. A 16-token verify
+    // costs ~1.9 AR steps on H200, ~4.4 on gfx1201, ~6.6 on gfx1151, so
+    // speculation pays on CUDA (1.05-1.45x) and LOSES on both AMD parts
+    // (0.28-0.76x). A user who passes --draft expects a speedup; on HIP they
+    // will get the opposite, so say so rather than let them discover it.
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    std::fprintf(stderr,
+        "[muse] WARNING speculative decode is output-verified but is a "
+        "SLOWDOWN on the AMD parts measured so far: 0.49-0.76x vs AR on "
+        "gfx1201, 0.28-0.46x on gfx1151 (acceptance is fine; the 16-token "
+        "verify costs 4.4-6.6 AR steps). Prefer plain AR decode here.\n");
+#else
     std::fprintf(stderr,
         "[muse] speculative decode: output-verified; measured 1.05-1.45x vs AR "
         "on H200 chat traffic (vendor's llama.cpp reference reaches 3.1x — "
         "verify-cost headroom remains). Watch the [muse-spec] line per "
         "request.\n");
+#endif
     std::fflush(stdout);
     return true;
 }
