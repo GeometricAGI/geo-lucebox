@@ -48,11 +48,23 @@ int main() {
         return 77;
     }
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    // Prefer a GPU device when one exists: the low-bpw artifact's qtype
+    // 105/106 tensors can only be registered (and decoded) there, so a
+    // CPU-only run would test a different path than the one that serves.
+    ggml_backend_t backend = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && !backend; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            backend = ggml_backend_dev_init(dev, nullptr);
+        }
+    }
+    const bool on_gpu = backend != nullptr;
+    if (!backend) backend = ggml_backend_cpu_init();
     if (!backend) {
-        std::fprintf(stderr, "FAIL: ggml_backend_cpu_init\n");
+        std::fprintf(stderr, "FAIL: no backend\n");
         return 1;
     }
+    std::printf("[test] backend: %s\n", on_gpu ? "GPU" : "CPU");
 
     // Layer 0 only: the whole point is to parse metadata and bind tensors
     // without paying for a 17 GB residency in a unit test.
@@ -63,8 +75,17 @@ int main() {
 
     MuseWeights w;
     if (!load_muse_gguf_partial(path, backend, plan, w)) {
-        std::fprintf(stderr, "FAIL: load_muse_gguf_partial: %s\n",
-                     dflash27b_last_error());
+        const std::string err = dflash27b_last_error();
+        // On CPU, an artifact with qtype-105/106 tensors MUST be refused with
+        // the host-residency message rather than loading into a path that
+        // cannot decode it. That refusal is the expected result, not a
+        // failure.
+        if (!on_gpu && err.find("host-resident") != std::string::npos) {
+            std::printf("OK: mix artifact refused on CPU (%s)\n", err.c_str());
+            ggml_backend_free(backend);
+            return 0;
+        }
+        std::fprintf(stderr, "FAIL: load_muse_gguf_partial: %s\n", err.c_str());
         ggml_backend_free(backend);
         return 1;
     }

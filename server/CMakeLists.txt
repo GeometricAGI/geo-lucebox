@@ -385,6 +385,7 @@ add_library(dflash_common STATIC
     src/muse/muse_loader.cpp
     src/muse/muse_graph.cpp
     src/muse/muse_step.cpp
+    src/muse/muse_dmix2.cpp
     src/gemma4/gemma4_loader.cpp
     src/gemma4/gemma4_graph.cpp
     src/gemma4/gemma4_backend.cpp

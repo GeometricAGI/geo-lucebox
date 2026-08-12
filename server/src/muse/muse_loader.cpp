@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <map>
+#include <set>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -485,6 +487,44 @@ bool load_muse_gguf_partial(const std::string & path,
             if (!r.second) {
                 set_last_error("muse: blk." + std::to_string(il) + "." +
                                r.first + ".weight missing");
+                gguf_free(gctx); return false;
+            }
+        }
+    }
+
+    // ── qtype 105/106: register the dmix2 sidecar ──────────────────────
+    // Those wires carry only codes; the per-tensor codebook + mode live in a
+    // GGUF KV. A model with mix tensors and no sidecar would decode against
+    // fixed levels — plausible-looking output from the wrong numbers — so the
+    // load fails instead.
+    {
+        std::map<std::string, ggml_tensor *> resident_mix;
+        std::set<std::string> all_mix;
+        for (int i = 0; i < n_tensors; ++i) {
+            const char * name = gguf_get_tensor_name(gctx, i);
+            const int qt = (int)gguf_get_tensor_type(gctx, i);
+            if (qt != 105 && qt != 106) continue;
+            all_mix.insert(name);
+            if (!should_load_muse_tensor(name, plan)) continue;
+            resident_mix[name] = ggml_get_tensor(meta_ctx, name);
+        }
+        if (!resident_mix.empty()) {
+            const int64_t kid = gguf_find_key(gctx, "geoquant.dmix2.sidecar");
+            if (kid < 0 || gguf_get_kv_type(gctx, kid) != GGUF_TYPE_ARRAY ||
+                gguf_get_arr_type(gctx, kid) != GGUF_TYPE_UINT8) {
+                set_last_error("muse: model carries " +
+                               std::to_string(resident_mix.size()) +
+                               " qtype-105/106 tensors but no "
+                               "geoquant.dmix2.sidecar u8 KV");
+                gguf_free(gctx); return false;
+            }
+            const uint8_t * blob = (const uint8_t *)gguf_get_arr_data(gctx, kid);
+            const size_t blob_len = gguf_get_arr_n(gctx, kid);
+            std::vector<MuseDmix2Entry> entries;
+            if (!muse_parse_dmix2_sidecar(blob, blob_len, entries)) {
+                gguf_free(gctx); return false;   // parser set the message
+            }
+            if (!muse_register_dmix2(entries, resident_mix, all_mix)) {
                 gguf_free(gctx); return false;
             }
         }

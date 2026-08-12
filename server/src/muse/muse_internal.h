@@ -21,6 +21,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -153,6 +155,33 @@ ggml_tensor * build_muse_inp_norm(ggml_context * ctx, const MuseWeights & w,
 
 ggml_tensor * build_muse_head(ggml_context * ctx, const MuseWeights & w,
                               ggml_tensor * cur);
+
+// ── dmix2 sidecar (muse_dmix2.cpp) ─────────────────────────────────────
+// Out-of-band codebooks for the qtype-105/106 tensors of the low-bpw
+// artifact. Parsed from the `geoquant.dmix2.sidecar` GGUF KV and handed to
+// the CUDA/HIP mix registry shared with the DeepSeek4 line.
+
+struct MuseDmix2Entry {
+    std::string name;
+    int  qtype = 0;            // 105 or 106
+    uint8_t mode = 0;          // 0 fixed levels, 1 learned codebook
+    std::vector<uint16_t> codebook;   // C*K bf16 bit patterns, row-major
+};
+
+// Parse (and strictly validate) a dmix2 blob.
+bool muse_parse_dmix2_sidecar(const uint8_t * blob, size_t len,
+                              std::vector<MuseDmix2Entry> & out);
+
+// Register the resident mix tensors with the device registry.
+//   `resident`    — name -> tensor for the 105/106 tensors THIS load bound.
+//   `all_in_file` — names of every 105/106 tensor in the file.
+// Every resident tensor must have an entry (a missing one would decode
+// against fixed levels), and every entry must name a mix tensor of the file
+// (anything else is sidecar drift). Entries for tensors outside a partial
+// load's range are expected and ignored.
+bool muse_register_dmix2(const std::vector<MuseDmix2Entry> & entries,
+                         const std::map<std::string, ggml_tensor *> & resident,
+                         const std::set<std::string> & all_in_file);
 
 // ── KV cache + step driver (muse_step.cpp) ─────────────────────────────
 

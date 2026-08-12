@@ -133,9 +133,20 @@ port afterthought:
 Remaining for a servable path: the ModelBackend implementation (parking,
 snapshots, drafter hooks), daemon wiring, backend factory + capability-table
 row, and batching/CUDA-graph replay tuning.
-- **S4 — qtype 105/106.** Register the dmix2 sidecar (KV-embedded, name-keyed)
-  through the existing `ggml_cuda_rocmfp{2,3}_mix_register_host` registry that
-  the ds4 line already carries; full-offload refusal identical to ds4.
+- **S4 — qtype 105/106 sidecar. DONE.** `src/muse/muse_dmix2.cpp` parses the
+  name-keyed `geoquant.dmix2.sidecar` KV and registers each resident mix
+  tensor with the `ggml_cuda_rocmfp{2,3}_mix_register_host` registry the ds4
+  line already carries (dense ⇒ `n_experts = 1`). Verified on the real
+  11.5 GB artifact: 71 entries parsed, resident tensors registered.
+
+  Cover rules, chosen so neither direction can go wrong quietly:
+  every RESIDENT mix tensor must have an entry (a missing one would decode
+  against fixed levels — plausible output from the wrong numbers), and every
+  entry must name a mix tensor **of the file** rather than of this load, so a
+  layer-split target legitimately covering a subset is not mistaken for
+  drift. Host-resident mix tensors are refused by name: decode is GPU-only,
+  and on unified memory (Strix Halo) a host pointer may read something valid
+  but wrong instead of faulting.
 - **S5 — gate parity.** Run the 122-item agentic golden suite against
   lucebox-served muse-v4 and compare with the llama.cpp bands
   (muse-v4 103–106, muse-lowbpw-r1 101–103, official 100–101, bf16 103).
