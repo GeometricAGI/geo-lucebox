@@ -160,17 +160,37 @@ struct MuseCache {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     std::vector<ggml_tensor *> k, v;   // per layer
-    int max_ctx  = 0;   // rows on full-attention layers
-    int swa_size = 0;   // ring rows on sliding-window layers
-    int n_layer  = 0;
+    int max_ctx    = 0;   // rows on full-attention layers
+    // Sliding-window layers keep TWO distinct numbers. The window is the
+    // model's attention span; the ring is how many rows are allocated, and it
+    // must exceed the window by at least one chunk. With ring == window a
+    // chunked prefill evicts rows that queries in the SAME chunk still need
+    // (every write in a graph lands before any read), which mis-attends
+    // silently instead of failing — measured on an 8-token probe with a
+    // 4-row ring: chunked vs stepwise prefill diverged by rms 2.11 with a
+    // different argmax.
+    int swa_window = 0;   // attention span (from the model)
+    int swa_ring   = 0;   // allocated ring rows = window + headroom
+    int n_layer    = 0;
+
+    // Largest chunk muse_step will accept. When the ring spans the whole
+    // context the rows never rotate, so nothing can clobber itself and the
+    // limit is just the context.
+    int max_chunk() const {
+        return swa_ring >= max_ctx ? max_ctx : swa_ring - swa_window;
+    }
 };
 
 // True when the SWA ring slot is visible to a query at `q_abs`, given that
-// `total` tokens have been written. Exposed for unit testing the wrap.
-bool muse_swa_slot_visible(int total, int q_abs, int slot, int swa_size);
+// `total` tokens have been written. Occupancy uses `ring_rows`, visibility
+// uses `window` — they are different numbers. Exposed for unit testing.
+bool muse_swa_slot_visible(int total, int q_abs, int slot, int ring_rows,
+                           int window);
 
+// `max_chunk` is the largest prefill chunk that will be used; the SWA ring is
+// sized to window + max_chunk so a chunk never evicts its own history.
 bool create_muse_cache(ggml_backend_t backend, const MuseWeights & w,
-                       int max_ctx, MuseCache & out);
+                       int max_ctx, MuseCache & out, int max_chunk = 512);
 void free_muse_cache(MuseCache & c);
 
 // One forward step over `n_tokens` embeddings starting at absolute position

@@ -32,6 +32,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -88,28 +89,38 @@ static int test_swa_ring_wrap() {
     const int S = 4;
 
     // Before any wrap (total=3): slots 0..2 hold positions 0..2, slot 3 empty.
-    expect(muse_swa_slot_visible(3, 2, 0, S), true,  "t=3 q=2 slot0 (pos 0)");
-    expect(muse_swa_slot_visible(3, 2, 2, S), true,  "t=3 q=2 slot2 (pos 2)");
-    expect(muse_swa_slot_visible(3, 2, 3, S), false, "t=3 q=2 slot3 (empty)");
-    expect(muse_swa_slot_visible(3, 1, 2, S), false, "t=3 q=1 slot2 (future)");
+    expect(muse_swa_slot_visible(3, 2, 0, S, S), true,  "t=3 q=2 slot0 (pos 0)");
+    expect(muse_swa_slot_visible(3, 2, 2, S, S), true,  "t=3 q=2 slot2 (pos 2)");
+    expect(muse_swa_slot_visible(3, 2, 3, S, S), false, "t=3 q=2 slot3 (empty)");
+    expect(muse_swa_slot_visible(3, 1, 2, S, S), false, "t=3 q=1 slot2 (future)");
 
     // After wrap (total=6): slot0 -> pos 4, slot1 -> pos 5, slot2 -> pos 2,
     // slot3 -> pos 3. A query at pos 5 sees the window [2,5] — all four.
-    expect(muse_swa_slot_visible(6, 5, 0, S), true, "t=6 q=5 slot0 (pos 4)");
-    expect(muse_swa_slot_visible(6, 5, 1, S), true, "t=6 q=5 slot1 (pos 5)");
-    expect(muse_swa_slot_visible(6, 5, 2, S), true, "t=6 q=5 slot2 (pos 2)");
-    expect(muse_swa_slot_visible(6, 5, 3, S), true, "t=6 q=5 slot3 (pos 3)");
+    expect(muse_swa_slot_visible(6, 5, 0, S, S), true, "t=6 q=5 slot0 (pos 4)");
+    expect(muse_swa_slot_visible(6, 5, 1, S, S), true, "t=6 q=5 slot1 (pos 5)");
+    expect(muse_swa_slot_visible(6, 5, 2, S, S), true, "t=6 q=5 slot2 (pos 2)");
+    expect(muse_swa_slot_visible(6, 5, 3, S, S), true, "t=6 q=5 slot3 (pos 3)");
 
     // A query at pos 4 must NOT see slot1 (pos 5 is in its future) — the case
     // a naive contiguous-span mask gets wrong mid-chunk.
-    expect(muse_swa_slot_visible(6, 4, 1, S), false, "t=6 q=4 slot1 (future)");
+    expect(muse_swa_slot_visible(6, 4, 1, S, S), false, "t=6 q=4 slot1 (future)");
     // ...and pos 1 has been overwritten by pos 5, so nothing exposes it.
-    expect(muse_swa_slot_visible(6, 4, 0, S), true,  "t=6 q=4 slot0 (pos 4)");
+    expect(muse_swa_slot_visible(6, 4, 0, S, S), true,  "t=6 q=4 slot0 (pos 4)");
 
     // Window edge: at total=8, q=7, slot3 holds pos 7-... check eviction.
     // slot0 -> 4, slot1 -> 5, slot2 -> 6, slot3 -> 7; window [4,7].
-    expect(muse_swa_slot_visible(8, 7, 0, S), true, "t=8 q=7 slot0 (pos 4)");
-    expect(muse_swa_slot_visible(8, 4, 2, S), false, "t=8 q=4 slot2 (future 6)");
+    expect(muse_swa_slot_visible(8, 7, 0, S, S), true, "t=8 q=7 slot0 (pos 4)");
+    expect(muse_swa_slot_visible(8, 4, 2, S, S), false, "t=8 q=4 slot2 (future 6)");
+    // Ring LARGER than the window (the shipping configuration: ring =
+    // window + chunk headroom). With ring 8 and window 4 at total=8, slots
+    // 0..7 hold positions 0..7; a query at 7 sees only [4,7] even though
+    // positions 0..3 are still resident. Conflating ring and window here is
+    // exactly the bug the end-to-end wrap test caught.
+    expect(muse_swa_slot_visible(8, 7, 7, 8, 4), true,  "ring8 win4 q=7 slot7 (pos 7)");
+    expect(muse_swa_slot_visible(8, 7, 4, 8, 4), true,  "ring8 win4 q=7 slot4 (pos 4)");
+    expect(muse_swa_slot_visible(8, 7, 3, 8, 4), false, "ring8 win4 q=7 slot3 (pos 3 out of window)");
+    expect(muse_swa_slot_visible(8, 4, 5, 8, 4), false, "ring8 win4 q=4 slot5 (future)");
+    expect(muse_swa_slot_visible(8, 4, 1, 8, 4), true,  "ring8 win4 q=4 slot1 (pos 1 in window)");
     return fails;
 }
 
@@ -197,6 +208,83 @@ int main() {
         std::fprintf(stderr, "FAIL: prefill/incremental RMS %.6f exceeds 0.01 "
                              "— KV append, ring slot or mask mismatch\n", rms_ab);
         ++fails;
+    }
+
+    // ── Ring WRAP, end to end ──────────────────────────────────────────
+    // The runs above had swa_size == max_ctx, so the ring never rotated.
+    // Shrinking the window makes the same prompt wrap it several times; the
+    // model's attention span changes (so the llama.cpp reference no longer
+    // applies), but the property under test is unchanged: chunked prefill and
+    // one-token decode must reach identical logits. If the slot arithmetic or
+    // the ring mask is wrong, this is where it shows.
+    {
+        MuseWeights ws = w;                 // shares tensors; hparams copied
+        ws.sliding_window = 4;              // force a tiny window
+        const int ctx_small = 64;
+        const int chunk     = 4;            // ring becomes window + chunk = 8
+
+        std::vector<float> chunked, stepwise;
+        MuseCache c1;
+        if (!create_muse_cache(backend, ws, ctx_small, c1, chunk)) {
+            std::fprintf(stderr, "FAIL: wrap cache 1: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        // Chunked prefill at exactly the ring size — the largest chunk that
+        // cannot clobber its own rows.
+        int done = 0;
+        std::vector<float> tmp;
+        while (done < n) {
+            const int take = std::min(c1.max_chunk(), n - done);
+            if (!muse_step(backend, ws, c1, embd.data() + (size_t)done * ws.n_embd,
+                           take, done, tmp)) {
+                std::fprintf(stderr, "FAIL: wrap chunk at %d: %s\n", done,
+                             dflash27b_last_error());
+                return 1;
+            }
+            done += take;
+        }
+        chunked = tmp;
+        free_muse_cache(c1);
+
+        MuseCache c2;
+        if (!create_muse_cache(backend, ws, ctx_small, c2, chunk)) {
+            std::fprintf(stderr, "FAIL: wrap cache 2: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (!muse_step(backend, ws, c2, embd.data() + (size_t)i * ws.n_embd,
+                           1, i, stepwise)) {
+                std::fprintf(stderr, "FAIL: wrap step %d: %s\n", i,
+                             dflash27b_last_error());
+                return 1;
+            }
+        }
+        free_muse_cache(c2);
+
+        double max_w = 0.0;
+        const double rms_w = rms_between(chunked, stepwise, max_w);
+        std::printf("ring wrap (window=4 ring=8, %d tokens): argmax %d/%d | max|d|=%.5f "
+                    "rms=%.6f\n", n, argmax_of(chunked), argmax_of(stepwise),
+                    max_w, rms_w);
+        if (argmax_of(chunked) != argmax_of(stepwise) || rms_w > 0.01) {
+            std::fprintf(stderr, "FAIL: chunked and stepwise disagree across a "
+                                 "wrapped ring\n");
+            ++fails;
+        }
+
+        // And the guard: a chunk larger than the ring must be REFUSED, not
+        // silently mis-attended.
+        MuseCache c3;
+        if (!create_muse_cache(backend, ws, ctx_small, c3, chunk)) {
+            std::fprintf(stderr, "FAIL: wrap cache 3\n"); return 1;
+        }
+        std::vector<float> junk;
+        if (muse_step(backend, ws, c3, embd.data(), c3.max_chunk() + 1, 0, junk)) {
+            std::fprintf(stderr, "FAIL: oversized chunk was accepted (it would "
+                                 "clobber its own ring rows)\n");
+            ++fails;
+        }
+        free_muse_cache(c3);
     }
 
     if (ref && *ref) {
