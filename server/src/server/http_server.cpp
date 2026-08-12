@@ -860,6 +860,29 @@ json parse_responses_arguments(const json & item) {
     return json::object();
 }
 
+// ATEM form of a tool call, mirroring the chat template's render_atem macro.
+// Needed when a client replays an assistant tool-call turn that this server
+// did not itself produce (so tool_memory has no raw text for it): without
+// this the turn renders EMPTY and the model loses the fact that it called
+// the tool at all, which breaks every multi-step agentic episode.
+std::string render_tool_call_atem(const std::string & name,
+                                  const json & arguments) {
+    std::string out = "<atem:function_calls>\n<atem:invoke name=\"" + name +
+                      "\">\n";
+    if (arguments.is_object()) {
+        for (const auto & [key, value] : arguments.items()) {
+            out += "<atem:parameter name=\"" + key + "\">";
+            if (value.is_string())        out += value.get<std::string>();
+            else if (value.is_boolean())  out += value.get<bool>() ? "true" : "false";
+            else if (value.is_null())     out += "null";
+            else                          out += value.dump();
+            out += "</atem:parameter>\n";
+        }
+    }
+    out += "</atem:invoke>\n</atem:function_calls>";
+    return out;
+}
+
 std::string render_tool_call_xml(const std::string & name, const json & arguments) {
     std::string out = "<function=" + name + ">\n";
     if (arguments.is_object()) {
@@ -876,7 +899,8 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
-    ToolMemory & tool_memory) {
+    ToolMemory & tool_memory,
+    ChatFormat chat_format) {
     std::vector<ChatMessage> chat_msgs;
     std::vector<std::string> system_parts;
 
@@ -922,10 +946,44 @@ std::vector<ChatMessage> normalize_chat_messages(
                     if (!id.empty()) call_ids.push_back(id);
                 }
                 std::string raw = tool_memory.lookup(call_ids);
+                if (raw.empty()) {
+                    // Not ours to replay (a client-constructed history, or a
+                    // restarted server). Rebuild the call text from the
+                    // structured tool_calls instead of dropping the turn.
+                    for (const auto & tc : m["tool_calls"]) {
+                        const json & fn = tc.contains("function") ? tc["function"] : tc;
+                        const std::string fname = fn.value("name", "");
+                        if (fname.empty()) continue;
+                        json args = json::object();
+                        if (fn.contains("arguments")) {
+                            if (fn["arguments"].is_string()) {
+                                try {
+                                    args = json::parse(fn["arguments"].get<std::string>());
+                                } catch (const std::exception &) {
+                                    args = json::object();
+                                }
+                            } else if (fn["arguments"].is_object()) {
+                                args = fn["arguments"];
+                            }
+                        }
+                        if (!raw.empty()) raw += "\n";
+                        raw += (chat_format == ChatFormat::ATEM)
+                                   ? render_tool_call_atem(fname, args)
+                                   : render_tool_call_xml(fname, args);
+                    }
+                }
                 if (!raw.empty()) {
                     cm.content = raw;
                     replayed = true;
                 }
+            }
+
+            // ATEM addresses a tool result turn by NAME; without this the
+            // renderer falls back to the opaque tool_call_id and the model
+            // sees `<|start|>tool call_1<|message|><tool_output name="call_1">`
+            // instead of the function it just invoked.
+            if (cm.role == "tool") {
+                cm.name = m.value("name", "");
             }
 
             if (!replayed) {
@@ -1963,7 +2021,8 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
                 hr.path, body, req, count_tokens_only)) return false;
 
         const std::vector<ChatMessage> chat_messages =
-            normalize_chat_messages(req.messages, req.format, tool_memory_);
+            normalize_chat_messages(req.messages, req.format, tool_memory_,
+                                    chat_format_);
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, req);
@@ -2566,7 +2625,7 @@ void HttpServer::apply_flowkv_compression(
         tools_json = req.tools.dump();
     }
     const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
-        modified_messages, req.format, tool_memory_);
+        modified_messages, req.format, tool_memory_, chat_format_);
 
     std::string rendered;
     if (!config_.chat_template_src.empty()) {
