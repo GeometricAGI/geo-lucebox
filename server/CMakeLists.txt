@@ -384,6 +384,7 @@ add_library(dflash_common STATIC
     src/qwen3/qwen3_daemon.cpp
     src/muse/muse_loader.cpp
     src/muse/muse_graph.cpp
+    src/muse/muse_step.cpp
     src/gemma4/gemma4_loader.cpp
     src/gemma4/gemma4_graph.cpp
     src/gemma4/gemma4_backend.cpp
@@ -1455,7 +1456,8 @@ if(DFLASH27B_TESTS)
 
     # Muse-Glimmer loader + forward-graph parity against a real artifact
     # (both skip with 77 when the artifact / reference dump is absent).
-    foreach(_muse_art_test test_muse_loader test_muse_graph_parity)
+    foreach(_muse_art_test test_muse_loader test_muse_graph_parity
+                          test_muse_generate)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_muse_art_test}.cpp")
             add_executable(${_muse_art_test} test/${_muse_art_test}.cpp)
             target_include_directories(${_muse_art_test} PRIVATE
@@ -1652,7 +1654,8 @@ if(DFLASH27B_TESTS)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 if(_unit_target STREQUAL "test_muse_loader" OR
-                   _unit_target STREQUAL "test_muse_graph_parity")
+                   _unit_target STREQUAL "test_muse_graph_parity" OR
+                   _unit_target STREQUAL "test_muse_generate")
                     # Exit 77 = skipped (no artifact on this machine).
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES
                         SKIP_RETURN_CODE 77)

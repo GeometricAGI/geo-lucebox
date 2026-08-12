@@ -154,4 +154,30 @@ ggml_tensor * build_muse_inp_norm(ggml_context * ctx, const MuseWeights & w,
 ggml_tensor * build_muse_head(ggml_context * ctx, const MuseWeights & w,
                               ggml_tensor * cur);
 
+// ── KV cache + step driver (muse_step.cpp) ─────────────────────────────
+
+struct MuseCache {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<ggml_tensor *> k, v;   // per layer
+    int max_ctx  = 0;   // rows on full-attention layers
+    int swa_size = 0;   // ring rows on sliding-window layers
+    int n_layer  = 0;
+};
+
+// True when the SWA ring slot is visible to a query at `q_abs`, given that
+// `total` tokens have been written. Exposed for unit testing the wrap.
+bool muse_swa_slot_visible(int total, int q_abs, int slot, int swa_size);
+
+bool create_muse_cache(ggml_backend_t backend, const MuseWeights & w,
+                       int max_ctx, MuseCache & out);
+void free_muse_cache(MuseCache & c);
+
+// One forward step over `n_tokens` embeddings starting at absolute position
+// `kv_start`. Returns the logits of the LAST token. Prefill is the same call
+// with n_tokens > 1.
+bool muse_step(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
+               const float * embed, int n_tokens, int kv_start,
+               std::vector<float> & out_logits);
+
 }  // namespace dflash::common

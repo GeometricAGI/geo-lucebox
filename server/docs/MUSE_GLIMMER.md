@@ -108,9 +108,31 @@ port afterthought:
 
   Tolerance is calibrated, not guessed: llama.cpp's own CUDA-vs-CPU logits
   on this artifact differ by rms 0.107, so the gate is rms <= 0.25 plus
-  exact argmax and top-8 agreement. Remaining for a servable path: the
-  daemon-side step loop (batching, KV ring management, CUDA-graph replay)
-  and the backend/factory/capability wiring.
+  exact argmax and top-8 agreement.
+- **S3b — KV cache + step driver. DONE.** `src/muse/muse_step.cpp`:
+  per-layer cache (full layers `max_ctx` rows, SWA layers a `swa_size` ring
+  indexed by absolute position % swa_size), per-step full and ring masks,
+  `set_rows` append with row indices as graph inputs (stable node properties
+  for CUDA-graph replay), and `muse_step()` covering prefill and decode.
+  `test_muse_generate` checks that one prefill of N tokens and
+  (prefill N-1 + one decode step) produce the SAME logits — same backend,
+  so any divergence is a cache/mask/position bug, not reduction order.
+  Measured: **bit-identical (max|d| = 0.0)**, and the incremental path also
+  matches the llama.cpp reference (rms 0.131).
+
+  The ring mask derives each slot's occupant (largest p < total with
+  p % S == slot) rather than assuming a contiguous span, because mid-chunk
+  the ring holds a rotated view and a start..end span would either mask live
+  rows or expose stale ones. **Honest limit:** the end-to-end runs so far all
+  had `swa_size == max_ctx`, so the ring has not actually wrapped in a full
+  forward — wrapping needs a prompt longer than the 2048-token window. The
+  wrap arithmetic is unit-tested model-free (`muse_swa_slot_visible`,
+  including the mid-chunk future-slot and eviction cases); a >2048-token
+  forward is still owed.
+
+Remaining for a servable path: the ModelBackend implementation (parking,
+snapshots, drafter hooks), daemon wiring, backend factory + capability-table
+row, and batching/CUDA-graph replay tuning.
 - **S4 — qtype 105/106.** Register the dmix2 sidecar (KV-embedded, name-keyed)
   through the existing `ggml_cuda_rocmfp{2,3}_mix_register_host` registry that
   the ds4 line already carries; full-offload refusal identical to ds4.
