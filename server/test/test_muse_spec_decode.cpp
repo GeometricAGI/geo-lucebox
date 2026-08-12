@@ -197,21 +197,25 @@ int main() {
     // The headline invariant — with the one exception no implementation can
     // remove. ggml runs a matrix-VECTOR kernel at one token and a GEMM at
     // many, so a 16-token verify forward and 16 single-token forwards
-    // accumulate in different orders. Measured on this artifact
-    // (test_muse_verify_capture): ONE batched forward shifts the logits by up
-    // to 0.42 (rms 0.08) against sequential — the same order as llama.cpp's
-    // own CUDA-vs-CPU drift (rms 0.107) that the graph-parity gate is
-    // calibrated against. Where the target's own top-2 margin is wider than
-    // that drift, the two paths must agree exactly; where it is narrower,
-    // which token wins is kernel-scheduling luck, not a property spec decode
-    // can be held to.
+    // accumulate in different orders. Where the target's own top-2 margin is
+    // wider than that drift, the two paths must agree exactly; where it is
+    // narrower, which token wins is kernel-scheduling luck, not a property
+    // spec decode can be held to.
     //
     // So: identity is required up to the first committed position whose
     // margin is inside the drift band. Diverging at a wide-margin position is
     // a real bug and fails. `min_coverage` guards the check against becoming
     // vacuous — a prompt whose margins collapse immediately proves nothing.
-    const float kTieMargin = 0.5f;    // ~1.2x the measured max single-batch
-                                      // drift of 0.42
+    //
+    // The threshold has to clear the drift on the WORST platform this runs on,
+    // and that is not a constant to guess: test_muse_verify_capture measures it
+    // per run and reports max drift 0.42 on H200 (CUDA), 0.56 on gfx1151 and
+    // 0.77 on gfx1201 (HIP) for the same batch — the AMD kernels drift ~1.8x
+    // further than CUDA, which a 0.5 constant calibrated on H200 alone did not
+    // cover. 1.0 clears all three and still sits well under the 1.3-2.7
+    // separation of a confident prediction, so a real accept-rule / rollback /
+    // KV bug fails loudly. Raise it from a measurement, never by feel.
+    const float kTieMargin = 1.0f;
     auto first_tie_of = [&](const RunOut & r) {
         for (size_t i = 0; i < r.margins.size(); ++i) {
             if (r.margins[i] < kTieMargin) return (int)i;
