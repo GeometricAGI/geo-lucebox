@@ -28,9 +28,22 @@ using dflash::common::ChatMessage;
 
 static int g_fails = 0;
 
+// Fixture location, in precedence order:
+//   1. DFLASH_TEST_DATA_DIR  -- for a relocated / installed tree;
+//   2. the source path baked in by CMake -- works from ANY working directory;
+//   3. a CWD-relative guess, only if someone builds this without the define.
+//
+// (2) exists because the CWD-relative form silently made this test pass when
+// run by hand from server/ and fail under ctest, which runs from the build
+// directory. A fixture-reading test that depends on where it was invoked from
+// is a test that reports the wrong answer half the time.
 static std::string data_dir() {
     if (const char * d = std::getenv("DFLASH_TEST_DATA_DIR")) return d;
+#ifdef DFLASH_MUSE_ATEM_DATA_DIR
+    return DFLASH_MUSE_ATEM_DATA_DIR;
+#else
     return "test/data/muse_atem";
+#endif
 }
 
 static bool read_file(const std::string & path, std::string & out) {

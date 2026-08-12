@@ -80,7 +80,7 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     // Never because MuseBackendConfig carries no field for it — the
     // static_asserts in backend_factory.cpp enforce that correspondence, so
     // this row cannot drift from what the backend can actually accept.
-    {"muse-glimmer", false, false, false, false,  kNever, kNever, kNever, kNever, kNever, kNever},
+    {"muse-glimmer", false, false, false, false,  kNever, kNever, kNever, kMono,  kNever, kNever},
 };
 
 inline constexpr std::size_t kArchCount =

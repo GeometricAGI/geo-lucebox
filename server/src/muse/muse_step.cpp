@@ -115,13 +115,28 @@ namespace {
 
 // Causal mask over a flat [0, kv_len) span: query i (absolute kv_start+i)
 // attends to every key at absolute position <= its own.
+//
+// `fa_window` > 0 additionally caps how far BACK a query may look on the
+// full-attention layers (the `--fa-window` sparse-decode knob; 0 = unlimited,
+// which is the default and leaves the mask bit-identical to the unwindowed
+// path). It applies only here: the SWA layers already carry the model's own
+// window and must keep it.
+//
+// Deliberately NOT clamped to the model's sliding_window or anything else:
+// this is a user-chosen span, and silently widening or narrowing it would make
+// the flag lie. It is a quality/throughput trade the caller opts into --
+// see the warning in the header for why it is dangerous on this model.
 void fill_full_mask(std::vector<ggml_fp16_t> & m, int kv_pad, int q_pad,
-                    int kv_start, int n_tokens) {
+                    int kv_start, int n_tokens, int fa_window) {
     std::fill(m.begin(), m.end(), ggml_fp32_to_fp16(-INFINITY));
     for (int i = 0; i < n_tokens; ++i) {
         const int q_abs = kv_start + i;
         const int upper = std::min(q_abs, kv_pad - 1);
-        for (int k = 0; k <= upper; ++k) {
+        // Inclusive lower bound: a window of W lets a query see itself plus
+        // the W-1 keys before it, so the span is [q_abs-W+1, q_abs].
+        const int lower = (fa_window > 0 && q_abs - fa_window + 1 > 0)
+                              ? (q_abs - fa_window + 1) : 0;
+        for (int k = lower; k <= upper; ++k) {
             m[(size_t)i * kv_pad + k] = ggml_fp32_to_fp16(0.0f);
         }
     }
@@ -246,7 +261,7 @@ bool muse_step(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
     ggml_backend_tensor_set(kvi_swa,  idx_swa.data(),  0, ggml_nbytes(kvi_swa));
 
     std::vector<ggml_fp16_t> mf((size_t)full_kv_len * q_pad);
-    fill_full_mask(mf, full_kv_len, q_pad, kv_start, n_tokens);
+    fill_full_mask(mf, full_kv_len, q_pad, kv_start, n_tokens, cache.fa_window);
     ggml_backend_tensor_set(mask_full, mf.data(), 0, ggml_nbytes(mask_full));
 
     std::vector<ggml_fp16_t> ms((size_t)swa_kv_len * q_pad);

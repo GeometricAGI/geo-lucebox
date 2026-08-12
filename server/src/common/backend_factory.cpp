@@ -418,6 +418,7 @@ std::unique_ptr<ModelBackend> create_backend(
         mcfg.device     = args.device;
         mcfg.stream_fd  = args.stream_fd;
         mcfg.chunk      = args.chunk;
+        mcfg.fa_window  = args.fa_window;
 
         auto backend = std::make_unique<MuseBackend>(mcfg);
         if (!backend->init()) {

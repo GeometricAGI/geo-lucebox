@@ -56,6 +56,30 @@ bool MuseBackend::init() {
         std::fprintf(stderr, "[muse] cache failed: %s\n", dflash27b_last_error());
         return false;
     }
+
+    // Reject rather than silently clamp: a window wider than the context is a
+    // misunderstanding of the flag, and quietly treating it as "unlimited"
+    // would hide that. Negative is nonsense.
+    if (cfg_.fa_window < 0 || cfg_.fa_window > cache_.max_ctx) {
+        std::fprintf(stderr, "[muse] --fa-window %d is out of range for ctx %d "
+                             "(0 = unlimited)\n", cfg_.fa_window, cache_.max_ctx);
+        return false;
+    }
+    cache_.fa_window = cfg_.fa_window;
+    if (cache_.fa_window > 0) {
+        // Loud on purpose. This model keeps its global context in 13
+        // full-attention layers; windowing them can drop the system prompt and
+        // tool definitions out of view, which is exactly how tool calling
+        // breaks. It has not been scored on the golden suite at any non-zero
+        // value, so the honest thing is to say so at startup.
+        std::fprintf(stderr,
+                     "[muse] WARNING --fa-window %d limits the %d full-attention "
+                     "layers to the last %d positions. Untested for quality on "
+                     "this model: run the golden suite before trusting it.\n",
+                     cache_.fa_window,
+                     (int)std::count(w_.swa_layers.begin(), w_.swa_layers.end(), false),
+                     cache_.fa_window);
+    }
     return true;
 }
 

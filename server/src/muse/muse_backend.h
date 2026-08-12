@@ -29,6 +29,16 @@ struct MuseBackendConfig {
     // chunk), so it is a correctness parameter, not only a throughput knob:
     // muse_step refuses a chunk larger than the headroom it was built for.
     int             chunk      = 512;
+
+    // `--fa-window`: cap how far back the FULL-attention layers look during
+    // decode (0 = unlimited, the default). Monolithic only -- there is no
+    // layer-split adapter for this family to forward it through.
+    //
+    // Off by default on purpose: this model has only 13 full-attention layers
+    // and they carry its global context, so a finite window there is a real
+    // quality risk (dropping the system prompt and tool definitions out of
+    // view is how tool calling breaks), not a free speedup.
+    int             fa_window  = 0;
 };
 
 class MuseBackend : public ModelBackend {

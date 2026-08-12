@@ -199,6 +199,17 @@ struct MuseCache {
     // 4-row ring: chunked vs stepwise prefill diverged by rms 2.11 with a
     // different argmax.
     int swa_window = 0;   // attention span (from the model)
+    // `--fa-window`: cap how far back the FULL-attention layers look during
+    // decode. 0 = unlimited (default), which leaves the mask bit-identical to
+    // the unwindowed path. The SWA layers are untouched -- they already carry
+    // the model's own window.
+    //
+    // WARNING, and the reason this defaults off: muse-glimmer has only 13
+    // full-attention layers and they are what give it global context. A finite
+    // window there drops the system prompt and tool definitions out of view,
+    // which is exactly how tool calling breaks. Treat any non-zero value as
+    // needing a golden-suite run before it is trusted, not as a free speedup.
+    int fa_window  = 0;
     int swa_ring   = 0;   // allocated ring rows = window + headroom
     int n_layer    = 0;
 

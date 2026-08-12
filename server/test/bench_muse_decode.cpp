@@ -16,6 +16,11 @@
 //   MUSE_N_DECODE=…              timed decode steps (default 128)
 //   MUSE_WARMUP=…                untimed decode steps first (default 16)
 //   MUSE_MAX_CTX=…               cache size (default 2048)
+//   MUSE_FA_WINDOW=…             --fa-window equivalent: cap how far back the
+//                                FULL-attention layers look (0 = unlimited,
+//                                the default). Exposed here so the flag can be
+//                                A/B'd for both throughput AND output effect
+//                                without standing a server up.
 //
 // The warmup is not politeness: the first steps pay lazy kernel module loads
 // and allocator growth, which at these step counts would dominate.
@@ -95,6 +100,12 @@ int main() {
                      dflash27b_last_error());
         return 1;
     }
+    cache.fa_window = env_int("MUSE_FA_WINDOW", 0);
+    if (cache.fa_window < 0 || cache.fa_window > cache.max_ctx) {
+        std::fprintf(stderr, "bench_muse_decode: MUSE_FA_WINDOW %d out of range "
+                             "for ctx %d\n", cache.fa_window, cache.max_ctx);
+        return 1;
+    }
 
     // Any in-vocab ids will do; decode cost does not depend on which.
     std::vector<int32_t> ids((size_t)n_prompt);
@@ -148,6 +159,8 @@ int main() {
     std::printf("load             %.1f s\n", load_s);
     std::printf("prefill          %d tok in %.3f s  (%.1f tok/s)\n",
                 n_prompt, prefill_s, n_prompt / prefill_s);
+    std::printf("fa_window        %d%s\n", cache.fa_window,
+                cache.fa_window ? " (full-attn layers windowed)" : " (unlimited)");
     std::printf("decode           %d steps (warmup %d)\n", n_decode, n_warmup);
     std::printf("  mean           %.3f ms/tok  (%.2f tok/s)\n",
                 mean_ms, 1e3 / mean_ms);

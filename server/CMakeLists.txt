@@ -1474,6 +1474,7 @@ if(DFLASH27B_TESTS)
     endforeach()
     unset(_muse_art_test)
 
+
     # Decode-throughput bench for the muse step driver. Not a test (it needs an
     # artifact and reports timings rather than asserting), but it shares the
     # muse test targets' include/link shape.
@@ -1513,6 +1514,16 @@ if(DFLASH27B_TESTS)
         endif()
     endforeach()
     unset(_muse_atem_test)
+
+    # Bake the fixture directory in as the DEFAULT so the reference-prompt test
+    # resolves fixtures from any working directory. ctest already injects
+    # DFLASH_TEST_DATA_DIR as a test property (below), so ctest was fine -- but
+    # running the binary directly from the build tree read a CWD-relative path
+    # and reported 5 spurious failures. The env var still wins when set.
+    if(TARGET test_muse_atem_reference_prompts)
+        target_compile_definitions(test_muse_atem_reference_prompts PRIVATE
+            DFLASH_MUSE_ATEM_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data/muse_atem")
+    endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_recurrent_snapshot.cpp")
         add_executable(test_recurrent_snapshot test/test_recurrent_snapshot.cpp)

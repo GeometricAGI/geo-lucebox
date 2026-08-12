@@ -48,7 +48,7 @@ drift silently.
 | Draft over IPC | `--draft-ipc-bin` | **No** | qwen35 |
 | Draft tree / budget / temp | `--ddtree*` | **No** | qwen35 both |
 | Verify width | `--verify-width` | **No** | laguna |
-| FA window | `--fa-window` | **No** | qwen35, gemma4 |
+| FA window | `--fa-window` | **Yes** (monolithic) | qwen35, gemma4 |
 | Draft SWA | `--draft-swa` | **No** | qwen35 |
 | Paged attention | `--paged-attention` | **No** | qwen35 monolithic |
 | Layer split / multi-GPU | `--target-devices` | **No** | qwen35, gemma4, deepseek4, laguna |
@@ -63,6 +63,29 @@ The unimplemented daemon verbs return failure rather than claiming success:
 parking frees weights and KV to hand the GPU to another process, and nothing
 here reloads them, so a success reply would strand the daemon in a state it
 cannot leave.
+
+### `--fa-window`
+
+Caps how far back the **full-attention** layers look during decode. The SWA
+layers are untouched — they already carry the model's own window. Default 0
+(unlimited), which is bit-identical to the unwindowed path (verified: 202048 f32
+logits compare byte-for-byte with `MUSE_FA_WINDOW=0` against a build predating
+the flag). Out-of-range values are rejected at init rather than clamped.
+
+**Treat a non-zero value as unproven on this model.** It has only 13
+full-attention layers and they are what carry global context, so windowing them
+can drop the system prompt and tool definitions out of view — which is exactly
+how tool calling breaks. Nothing here has been scored on the golden suite at any
+non-zero window, and the backend prints a warning at startup saying so. It is
+also not a free speedup: at a 128-token prompt it measured 13.819 vs 13.819
+ms/tok (i.e. nothing), because the attention span is trivial at that length. Any
+benefit is a long-context effect and is unmeasured.
+
+A/B it without standing a server up:
+
+```bash
+MUSE_FA_WINDOW=512 MUSE_N_PROMPT=2048 MUSE_GGUF=… ./bench_muse_decode
+```
 
 **Speculative decode is the gap worth knowing about.** The vendor ships
 `dflash-kquant.gguf`, a quantized DFlash drafter intended exactly for this —
