@@ -163,23 +163,30 @@ margin. Its mechanism control double-norms the drafter's hidden states:
 acceptance must drop (proves the projection is on the path) while output stays
 identical (proves verification governs).
 
-**The drift is platform-dependent, so the threshold is measured, not fixed.**
-Same 16-token batch, same artifact:
+**The drift depends on platform AND on the batched matmul path, so the
+threshold is measured, not fixed.** Same 16-token batch, all on
+`muse-lowbpw-r1` so the artifact is held constant:
 
-| | max Δlogit | rms | K/V max Δ |
-|---|---|---|---|
-| H200 (CUDA) | 0.42 | 0.082 | 0.41 |
-| gfx1151 (HIP) | 0.56 | 0.091 | 0.36 |
-| gfx1201 (HIP) | **0.77** | 0.143 | 0.73 |
+| | max Δlogit | rms |
+|---|---|---|
+| H200 (CUDA), dequant+GEMM | 0.479 | 0.079 |
+| gfx1151 (HIP), dequant+GEMM | 0.563 | 0.091 |
+| gfx1201 (HIP), dequant+GEMM | 0.774 | 0.143 |
+| **gfx1201 (HIP), mix MMQ** | **0.380** | **0.059** |
 
-The AMD kernels drift ~1.8× further than CUDA — the same order as llama.cpp's
-own CUDA-vs-CPU rms 0.107 that the graph-parity gate is calibrated against.
+Two things to read off this. The vendor effect is real but ~1.6×, not the
+~1.8× first recorded here — that number compared `muse-v4` on H200 against
+`r1` on AMD and so mixed artifact with vendor (`muse-v4` on H200 is 0.422, i.e.
+the artifact accounts for little of it). And the *dominant* term is not the
+vendor at all: it is whether the batched multiply dequantizes. Turning on the
+mix MMQ path takes gfx1201 to 0.380, **below** CUDA's same-artifact 0.479, and
+makes batched verify agree with sequential decode on all 16 positions.
+
 `test_muse_verify_capture` therefore uses the drift it measures *in that run*
-as its own tie threshold (self-calibrating, and tighter on H200 than the
-constant it replaced), and `test_muse_spec_decode`, which drives the backend
-and cannot measure drift itself, carries 1.0 to clear all three platforms. A
-0.5 constant calibrated on H200 alone sat *below* gfx1201's real drift and
-would have reported a legitimate tie-break there as an implementation bug.
+as its own tie threshold, and `test_muse_spec_decode`, which drives the backend
+and cannot measure drift itself, carries 1.0 to clear every configuration
+measured. A 0.5 constant calibrated on H200 alone sat *below* gfx1201's real
+drift and would have reported a legitimate tie-break there as a bug.
 
 **The one convention that mattered: the block mask is BIDIRECTIONAL.** The
 generic draft graph masked the noise block causally (the Qwen3-style drafters
@@ -227,11 +234,34 @@ Acceptance barely moves across these (0.18–0.23); the ratio moves 2.7×. What
 predicts the payoff is AR-step cost ÷ batched-verify cost — bf16 wins *because*
 its AR step is expensive enough to amortise the block.
 
-**Do not combine `--draft` with `muse-lowbpw-r1`:** it is a slowdown even on
-CUDA. The qtype-105/106 kernels were tuned for the batch-1 matvec path (the
-2.06× win recorded below); nothing serves batch 16, so the verify is
-disproportionately expensive. Speculative decode currently wants a K-quant
-artifact on CUDA.
+**`muse-lowbpw-r1` + `--draft` needs `DFLASH_DS4_MIX_MMQ_PREFILL=1`.** Without
+it, `ne11 > 1` for qtypes 105/106 falls back to dequantize-to-bf16 + dense
+GEMM — **48% of a 16-token verify's GPU time sits in
+`dequantize_rocmfp{2,3}_mix_kernel`** (nsys), i.e. the multiply throws away the
+3.3 bpw artifact and runs 16-bit. Batched MMQ kernels for both mix qtypes
+already exist and already plumb the out-of-band codebooks; they were simply
+gated to RDNA3.5/RDNA4 behind that env var. Enabling it:
+
+| | verify tok/s | vs AR | drift | verify == sequential |
+|---|---|---|---|---|
+| gfx1201, off | 15.6–21.0 | 0.56–0.76× | 0.774 | 15/16 |
+| **gfx1201, on** | **28.5–39.5** | **1.03–1.43×** | **0.380** | **16/16** |
+| H200, off | 25.4 | 0.52× | 0.479 | 15/16 |
+| H200, on | 30.5 | 0.62× | 0.443 | 15/16 |
+
+**On AMD this flips speculative decode from a loss to a win** (1.7–1.9× on the
+verify), and it is *more* numerically faithful, because the dequant path rounds
+through bf16 where MMQ keeps integer dot products. On CUDA it is 1.20× and r1
+remains a net loss — the profile shows why: dequant disappears, but the mix MMQ
+kernel itself costs ~554 µs against ~90 µs for a K-quant MMQ of comparable
+shape. The mix types get no MMA tile on NVIDIA (`GGML_CUDA_ROCMFPX_MMQ_TILE` is
+never defined and the tile choice is gated to RDNA), so that is where new
+kernel work would actually pay — not in writing a batched path, which exists,
+but in giving it a tensor-core tile.
+
+The env var is DS4-owned and still defaults off; flipping the default is the
+DS4 line's call, not this one's. K-quant artifacts (`muse-v4`) are unaffected
+either way.
 
 **Acceptance rate is not a quality signal.** A deliberately broken 9.2 GB
 `q2k-pure` control scored the *highest* mean acceptance of any artifact tested

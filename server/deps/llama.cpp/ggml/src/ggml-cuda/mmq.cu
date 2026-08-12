@@ -517,21 +517,51 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                             GGML_CUDA_CC_IS_RDNA4(cc);
             break;
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: {
+            // Batched path for the mix qtypes. Without it, ne11 > 1 falls back
+            // to dequantize-to-bf16 + dense GEMM, which throws away the whole
+            // point of a 3.3 bpw artifact for the duration of the multiply:
+            // measured 48% of a 16-token speculative verify's GPU time inside
+            // dequantize_rocmfp{2,3}_mix_kernel.
+            //
+            // Enabling it on gfx1201 measured 1.7-1.9x on that verify AND
+            // halved the batch-vs-sequential logit drift (0.774 -> 0.380),
+            // because the dequant path rounds through bf16 where MMQ keeps
+            // integer dot products. Faster and more faithful.
+            //
+            // NVIDIA is opted in behind the same env var so the claim can be
+            // measured rather than assumed: the DP4A tile these types declare
+            // is portable, but nothing has gated it here yet.
             static const bool mix_mmq_enabled = []() {
                 const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
                 return value != nullptr && !(value[0] == '0' && value[1] == '\0');
             }();
             mmq_supported = mix_mmq_enabled &&
-                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+                 GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
         }
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: {
+            // Batched path for the mix qtypes. Without it, ne11 > 1 falls back
+            // to dequantize-to-bf16 + dense GEMM, which throws away the whole
+            // point of a 3.3 bpw artifact for the duration of the multiply:
+            // measured 48% of a 16-token speculative verify's GPU time inside
+            // dequantize_rocmfp{2,3}_mix_kernel.
+            //
+            // Enabling it on gfx1201 measured 1.7-1.9x on that verify AND
+            // halved the batch-vs-sequential logit drift (0.774 -> 0.380),
+            // because the dequant path rounds through bf16 where MMQ keeps
+            // integer dot products. Faster and more faithful.
+            //
+            // NVIDIA is opted in behind the same env var so the claim can be
+            // measured rather than assumed: the DP4A tile these types declare
+            // is portable, but nothing has gated it here yet.
             static const bool mix_mmq_enabled = []() {
                 const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
                 return value != nullptr && !(value[0] == '0' && value[1] == '\0');
             }();
             mmq_supported = mix_mmq_enabled &&
-                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+                 GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
         }
         default:
