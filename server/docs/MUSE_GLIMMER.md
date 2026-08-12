@@ -67,7 +67,7 @@ a config field forces the row to be updated.
 
 | Feature | Flag | muse-glimmer | For contrast |
 |---|---|---|---|
-| Speculative decode | `--draft` | **Yes** (monolithic). 1.05–1.45× on CUDA; a **slowdown on AMD** — see below | qwen35 both, gemma4 monolithic |
+| Speculative decode | `--draft` | **Yes** (monolithic). 1.05–1.45× on CUDA; on AMD a loss by default but **1.03–1.43× with mix MMQ enabled** — see below | qwen35 both, gemma4 monolithic |
 | Draft over IPC | `--draft-ipc-bin` | **No** | qwen35 |
 | Draft tree / budget / temp | `--ddtree*` | **No** | qwen35 both |
 | Verify width | `--verify-width` | **No** | laguna |
@@ -111,7 +111,7 @@ A/B it without standing a server up:
 MUSE_FA_WINDOW=512 MUSE_N_PROMPT=2048 MUSE_GGUF=… ./bench_muse_decode
 ```
 
-### Speculative decode — verified-correct on CUDA and HIP; a speedup only on CUDA
+### Speculative decode — verified-correct on CUDA and HIP; a speedup on both once the batched mix path is on
 
 `--draft ~/models/muse-glimmer-gguf/dflash-kquant.gguf` loads the vendor
 drafter (arch `dflash`, 5 blocks, `n_embd` 6656, block size 16, mask token
