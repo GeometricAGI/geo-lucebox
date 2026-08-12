@@ -76,6 +76,11 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever, kNever},
     {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kBoth, kNever, kNever},
     {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever, kNever},
+    // muse-glimmer: dense AR decode only for now. Every option below is
+    // Never because MuseBackendConfig carries no field for it — the
+    // static_asserts in backend_factory.cpp enforce that correspondence, so
+    // this row cannot drift from what the backend can actually accept.
+    {"muse-glimmer", false, false, false, false,  kNever, kNever, kNever, kNever, kNever, kNever},
 };
 
 inline constexpr std::size_t kArchCount =
