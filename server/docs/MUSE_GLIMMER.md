@@ -34,6 +34,25 @@ segmentation and tool parsing):
 Both land inside their reference bands, so this serving path costs no quality.
 `muse-lowbpw-r1` scores AGENT 9/12 against `muse-v4`'s 8.
 
+**Quality is unchanged by GPU vendor and by speculative decode.** The same
+122-item suite, `muse-lowbpw-r1`, served through `dflash_server` at pinned
+geometry, scored **101/122 on gfx1201 with `--draft` on** against **101/122 on
+H200** — identical totals, with the per-axis counts moving by at most one item,
+inside the ±2 the suite is noisy to:
+
+| axis | H200 (CUDA, AR) | gfx1201 (HIP, `--draft`) |
+|---|---|---|
+| MATH | 30/40 | 31/40 |
+| CODE | 37/40 | 38/40 |
+| TOOL | 25/30 | 24/30 |
+| AGENT | 9/12 | 8/12 |
+| **total** | **101/122** | **101/122** |
+
+That is the whole point of an output-verified drafter: it is not a quality
+trade. Mean acceptance across the suite's 148 requests was **0.314** — higher
+than the 0.15–0.24 of open-ended chat, because reasoning and code
+continuations are more predictable.
+
 ## Feature support
 
 muse-glimmer serves dense AR prefill + decode, `--fa-window`, and DFlash
@@ -128,13 +147,14 @@ bite — the first version of that test failed its own control, which is how the
 property above was found.
 
 **Correctness is the tested property.** `test_muse_spec_decode` asserts the
-speculative output is token-identical to greedy AR: **64/64 identical on H200
-and on gfx1151**, and on gfx1201 the check covered 19 tokens before the
-target's own margins fell inside that GPU's (widest) drift band — its coverage
-guard failed the run rather than let a short demonstration pass as a long one,
-which is why the identity prompt now counts numerically instead of in words.
-There is one calibrated exception no implementation can remove: ggml uses a
-matrix-vector
+speculative output is token-identical to greedy AR: **64/64 identical on all
+three GPUs — H200, gfx1201 and gfx1151**. Getting there on gfx1201 took a
+better prompt: with word-counting, the target's own margins fell inside that
+GPU's (widest) drift band by position 19 and the coverage guard failed the run
+rather than let a 19-token demonstration pass as a 64-token one. Numeric
+counting keeps the margins outside the band and the check covers the full
+horizon. There is one calibrated exception no implementation can remove: ggml
+uses a matrix-vector
 kernel at one token and a GEMM at many, so one batched verify shifts the logits
 against one-at-a-time decode. Where the target's top-2 margin is inside that
 drift band, which token wins is kernel-scheduling luck; the test requires
