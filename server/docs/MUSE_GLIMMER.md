@@ -237,6 +237,22 @@ Acceptance barely moves across these (0.18–0.23); the ratio moves 2.7×. What
 predicts the payoff is AR-step cost ÷ batched-verify cost — bf16 wins *because*
 its AR step is expensive enough to amortise the block.
 
+**Best serving config for `muse-lowbpw-r1` on CUDA: `--draft` WITH the batched
+mix path on.** Measured on H200 over the full 122-item gate (148 requests, all
+of them engaging speculation, mean acceptance 0.319):
+
+| config | tok/s | vs AR | quality |
+|---|---|---|---|
+| AR | 52.6 | 1.00× | 101/122 |
+| `--draft`, mix MMQ off | 43.5 | **0.83×** (a loss) | — |
+| `--draft`, mix MMQ on | **81.0** | **1.54×** | **103/122** |
+
+The two compound: MMQ makes each verify cheaper, and the gate's acceptance
+(0.319, against 0.15–0.24 on open-ended chat) means more committed tokens ride
+on each one. Quality is inside the ±2 band the suite is noisy to. This is why
+the 1.20× measured on a short chat set understates the effect on real
+reasoning/code traffic.
+
 **`muse-lowbpw-r1` + `--draft` needs `DFLASH_DS4_MIX_MMQ_PREFILL=1`.** Without
 it, `ne11 > 1` for qtypes 105/106 falls back to dequantize-to-bf16 + dense
 GEMM — **48% of a 16-token verify's GPU time sits in

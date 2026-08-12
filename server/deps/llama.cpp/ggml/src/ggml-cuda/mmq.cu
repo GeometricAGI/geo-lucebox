@@ -471,6 +471,51 @@ void ggml_cuda_op_mul_mat_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size);
 }
 
+#ifndef GGML_CUDA_MIX_MMQ_DEFAULT
+// Default OFF until the correctness gate (test_rocmfp_mix_mmq) has run on both
+// vendors; flipped on once it does.
+#define GGML_CUDA_MIX_MMQ_DEFAULT false
+#endif
+
+// ── Batched path for the mix qtypes (105/106) ───────────────────────────
+// Without it, ne11 > 1 falls back to dequantize-to-bf16 + dense GEMM, which
+// discards the whole point of a sub-4 bpw artifact for the duration of the
+// multiply (measured: 48% of a 16-token speculative verify's GPU time inside
+// dequantize_rocmfp{2,3}_mix_kernel).
+//
+// Runtime-settable rather than a function-local static so a single process can
+// A/B both paths; test_rocmfp_mix_mmq compares them against the validated
+// matvec kernel that way. Env var still provides the default.
+static bool g_mix_mmq_forced     = false;
+static bool g_mix_mmq_forced_val = false;
+
+bool ggml_cuda_mix_mmq_enabled() {
+    if (g_mix_mmq_forced) {
+        return g_mix_mmq_forced_val;
+    }
+    static const bool from_env = []() {
+        const char * value = getenv("DFLASH_MIX_MMQ");
+        if (value == nullptr) {
+            // Legacy spelling; the flag predates its use outside DS4 prefill.
+            value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+        }
+        if (value == nullptr) {
+            return GGML_CUDA_MIX_MMQ_DEFAULT;
+        }
+        return !(value[0] == '0' && value[1] == '\0');
+    }();
+    return from_env;
+}
+
+void ggml_cuda_set_mix_mmq_enabled(bool enabled) {
+    g_mix_mmq_forced     = true;
+    g_mix_mmq_forced_val = enabled;
+}
+
+void ggml_cuda_clear_mix_mmq_override() {
+    g_mix_mmq_forced = false;
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -531,11 +576,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // NVIDIA is opted in behind the same env var so the claim can be
             // measured rather than assumed: the DP4A tile these types declare
             // is portable, but nothing has gated it here yet.
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
+            mmq_supported = ggml_cuda_mix_mmq_enabled() &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
                  GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
@@ -555,11 +596,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // NVIDIA is opted in behind the same env var so the claim can be
             // measured rather than assumed: the DP4A tile these types declare
             // is portable, but nothing has gated it here yet.
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
+            mmq_supported = ggml_cuda_mix_mmq_enabled() &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
                  GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
