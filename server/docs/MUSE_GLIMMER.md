@@ -104,7 +104,34 @@ requires:
 - `read_verify_logits(...)`;
 - `snapshot_kv()` / `restore_kv()` so a rejected speculation can be rolled back.
 
-Two of those are missing outright. There is **no feature-capture tap anywhere in
+**`snapshot_kv` / `restore_kv` are now implemented** (`muse_snapshot.cpp`), so
+what remains is the feature capture and the spec-decode loop.
+
+The rollback is row-scoped, and the reasoning matters because it is what makes
+it cheap:
+
+- **Full-attention layers need no saved data at all.** Row index *is* the
+  absolute position, so a speculative write never lands on a row an earlier
+  position occupies; rolling back is a cursor move.
+- **SWA layers save only the rows the span will clobber** — at most
+  `depth` rows per layer, as one or two contiguous spans, moved by a single
+  ggml graph. ~640 KB at depth 16 against ~110 MB for copying the whole cache
+  the way gemma4's adapter does.
+
+**Measured finding: the data restore is currently redundant.** A speculative
+span at `[P+1, P+D]` clobbers slot `(P+i) % S`, and the probe at `P` can only
+read that slot if `i >= S - window`, i.e. `i` exceeds the ring headroom. But
+`muse_step` already refuses any forward longer than the headroom. So every
+speculative span that *can* run touches only rows already outside every future
+query's window. The mechanism is kept anyway: it is the correct general
+implementation, and it stops being redundant the moment ring sizing, chunk
+policy or speculation depth changes. `test_muse_kv_snapshot` therefore proves
+the save/restore on cache **bytes** (scribble-and-restore, plus a one-shot
+guard) rather than through logits, where a negative control cannot be made to
+bite — the first version of that test failed its own control, which is how the
+property above was found.
+
+The two remaining pieces are missing outright. There is **no feature-capture tap anywhere in
 `muse_graph.cpp` or `muse_step.cpp`**, so the capture contract needs new graph
 work, not a hook. And there is no KV snapshot/restore: on the SWA layers the
 cache is a *rotated ring*, so rolling back past an eviction is not recoverable
@@ -308,10 +335,10 @@ against the 105/106 artifact by design (decode for those qtypes is GPU-only).
 
 - Everything in the feature table above, most notably **speculative decode**
   despite the vendor shipping a drafter for it.
-- The SWA ring's wrap arithmetic is unit-tested model-free
-  (`muse_swa_slot_visible`, including mid-chunk future-slot and eviction cases),
-  but **no end-to-end forward has yet exceeded the 2048-token window**, so a
-  >2048-token prompt is still owed.
+- ~~No end-to-end forward has exceeded the 2048-token window.~~ **Closed:**
+  `test_muse_kv_snapshot` builds a cache with `ring < max_ctx` and prefills
+  `ring + 32` tokens (2144 against a 2112 ring), so the ring genuinely wraps and
+  the chunked prefill is exercised across the wrap.
 - The quality gate has been run on CUDA only; the HIP builds are verified for
   load, decode and mix registration but not scored.
 - One 1.1 s first-timed-step outlier on Strix Halo did not reproduce with a

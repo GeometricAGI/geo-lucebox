@@ -227,6 +227,37 @@ struct MuseCache {
 bool muse_swa_slot_visible(int total, int q_abs, int slot, int ring_rows,
                            int window);
 
+// KV snapshot for speculative-decode rollback.
+//
+// Holds only the SWA rows a speculative forward will overwrite (see
+// muse_snapshot.cpp for why full-attention layers need none), so its size is
+// O(speculation depth), not O(context).
+struct MuseKvSnapshot {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<ggml_tensor *> k, v;   // per layer; null on full-attention layers
+    int  max_depth = 0;                // rows allocated per SWA layer
+    int  base_pos  = -1;               // absolute position the live save starts at
+    int  n         = 0;                // rows in the live save
+    bool valid     = false;            // a save is outstanding and restorable
+};
+
+bool create_muse_kv_snapshot(ggml_backend_t backend, const MuseWeights & w,
+                             const MuseCache & cache, int max_depth,
+                             MuseKvSnapshot & out);
+void free_muse_kv_snapshot(MuseKvSnapshot & s);
+
+// Save the SWA rows that a forward over [base_pos, base_pos+n) will clobber.
+// Call BEFORE that forward.
+bool muse_kv_snapshot_save(ggml_backend_t backend, const MuseWeights & w,
+                           MuseCache & cache, int base_pos, int n,
+                           MuseKvSnapshot & snap);
+
+// Put them back. One-shot: the save is consumed, because a second restore
+// would overwrite rows the caller has legitimately re-filled since.
+bool muse_kv_snapshot_restore(ggml_backend_t backend, const MuseWeights & w,
+                              MuseCache & cache, MuseKvSnapshot & snap);
+
 // `max_chunk` is the largest prefill chunk that will be used; the SWA ring is
 // sized to window + max_chunk so a chunk never evicts its own history.
 bool create_muse_cache(ggml_backend_t backend, const MuseWeights & w,

@@ -385,6 +385,7 @@ add_library(dflash_common STATIC
     src/muse/muse_loader.cpp
     src/muse/muse_graph.cpp
     src/muse/muse_step.cpp
+    src/muse/muse_snapshot.cpp
     src/muse/muse_dmix2.cpp
     src/muse/muse_backend.cpp
     src/gemma4/gemma4_loader.cpp
@@ -1460,7 +1461,7 @@ if(DFLASH27B_TESTS)
     # Muse-Glimmer loader + forward-graph parity against a real artifact
     # (both skip with 77 when the artifact / reference dump is absent).
     foreach(_muse_art_test test_muse_loader test_muse_graph_parity
-                          test_muse_generate)
+                          test_muse_generate test_muse_kv_snapshot)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_muse_art_test}.cpp")
             add_executable(${_muse_art_test} test/${_muse_art_test}.cpp)
             target_include_directories(${_muse_art_test} PRIVATE
