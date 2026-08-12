@@ -36,15 +36,16 @@ Both land inside their reference bands, so this serving path costs no quality.
 
 ## Feature support
 
-muse-glimmer is currently the **least-featured** backend in the tree: dense AR
-prefill + decode, plus `--fa-window`. Everything else is `Never` in
-`model_capabilities.h` because `MuseBackendConfig` carries no field for it, and
-the table is cross-checked against that struct at compile time so the two cannot
-drift silently — adding a config field forces the row to be updated.
+muse-glimmer serves dense AR prefill + decode, `--fa-window`, and DFlash
+speculative decode against the vendor drafter (`--draft`, monolithic only).
+Everything else is `Never` in `model_capabilities.h` because
+`MuseBackendConfig` carries no field for it, and the table is cross-checked
+against that struct at compile time so the two cannot drift silently — adding
+a config field forces the row to be updated.
 
 | Feature | Flag | muse-glimmer | For contrast |
 |---|---|---|---|
-| Speculative decode | `--draft` | **No** | qwen35 both, gemma4 monolithic |
+| Speculative decode | `--draft` | **Yes** (monolithic; measured 1.05–1.45× — see below) | qwen35 both, gemma4 monolithic |
 | Draft over IPC | `--draft-ipc-bin` | **No** | qwen35 |
 | Draft tree / budget / temp | `--ddtree*` | **No** | qwen35 both |
 | Verify width | `--verify-width` | **No** | laguna |
@@ -88,24 +89,18 @@ A/B it without standing a server up:
 MUSE_FA_WINDOW=512 MUSE_N_PROMPT=2048 MUSE_GGUF=… ./bench_muse_decode
 ```
 
-### Speculative decode — the gap worth knowing about, and what it actually costs
+### Speculative decode — implemented, verified-correct, 1.05–1.45× measured
 
-The vendor ships `dflash-kquant.gguf`, a quantized DFlash drafter (arch
-`dflash`, 5 blocks, `n_embd` 6656 matching the target) intended exactly for
-this — speed with no quality change — so users of this model will expect
-`--draft` to work.
-
-It is **not** a config-plumbing job. `DFlashTarget` (`common/dflash_target.h`)
-requires:
-
-- `verify_batch(...)` which, during the forward, **captures intermediate
-  activations at `capture_layer_ids()` into the draft's feature ring** — the
-  drafter cross-attends to `target_hidden_cat` of shape `[5*hidden, ctx_len]`;
-- `read_verify_logits(...)`;
-- `snapshot_kv()` / `restore_kv()` so a rejected speculation can be rolled back.
-
-**`snapshot_kv` / `restore_kv` are now implemented** (`muse_snapshot.cpp`), so
-what remains is the feature capture and the spec-decode loop.
+`--draft ~/models/muse-glimmer-gguf/dflash-kquant.gguf` loads the vendor
+drafter (arch `dflash`, 5 blocks, `n_embd` 6656, block size 16, mask token
+201818, capture layers `[2,14,26,38,50]` — all read from the drafter's GGUF,
+none hardcoded) and runs greedy-chain DFlash speculation:
+`MuseDFlashTarget` (`muse_dflash_target.{h,cpp}`) implements
+`common/dflash_target.h`; the loop lives in `muse_backend.cpp`
+(`do_spec_decode`). Greedy requests only — a sampling request falls back to AR
+rather than silently sampling from the draft. The bonus token is folded into
+the next round's verify batch (llama.cpp convention), so each round costs one
+target forward, not two.
 
 The rollback is row-scoped, and the reasoning matters because it is what makes
 it cheap:
@@ -116,7 +111,8 @@ it cheap:
 - **SWA layers save only the rows the span will clobber** — at most
   `depth` rows per layer, as one or two contiguous spans, moved by a single
   ggml graph. ~640 KB at depth 16 against ~110 MB for copying the whole cache
-  the way gemma4's adapter does.
+  the way gemma4's adapter does. `rollback_to(base, commit_n)` restores only
+  the rejected suffix, so accepted KV survives.
 
 **Measured finding: the data restore is currently redundant.** A speculative
 span at `[P+1, P+D]` clobbers slot `(P+i) % S`, and the probe at `P` can only
@@ -131,19 +127,57 @@ guard) rather than through logits, where a negative control cannot be made to
 bite — the first version of that test failed its own control, which is how the
 property above was found.
 
-The two remaining pieces are missing outright. There is **no feature-capture tap anywhere in
-`muse_graph.cpp` or `muse_step.cpp`**, so the capture contract needs new graph
-work, not a hook. And there is no KV snapshot/restore: on the SWA layers the
-cache is a *rotated ring*, so rolling back past an eviction is not recoverable
-in principle — the row has been overwritten. That needs a sizing argument
-(ring headroom ≥ max speculation depth) before it is correct, not just an
-implementation. For scale, gemma4's `DFlashTarget` is 159 lines sitting on a
-1369-line backend with capture wired through its graph; `muse_backend.cpp` is
-223 lines.
+**Correctness is the tested property.** `test_muse_spec_decode` asserts the
+speculative output is token-identical to greedy AR — measured 64/64 identical
+on a rigid-continuation prompt — with one calibrated exception no
+implementation can remove: ggml uses a matrix-vector kernel at one token and a
+GEMM at many, and one batched verify shifts the logits by up to **0.42 (rms
+0.08)** against one-at-a-time decode (same order as llama.cpp's own CUDA-vs-CPU
+rms 0.107 that the parity gate is calibrated against; K/V bytes shift ≤ 0.5
+against magnitudes of ~16). Where the target's top-2 margin is inside that
+drift band, which token wins is kernel-scheduling luck; the test therefore
+requires identity up to the first in-band margin and fails any divergence at a
+wide margin. Its mechanism control double-norms the drafter's hidden states:
+acceptance must drop (proves the projection is on the path) while output stays
+identical (proves verification governs).
 
-What *is* already favourable: `muse_step` takes an arbitrary token count plus a
-`kv_start`, so the verify forward itself needs no new driver, and the KV append
-is `set_rows`-based with graph-stable node properties.
+**The one convention that mattered: the block mask is BIDIRECTIONAL.** The
+generic draft graph masked the noise block causally (the Qwen3-style drafters
+here were converted against that), but the DFlash paper (arXiv:2602.06036,
+Fig. 2/4: "tokens attend bidirectionally within the same block") and the
+reference implementation this artifact was built for (llama.cpp
+`models/dflash.cpp`: "cache-aware, non-causal attention") both run the block
+bidirectionally. Running the muse drafter causally starved later slots and
+cost nothing visible except acceptance: avg_commit 2.91 → **6.40** on a
+rigid-continuation prompt the moment the mask matched training. The loader now
+keys this off the drafter arch (`DraftWeights::block_bidirectional`). Two more
+conventions verified against the reference: NEOX RoPE (measured
+indistinguishable from NORMAL, and NEOX is what the reference uses) and RAW
+noise embeddings (`ggml_get_rows` of the target table, no norm — measured
+within noise of the RMS-normed variant, reference behaviour kept).
+
+**Performance** (H200, muse-v4, chat traffic through the server): ~2.4–3.2
+tokens committed per verify round, **73–101 tok/s vs ~70 AR = 1.05–1.45×**.
+Real, but short of the vendor's 3.1× llama.cpp figure, for two measured
+reasons:
+
+1. **A 16-token verify forward costs ~1.9 AR steps on these kernels** (26.7 ms
+   vs 14.3 ms after moving verify argmax onto the GPU; it was 33 ms before).
+   For a memory-bound dense model it should approach parity — the vendor's
+   numbers imply near-parity batch cost. Profiling territory (ncu on the
+   batch-16 forward), not read-the-source territory.
+2. **The context features are re-projected through the drafter's wk/wv every
+   round** (~4.8 ms at 2k ctx). The reference injects them into a persistent
+   draft KV cache once per accepted token instead.
+
+Ablations that measured neutral and were left at the reference convention:
+drafter RoPE NORMAL vs NEOX, capture-layer shift ±1 (worse both ways),
+RMS-normed noise embeddings, target out_norm in the projection (worse, as
+expected — the drafter already normalizes).
+
+Diagnostic knobs, all env-gated and off by default: `MUSE_SPEC_DEBUG` (dump
+draft/target token arrays per round), `MUSE_DRAFT_NORM_EMBED`,
+`MUSE_CAPTURE_SHIFT`, `DFLASH_DRAFT_ROPE`.
 
 ## Architecture — a gemma4-shaped model
 
@@ -325,6 +359,9 @@ Known remaining headroom on the kernel:
 | `test_muse_loader` | hparams, SWA pattern, tensor map, refusals | yes (`MUSE_GGUF`) |
 | `test_muse_graph_parity` | full 52-layer forward vs llama.cpp logits | yes + `MUSE_REF_LOGITS` |
 | `test_muse_generate` | prefill-N == prefill-(N-1) + 1 step (**bit-identical**) | yes |
+| `test_muse_kv_snapshot` | row-scoped save/restore on cache bytes + ring wrap | yes |
+| `test_muse_verify_capture` | verify == sequential (argmax, KV bytes, logit drift) + capture coverage | yes |
+| `test_muse_spec_decode` | spec output token-identical to greedy AR + acceptance | yes + `MUSE_DRAFT_GGUF` |
 | `bench_muse_decode` | decode throughput | yes |
 
 Artifact-dependent tests skip with 77 when `MUSE_GGUF` is unset.
@@ -333,8 +370,11 @@ against the 105/106 artifact by design (decode for those qtypes is GPU-only).
 
 ## Known gaps
 
-- Everything in the feature table above, most notably **speculative decode**
-  despite the vendor shipping a drafter for it.
+- Everything in the feature table above.
+- **Speculative decode is 1.05–1.45× on H200 against the vendor's 3.1×**
+  (verified-correct; see the section above). The two measured gaps: batch-16
+  verify at ~1.9 AR-step cost (profile with ncu), and per-round feature
+  re-projection instead of a persistent draft KV cache.
 - ~~No end-to-end forward has exceeded the 2048-token window.~~ **Closed:**
   `test_muse_kv_snapshot` builds a cache with `ring < max_ctx` and prefills
   `ring + 32` tokens (2144 against a 2112 ring), so the ring genuinely wraps and

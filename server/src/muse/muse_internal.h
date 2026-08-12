@@ -161,6 +161,24 @@ ggml_tensor * build_muse_inp_norm(ggml_context * ctx, const MuseWeights & w,
 ggml_tensor * build_muse_head(ggml_context * ctx, const MuseWeights & w,
                               ggml_tensor * cur);
 
+// Project externally-produced hidden states through the lm_head and return the
+// per-position argmax. Used by speculative decode to turn the DFlash drafter's
+// output (which already lives in the target's representation space) into token
+// ids.
+//
+// This is NOT build_muse_head: the drafter applies its OWN final RMS norm
+// before emitting hidden states, so the target's `out_norm` must be skipped or
+// the states are normed twice. `apply_out_norm` exists to make that an
+// A/B-able claim rather than an assertion — acceptance rate is the measurement
+// that separates the two.
+//
+// logit_scale and the tanh softcap are kept for shape-fidelity with the head,
+// but both are monotonic in the logit, so neither can change the argmax.
+bool muse_project_hidden(ggml_backend_t backend, const MuseWeights & w,
+                         const float * hidden, int n_tokens,
+                         std::vector<int32_t> & out_tokens,
+                         bool apply_out_norm = false);
+
 // ── dmix2 sidecar (muse_dmix2.cpp) ─────────────────────────────────────
 // Out-of-band codebooks for the qtype-105/106 tensors of the low-bpw
 // artifact. Parsed from the `geoquant.dmix2.sidecar` GGUF KV and handed to
@@ -296,8 +314,16 @@ bool muse_kv_snapshot_save(ggml_backend_t backend, const MuseWeights & w,
 
 // Put them back. One-shot: the save is consumed, because a second restore
 // would overwrite rows the caller has legitimately re-filled since.
+//
+// `from_row` restores only the TAIL of the save — rows [from_row, n), i.e.
+// absolute positions [base_pos+from_row, base_pos+n). That is what a
+// speculative verify actually needs: the accepted prefix's KV is correct and
+// must be kept, only the rejected suffix has to be undone. from_row == n is a
+// no-op success (everything was accepted); from_row == 0 restores the whole
+// span. Either way the save is consumed.
 bool muse_kv_snapshot_restore(ggml_backend_t backend, const MuseWeights & w,
-                              MuseCache & cache, MuseKvSnapshot & snap);
+                              MuseCache & cache, MuseKvSnapshot & snap,
+                              int from_row = 0);
 
 // `max_chunk` is the largest prefill chunk that will be used; the SWA ring is
 // sized to window + max_chunk so a chunk never evicts its own history.

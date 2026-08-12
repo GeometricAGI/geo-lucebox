@@ -387,6 +387,7 @@ add_library(dflash_common STATIC
     src/muse/muse_step.cpp
     src/muse/muse_snapshot.cpp
     src/muse/muse_dmix2.cpp
+    src/muse/muse_dflash_target.cpp
     src/muse/muse_backend.cpp
     src/gemma4/gemma4_loader.cpp
     src/gemma4/gemma4_graph.cpp
@@ -1462,7 +1463,7 @@ if(DFLASH27B_TESTS)
     # (both skip with 77 when the artifact / reference dump is absent).
     foreach(_muse_art_test test_muse_loader test_muse_graph_parity
                           test_muse_generate test_muse_kv_snapshot
-                          test_muse_verify_capture)
+                          test_muse_verify_capture test_muse_spec_decode)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_muse_art_test}.cpp")
             add_executable(${_muse_art_test} test/${_muse_art_test}.cpp)
             target_include_directories(${_muse_art_test} PRIVATE
@@ -1691,7 +1692,10 @@ if(DFLASH27B_TESTS)
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 if(_unit_target STREQUAL "test_muse_loader" OR
                    _unit_target STREQUAL "test_muse_graph_parity" OR
-                   _unit_target STREQUAL "test_muse_generate")
+                   _unit_target STREQUAL "test_muse_generate" OR
+                   _unit_target STREQUAL "test_muse_kv_snapshot" OR
+                   _unit_target STREQUAL "test_muse_verify_capture" OR
+                   _unit_target STREQUAL "test_muse_spec_decode")
                     # Exit 77 = skipped (no artifact on this machine).
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES
                         SKIP_RETURN_CODE 77)

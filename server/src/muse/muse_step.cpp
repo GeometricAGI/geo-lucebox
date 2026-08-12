@@ -175,9 +175,14 @@ namespace {
 // verify). The graph is identical either way -- build_muse_head already computes
 // [n_vocab, n_tokens] and the single-token path simply discarded the rest -- so
 // verify costs no extra compute, only the larger readback.
+// `gpu_argmax`, when non-null, replaces the logits output with a per-position
+// GPU argmax — the readback drops from n_tokens*n_vocab floats to n_tokens
+// ints, which matters on every speculation round. out_logits is untouched in
+// that mode.
 bool muse_forward(ggml_backend_t backend, const MuseWeights & w, MuseCache & cache,
                   const float * embed, int n_tokens, int kv_start,
-                  std::vector<float> & out_logits, bool all_positions) {
+                  std::vector<float> & out_logits, bool all_positions,
+                  std::vector<int32_t> * gpu_argmax = nullptr) {
     if (n_tokens <= 0) { set_last_error("muse_step: n_tokens <= 0"); return false; }
     if (kv_start + n_tokens > cache.max_ctx) {
         set_last_error("muse_step: kv_start+n_tokens exceeds max_ctx");
@@ -250,6 +255,9 @@ bool muse_forward(ggml_backend_t backend, const MuseWeights & w, MuseCache & cac
                                kv_start, n_tokens, &cache, cap_idx);
     }
     cur = build_muse_head(ctx, w, cur);
+    if (gpu_argmax) {
+        cur = ggml_argmax(ctx, cur);   // [n_tokens] I32
+    }
     ggml_build_forward_expand(gf, cur);
 
     static thread_local ggml_gallocr_t alloc = nullptr;
@@ -289,7 +297,11 @@ bool muse_forward(ggml_backend_t backend, const MuseWeights & w, MuseCache & cac
         return false;
     }
 
-    if (all_positions) {
+    if (gpu_argmax) {
+        gpu_argmax->resize((size_t)n_tokens);
+        ggml_backend_tensor_get(cur, gpu_argmax->data(), 0,
+                                (size_t)n_tokens * sizeof(int32_t));
+    } else if (all_positions) {
         out_logits.resize((size_t)n_tokens * w.n_vocab);
         ggml_backend_tensor_get(cur, out_logits.data(), 0,
                                 out_logits.size() * sizeof(float));
@@ -316,15 +328,22 @@ bool muse_verify_batch(ggml_backend_t backend, const MuseWeights & w,
                        int n_tokens, int kv_start,
                        std::vector<int32_t> & argmax_out,
                        std::vector<float> * all_logits) {
-    std::vector<float> local;
-    std::vector<float> & lg = all_logits ? *all_logits : local;
-    if (!muse_forward(backend, w, cache, embed, n_tokens, kv_start, lg,
+    // Argmax on the GPU unless the caller wants the raw logits. The full block
+    // is [n_tokens x n_vocab] f32 — 13 MB at depth 16 on this vocab — and
+    // reading it back plus a CPU scan measurably taxes every speculation
+    // round; the argmax-only readback is n_tokens ints.
+    if (!all_logits) {
+        std::vector<float> unused;
+        return muse_forward(backend, w, cache, embed, n_tokens, kv_start,
+                            unused, /*all_positions=*/true, &argmax_out);
+    }
+    if (!muse_forward(backend, w, cache, embed, n_tokens, kv_start, *all_logits,
                       /*all_positions=*/true)) {
         return false;
     }
     argmax_out.resize((size_t)n_tokens);
     for (int t = 0; t < n_tokens; ++t) {
-        const float * row = lg.data() + (size_t)t * w.n_vocab;
+        const float * row = all_logits->data() + (size_t)t * w.n_vocab;
         int best = 0;
         for (int v = 1; v < w.n_vocab; ++v) if (row[v] > row[best]) best = v;
         argmax_out[(size_t)t] = best;

@@ -284,4 +284,65 @@ ggml_tensor * build_muse_head(ggml_context * ctx, const MuseWeights & w,
     return cur;
 }
 
+// ── muse_project_hidden ────────────────────────────────────────────────
+// lm_head (+ scale + softcap) + argmax over hidden states produced OUTSIDE
+// this model — the DFlash drafter's output. See the header for why out_norm
+// is skipped by default.
+
+bool muse_project_hidden(ggml_backend_t backend, const MuseWeights & w,
+                         const float * hidden, int n_tokens,
+                         std::vector<int32_t> & out_tokens,
+                         bool apply_out_norm) {
+    if (n_tokens <= 0) { set_last_error("muse_project_hidden: n_tokens <= 0"); return false; }
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead() + 1024 * 1024;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { set_last_error("muse_project_hidden: ggml_init"); return false; }
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
+    ggml_set_input(inp);
+
+    ggml_tensor * cur = inp;
+    if (apply_out_norm) {
+        cur = muse_rms_norm_mul(ctx, cur, w.out_norm, w.norm_eps);
+    }
+    cur = ggml_mul_mat(ctx, w.output, cur);          // [n_vocab, n_tokens]
+    if (w.logit_scale != 0.0f) {
+        cur = ggml_scale(ctx, cur, w.logit_scale);
+    }
+    if (w.final_logit_softcap != 0.0f) {
+        cur = ggml_scale(ctx, cur, 1.0f / w.final_logit_softcap);
+        cur = ggml_tanh(ctx, cur);
+        cur = ggml_scale(ctx, cur, w.final_logit_softcap);
+    }
+    cur = ggml_argmax(ctx, cur);                     // [n_tokens]
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    static thread_local ggml_gallocr_t alloc = nullptr;
+    if (!alloc) alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        set_last_error("muse_project_hidden: graph alloc failed");
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, hidden, 0,
+                            sizeof(float) * (size_t)n_tokens * w.n_embd);
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        set_last_error("muse_project_hidden: graph compute failed");
+        ggml_free(ctx);
+        return false;
+    }
+
+    out_tokens.resize((size_t)n_tokens);
+    ggml_backend_tensor_get(cur, out_tokens.data(), 0,
+                            sizeof(int32_t) * (size_t)n_tokens);
+    ggml_free(ctx);
+    return true;
+}
+
 }  // namespace dflash::common

@@ -87,10 +87,21 @@ void append_row_copy(ggml_context * ctx, ggml_cgraph * gf,
 }
 
 // Build and run the save/restore graph for every SWA layer.
+//
+// `from_row` selects a suffix of the saved span: snapshot rows
+// [from_row, snap.n) against ring slots for absolute positions
+// [base_pos+from_row, base_pos+n). Saving always passes 0; restoring passes
+// the accepted-prefix length so accepted KV is left alone.
 bool run_snapshot_graph(ggml_backend_t backend, const MuseWeights & w,
                         MuseCache & cache, MuseKvSnapshot & snap,
-                        bool to_snapshot) {
-    const RingSpans sp = ring_spans(snap.base_pos, snap.n, cache.swa_ring);
+                        bool to_snapshot, int from_row = 0) {
+    const int n_rows = snap.n - from_row;
+    if (n_rows <= 0) return true;
+    // Ring slots are indexed from the FIRST restored position, snapshot rows
+    // from `from_row`; the two offsets are different and conflating them is
+    // the whole hazard of a partial restore.
+    const RingSpans sp = ring_spans(snap.base_pos + from_row, n_rows,
+                                    cache.swa_ring);
 
     // 4 copy nodes per layer worst case (2 spans x K/V), each needing its own
     // views; the overhead figure is deliberately generous.
@@ -113,10 +124,14 @@ bool run_snapshot_graph(ggml_backend_t backend, const MuseWeights & w,
         ggml_tensor * vs = snap.v[(size_t)il];
         if (!kc || !ks) continue;
 
-        append_row_copy(ctx, gf, kc, ks, sp.off0, 0,       sp.len0, to_snapshot);
-        append_row_copy(ctx, gf, vc, vs, sp.off0, 0,       sp.len0, to_snapshot);
-        append_row_copy(ctx, gf, kc, ks, sp.off1, sp.len0, sp.len1, to_snapshot);
-        append_row_copy(ctx, gf, vc, vs, sp.off1, sp.len0, sp.len1, to_snapshot);
+        append_row_copy(ctx, gf, kc, ks, sp.off0, from_row,
+                        sp.len0, to_snapshot);
+        append_row_copy(ctx, gf, vc, vs, sp.off0, from_row,
+                        sp.len0, to_snapshot);
+        append_row_copy(ctx, gf, kc, ks, sp.off1, from_row + sp.len0,
+                        sp.len1, to_snapshot);
+        append_row_copy(ctx, gf, vc, vs, sp.off1, from_row + sp.len0,
+                        sp.len1, to_snapshot);
     }
 
     bool ok = true;
@@ -209,12 +224,19 @@ bool muse_kv_snapshot_save(ggml_backend_t backend, const MuseWeights & w,
 }
 
 bool muse_kv_snapshot_restore(ggml_backend_t backend, const MuseWeights & w,
-                              MuseCache & cache, MuseKvSnapshot & snap) {
+                              MuseCache & cache, MuseKvSnapshot & snap,
+                              int from_row) {
     if (!snap.valid) {
         set_last_error("muse snapshot: restore without a live save");
         return false;
     }
-    if (!run_snapshot_graph(backend, w, cache, snap, /*to_snapshot=*/false)) {
+    if (from_row < 0 || from_row > snap.n) {
+        set_last_error("muse snapshot: from_row " + std::to_string(from_row) +
+                       " outside [0, " + std::to_string(snap.n) + "]");
+        return false;
+    }
+    if (!run_snapshot_graph(backend, w, cache, snap, /*to_snapshot=*/false,
+                            from_row)) {
         return false;
     }
     // One-shot: a second restore from the same save would write rows that the

@@ -419,6 +419,9 @@ std::unique_ptr<ModelBackend> create_backend(
         mcfg.stream_fd  = args.stream_fd;
         mcfg.chunk      = args.chunk;
         mcfg.fa_window  = args.fa_window;
+        mcfg.draft_path = args.draft_path;
+        mcfg.draft_gpu  = args.draft_device.gpu;
+        if (args.draft_ctx_max > 0) mcfg.draft_ctx_max = args.draft_ctx_max;
 
         auto backend = std::make_unique<MuseBackend>(mcfg);
         if (!backend->init()) {
