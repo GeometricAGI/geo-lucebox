@@ -10,6 +10,7 @@
 // with `<|start|>assistant`, so the first header arrives WITHOUT its opener.
 
 #include "atem_stream.h"
+#include "tool_parser.h"
 
 #include <cstdio>
 #include <string>
@@ -139,7 +140,89 @@ static void test_chained_reasoning_does_not_nest() {
     }
 }
 
+// ── ATEM tool-call dialect in tool_parser.cpp ──────────────────────────
+static void test_tool_parser_atem_dialect() {
+    const json tools = json::parse(
+        R"([{"type":"function","function":{"name":"fs.read_file",)"
+        R"("parameters":{"type":"object","properties":{)"
+        R"("path":{"type":"string"},"lines":{"type":"integer"}}}}}])");
+    const std::string text =
+        "Reading it now.\n"
+        "<atem:function_calls>\n<atem:invoke name=\"fs.read_file\">\n"
+        "<atem:parameter name=\"path\">a.txt</atem:parameter>\n"
+        "<atem:parameter name=\"lines\">42</atem:parameter>\n"
+        "</atem:invoke>\n</atem:function_calls>";
+    const ToolParseResult r = parse_tool_calls(text, tools);
+    if (r.tool_calls.size() != 1) {
+        std::fprintf(stderr, "FAIL: atem dialect produced %zu calls (want 1)\n",
+                     r.tool_calls.size());
+        ++g_fails;
+        return;
+    }
+    CHECK_EQ_S(r.tool_calls[0].name, "fs.read_file", "tool name");
+    // Typed coercion through the declared schema: path stays a string, lines
+    // becomes a number. Emitting both as strings is what a naive text scrape
+    // would do and breaks strict clients.
+    const json args = json::parse(r.tool_calls[0].arguments);
+    CHECK_EQ_S(args.value("path", ""), "a.txt", "string arg");
+    if (!args["lines"].is_number_integer() || args["lines"].get<int>() != 42) {
+        std::fprintf(stderr, "FAIL: integer arg not coerced: %s\n",
+                     args.dump().c_str());
+        ++g_fails;
+    }
+    // The wrapper must not survive in the visible text.
+    if (r.cleaned_text.find("<atem:") != std::string::npos) {
+        std::fprintf(stderr, "FAIL: atem wrapper left in cleaned_text: %s\n",
+                     r.cleaned_text.c_str());
+        ++g_fails;
+    }
+}
+
+static void test_tool_parser_atem_argument_containing_other_dialect() {
+    // An argument value may legitimately contain another dialect's opener
+    // (agentic prompts pass XML and code as arguments). The ATEM span is
+    // claimed first precisely so a later pattern cannot half-consume it.
+    const json tools = json::parse(
+        R"([{"type":"function","function":{"name":"fs.write",)"
+        R"("parameters":{"type":"object","properties":{)"
+        R"("body":{"type":"string"}}}}}])");
+    const std::string text =
+        "<atem:function_calls>\n<atem:invoke name=\"fs.write\">\n"
+        "<atem:parameter name=\"body\">see <tool_call>x</tool_call> here"
+        "</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+    const ToolParseResult r = parse_tool_calls(text, tools);
+    if (r.tool_calls.size() != 1) {
+        std::fprintf(stderr, "FAIL: nested-opener case gave %zu calls (want 1)\n",
+                     r.tool_calls.size());
+        ++g_fails;
+        return;
+    }
+    const json args = json::parse(r.tool_calls[0].arguments);
+    CHECK_EQ_S(args.value("body", ""), "see <tool_call>x</tool_call> here",
+               "argument text preserved verbatim");
+}
+
+static void test_tool_parser_atem_streaming_opener() {
+    // The streaming emitter must recognise the opener to start buffering.
+    size_t pos = 0;
+    const std::string text = "ok\n<atem:function_calls>\n<atem:invoke name=\"a.b\">";
+    if (!find_tool_syntax_start(text, json(), pos)) {
+        std::fprintf(stderr, "FAIL: streaming opener not recognised\n");
+        ++g_fails;
+    } else if (text.compare(pos, 21, "<atem:function_calls>") != 0) {
+        std::fprintf(stderr, "FAIL: opener position wrong (%zu)\n", pos);
+        ++g_fails;
+    }
+    if (tool_syntax_holdback(json()) < 20) {
+        std::fprintf(stderr, "FAIL: holdback too small for the ATEM opener\n");
+        ++g_fails;
+    }
+}
+
 int main() {
+    test_tool_parser_atem_dialect();
+    test_tool_parser_atem_argument_containing_other_dialect();
+    test_tool_parser_atem_streaming_opener();
     test_reasoning_then_answer();
     test_recipient_marker_never_leaks();
     test_tool_call_segment_is_routed_by_recipient();

@@ -1484,6 +1484,9 @@ if(DFLASH27B_TESTS)
                             test_atem_stream)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_muse_atem_test}.cpp")
             add_executable(${_muse_atem_test} test/${_muse_atem_test}.cpp)
+            if(_muse_atem_test STREQUAL "test_atem_stream")
+                target_sources(${_muse_atem_test} PRIVATE src/server/tool_parser.cpp)
+            endif()
             target_include_directories(${_muse_atem_test} PRIVATE
                 ${DFLASH27B_SRC_INCLUDE_DIRS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/server
