@@ -1,0 +1,5 @@
+<|begin_of_text|><|start|>system<|message|>You are terse.
+
+Reasoning strength: high.
+
+# Valid recipients: "self", "user".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant

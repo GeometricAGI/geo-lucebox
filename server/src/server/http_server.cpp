@@ -860,6 +860,29 @@ json parse_responses_arguments(const json & item) {
     return json::object();
 }
 
+// ATEM form of a tool call, mirroring the chat template's render_atem macro.
+// Needed when a client replays an assistant tool-call turn that this server
+// did not itself produce (so tool_memory has no raw text for it): without
+// this the turn renders EMPTY and the model loses the fact that it called
+// the tool at all, which breaks every multi-step agentic episode.
+std::string render_tool_call_atem(const std::string & name,
+                                  const json & arguments) {
+    std::string out = "<atem:function_calls>\n<atem:invoke name=\"" + name +
+                      "\">\n";
+    if (arguments.is_object()) {
+        for (const auto & [key, value] : arguments.items()) {
+            out += "<atem:parameter name=\"" + key + "\">";
+            if (value.is_string())        out += value.get<std::string>();
+            else if (value.is_boolean())  out += value.get<bool>() ? "true" : "false";
+            else if (value.is_null())     out += "null";
+            else                          out += value.dump();
+            out += "</atem:parameter>\n";
+        }
+    }
+    out += "</atem:invoke>\n</atem:function_calls>";
+    return out;
+}
+
 std::string render_tool_call_xml(const std::string & name, const json & arguments) {
     std::string out = "<function=" + name + ">\n";
     if (arguments.is_object()) {
@@ -876,7 +899,8 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
-    ToolMemory & tool_memory) {
+    ToolMemory & tool_memory,
+    ChatFormat chat_format) {
     std::vector<ChatMessage> chat_msgs;
     std::vector<std::string> system_parts;
 
@@ -922,10 +946,44 @@ std::vector<ChatMessage> normalize_chat_messages(
                     if (!id.empty()) call_ids.push_back(id);
                 }
                 std::string raw = tool_memory.lookup(call_ids);
+                if (raw.empty()) {
+                    // Not ours to replay (a client-constructed history, or a
+                    // restarted server). Rebuild the call text from the
+                    // structured tool_calls instead of dropping the turn.
+                    for (const auto & tc : m["tool_calls"]) {
+                        const json & fn = tc.contains("function") ? tc["function"] : tc;
+                        const std::string fname = fn.value("name", "");
+                        if (fname.empty()) continue;
+                        json args = json::object();
+                        if (fn.contains("arguments")) {
+                            if (fn["arguments"].is_string()) {
+                                try {
+                                    args = json::parse(fn["arguments"].get<std::string>());
+                                } catch (const std::exception &) {
+                                    args = json::object();
+                                }
+                            } else if (fn["arguments"].is_object()) {
+                                args = fn["arguments"];
+                            }
+                        }
+                        if (!raw.empty()) raw += "\n";
+                        raw += (chat_format == ChatFormat::ATEM)
+                                   ? render_tool_call_atem(fname, args)
+                                   : render_tool_call_xml(fname, args);
+                    }
+                }
                 if (!raw.empty()) {
                     cm.content = raw;
                     replayed = true;
                 }
+            }
+
+            // ATEM addresses a tool result turn by NAME; without this the
+            // renderer falls back to the opaque tool_call_id and the model
+            // sees `<|start|>tool call_1<|message|><tool_output name="call_1">`
+            // instead of the function it just invoked.
+            if (cm.role == "tool") {
+                cm.name = m.value("name", "");
             }
 
             if (!replayed) {
@@ -1963,7 +2021,8 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
                 hr.path, body, req, count_tokens_only)) return false;
 
         const std::vector<ChatMessage> chat_messages =
-            normalize_chat_messages(req.messages, req.format, tool_memory_);
+            normalize_chat_messages(req.messages, req.format, tool_memory_,
+                                    chat_format_);
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, req);
@@ -2047,12 +2106,45 @@ enum class TokenDelivery {
 // MUST classify identically, or the reasoning/content split diverges
 // between streamed and non-streamed responses.
 TokenDelivery classify_generated_token(
-        Tokenizer & tokenizer, int32_t token, std::string & text) {
+        Tokenizer & tokenizer, int32_t token, std::string & text,
+        AtemSegmenter * atem = nullptr) {
     if (token == tokenizer.eos_id() || token == tokenizer.eos_chat_id()) {
         return TokenDelivery::kSkip;
     }
 
     const std::string & raw = tokenizer.raw_token(token);
+
+    // ── ATEM (muse-glimmer) ────────────────────────────────────────────
+    // This family does not mark reasoning with a tag pair; it addresses
+    // whole SEGMENTS (`<|start|>assistant to=self<|message|>…<|eom|>`).
+    // Without routing them, the recipient marker and the entire reasoning
+    // channel land in the visible answer — observed live before this
+    // existed. The segmenter maps those transitions onto the same
+    // think-tag protocol the emitter already understands, so the streaming
+    // and non-streaming paths stay identical.
+    if (atem) {
+        const AtemStep step = atem->feed(raw);
+        switch (step.action) {
+        case AtemAction::OpenReasoning:
+            text = "<think>";
+            return TokenDelivery::kThinkTag;
+        case AtemAction::CloseReasoning:
+            text = "</think>\n";
+            return TokenDelivery::kThinkTag;
+        case AtemAction::EndTurn:
+        case AtemAction::Drop:
+            return TokenDelivery::kSkip;
+        case AtemAction::EmitText:
+            // Tool-addressed segments currently flow as text: the ATEM
+            // <atem:function_calls> block is not yet a dialect the tool
+            // parser recognizes, so surfacing it verbatim keeps it
+            // readable (and keeps the agentic suite, which parses the
+            // block itself, working) instead of dropping it.
+            text = tokenizer.token_text(token);
+            return TokenDelivery::kText;
+        }
+        return TokenDelivery::kSkip;
+    }
 
     // Gemma4 thinking channel (<|channel> / <channel|>) and Qwen3.6
     // thinking markers share one mapped dialect. The Qwen markers
@@ -2086,11 +2178,14 @@ TokenDelivery classify_generated_token(
 
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
+        SseEmitter & emitter, bool atem_format) {
+    // Fresh per replay: the segmenter is stateful.
+    std::unique_ptr<AtemSegmenter> atem =
+        atem_format ? std::make_unique<AtemSegmenter>(true) : nullptr;
     for (int32_t token : tokens) {
         std::string text;
         const TokenDelivery delivery =
-            classify_generated_token(tokenizer, token, text);
+            classify_generated_token(tokenizer, token, text, atem.get());
         if (delivery == TokenDelivery::kSkip) continue;
 
         emitter.emit_token(text);
@@ -2332,9 +2427,9 @@ json build_responses_api_response(
 json build_non_streaming_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
+        SseEmitter & emitter, bool atem_format) {
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter);
+        result.tokens, tokenizer, emitter, atem_format);
     switch (req.format) {
     case ApiFormat::OPENAI_CHAT:
         return build_openai_completion_response(
@@ -2530,7 +2625,7 @@ void HttpServer::apply_flowkv_compression(
         tools_json = req.tools.dump();
     }
     const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
-        modified_messages, req.format, tool_memory_);
+        modified_messages, req.format, tool_memory_, chat_format_);
 
     std::string rendered;
     if (!config_.chat_template_src.empty()) {
@@ -3410,6 +3505,9 @@ void HttpServer::configure_generation_io(
         broadcast_status();
     };
 
+    if (chat_format_ == ChatFormat::ATEM && !output.atem) {
+        output.atem = std::make_unique<AtemSegmenter>(true);
+    }
     io.on_token = [this, job, &req, &emitter, &output](
             int32_t token) -> bool {
         if (output.client_disconnected ||
@@ -3426,7 +3524,8 @@ void HttpServer::configure_generation_io(
 
         std::string text;
         const TokenDelivery delivery =
-            classify_generated_token(tokenizer_, token, text);
+            classify_generated_token(tokenizer_, token, text,
+                                     output.atem.get());
         if (delivery == TokenDelivery::kSkip) return true;
 
         if (!text.empty()) {
@@ -3705,7 +3804,8 @@ void HttpServer::process_job(ServerJob * job) {
         }
     } else if (!req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
-            req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+            req, result, n_gen_cap, gen_timings, tokenizer_, emitter,
+            chat_format_ == ChatFormat::ATEM);
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
         const int flags = sock_get_flags(fd);

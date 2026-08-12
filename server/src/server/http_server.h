@@ -17,6 +17,7 @@
 #include "common/model_backend.h"
 #include "tokenizer.h"
 #include "chat_template.h"
+#include "atem_stream.h"
 #include "tool_memory.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
@@ -386,6 +387,10 @@ private:
         int completion_tokens = 0;
         bool visible_output_seen = false;
         bool client_disconnected = false;
+        // ATEM channel state for muse-glimmer. Per request: the segmenter
+        // carries the open/closed reasoning channel across tokens, so it
+        // cannot be shared or reused.
+        std::unique_ptr<AtemSegmenter> atem;
     };
 
     void prepare_generation_inputs(

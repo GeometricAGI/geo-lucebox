@@ -6,10 +6,11 @@
 // types — ggml's ggml_mul_mat handles Q8_0 × F32 dequantization transparently.
 //
 // GGUF arch: "qwen35-dflash-draft" (from convert_dflash_to_gguf.py /
-// quantize_draft_q8.py). Tensor naming convention:
+// quantize_draft_q8.py), or "dflash" for the muse-glimmer vendor drafter.
+// Tensor naming convention (the vendor spellings in brackets):
 //
-//   dflash.fc.weight                        [5*hidden, hidden]  Q8_0 / F16
-//   dflash.hidden_norm.weight               [hidden]            F32
+//   dflash.fc.weight           [fc.weight]              [5*hidden, hidden]  Q8_0 / F16 / Q4_K
+//   dflash.hidden_norm.weight  [enc.output_norm.weight] [hidden]            F32
 //   output_norm.weight                      [hidden]            F32
 //   blk.<i>.attn_norm.weight                [hidden]            F32
 //   blk.<i>.ffn_norm.weight                 [hidden]            F32
@@ -35,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -50,12 +52,6 @@
 namespace dflash::common {
 
 namespace {
-
-uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0) return fallback;
-    return gguf_get_val_u32(g, id);
-}
 
 int count_swa_layers(const DraftWeights & w) {
     int n_swa = 0;
@@ -125,11 +121,17 @@ bool load_draft_gguf(const std::string & path,
         }
         const char * arch = gguf_get_val_str(gctx, arch_id);
         arch_s = arch;
+        // "dflash" is the bare arch string the muse-glimmer vendor drafter
+        // ships with; its hparam keys are prefixed "dflash." either way, so
+        // the KV lookup below has to tolerate the prefix appearing once
+        // rather than twice.
         if (arch_s != "qwen35-dflash-draft" &&
             arch_s != "dflash-draft" &&
-            arch_s != "gemma4-dflash-draft") {
+            arch_s != "gemma4-dflash-draft" &&
+            arch_s != "dflash") {
             set_last_error(std::string("unexpected draft arch: ") + arch +
-                           " (expected qwen35-dflash-draft, dflash-draft, or gemma4-dflash-draft)");
+                           " (expected qwen35-dflash-draft, dflash-draft, "
+                           "gemma4-dflash-draft, or dflash)");
             gguf_free(gctx);
             return false;
         }
@@ -139,13 +141,27 @@ bool load_draft_gguf(const std::string & path,
     const char * A = arch_s.c_str();
     char key[128];
 
-    auto read_u32 = [&](const char * suffix, uint32_t fallback) -> uint32_t {
-        std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
-        return get_u32_or(gctx, key, fallback);
-    };
-    auto read_f32 = [&](const char * suffix, float fallback) -> float {
+    // Key lookup with a bare-suffix fallback. Converters write hparams under
+    // the arch prefix ("gemma4-dflash-draft.dflash.block_size"), but a drafter
+    // whose arch string is itself "dflash" writes them once
+    // ("dflash.block_size"). Trying the prefixed form first keeps every
+    // existing drafter byte-identical in behaviour; the fallback is what lets
+    // the bare-"dflash" arch load at all. A bare suffix like
+    // "embedding_length" simply does not exist as a top-level key, so the
+    // fallback cannot collide.
+    auto find_key2 = [&](const char * suffix) -> int64_t {
         std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
         int64_t id = gguf_find_key(gctx, key);
+        if (id >= 0) return id;
+        return gguf_find_key(gctx, suffix);
+    };
+    auto read_u32 = [&](const char * suffix, uint32_t fallback) -> uint32_t {
+        int64_t id = find_key2(suffix);
+        if (id < 0) return fallback;
+        return gguf_get_val_u32(gctx, id);
+    };
+    auto read_f32 = [&](const char * suffix, float fallback) -> float {
+        int64_t id = find_key2(suffix);
         if (id < 0) return fallback;
         return gguf_get_val_f32(gctx, id);
     };
@@ -170,8 +186,12 @@ bool load_draft_gguf(const std::string & path,
     // load without a hardcoded per-arch set; the array length also backstops
     // n_target_layers when the scalar KV is absent.
     {
-        std::snprintf(key, sizeof(key), "%s.%s", A, "dflash.target_layer_ids");
-        const int64_t target_ids_id = gguf_find_key(gctx, key);
+        // Two spellings in the wild: our converter writes
+        // `dflash.target_layer_ids`, the muse-glimmer vendor drafter writes
+        // `dflash.target_layers`. Both mean the same thing — the target layer
+        // indices whose OUTPUT hidden state the drafter cross-attends to.
+        int64_t target_ids_id = find_key2("dflash.target_layer_ids");
+        if (target_ids_id < 0) target_ids_id = find_key2("dflash.target_layers");
         if (target_ids_id >= 0 &&
             gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY &&
             gguf_get_arr_type(gctx, target_ids_id) == GGUF_TYPE_INT32) {
@@ -204,6 +224,19 @@ bool load_draft_gguf(const std::string & path,
     // Store GGUF-declared config into DraftWeights (replaces hardcoded defaults).
     out.block_size = (int)block_sz;
     out.n_target_layers = (int)n_tgt_lay;
+
+    // The mask token the drafter was TRAINED with. It is a property of the
+    // drafter, not of the target's tokenizer, and it is not derivable from
+    // anything else in the file — the muse-glimmer drafter declares 201818
+    // (`<|reserved_special_token_1818|>`), nothing like the 4 the gemma4
+    // drafter uses. Getting it wrong feeds the drafter noise it never saw in
+    // training, which costs acceptance rate silently and fails nothing.
+    {
+        const int64_t mask_id = gguf_find_key(gctx, "tokenizer.ggml.mask_token_id");
+        if (mask_id >= 0) {
+            out.mask_token_id = (int)gguf_get_val_u32(gctx, mask_id);
+        }
+    }
 
     // Propagate target model properties if available.
     if (target) {
@@ -242,6 +275,30 @@ bool load_draft_gguf(const std::string & path,
     out.n_embd    = (int)n_embd;
     out.n_ff      = (int)n_ff;
     out.rope_theta = read_f32("rope.freq_base", 0.0f);
+    // RoPE pairing convention. No GGUF key carries it, so it cannot be read
+    // from the file and the wrong choice is silent — the drafter still emits
+    // fluent-looking tokens, they just stop matching the target. NEOX for every
+    // drafter here, including the muse-glimmer one: its TARGET is NORMAL (see
+    // docs/MUSE_GLIMMER.md), which made NORMAL the obvious guess, but measured
+    // acceptance on muse-glimmer is 9.1% under NEOX against 8.6% under NORMAL,
+    // i.e. no support for changing it. `DFLASH_DRAFT_ROPE=normal|neox`
+    // re-runs that A/B.
+    out.rope_type = GGML_ROPE_TYPE_NEOX;
+    if (const char * rt = std::getenv("DFLASH_DRAFT_ROPE")) {
+        if (std::string(rt) == "normal") out.rope_type = GGML_ROPE_TYPE_NORMAL;
+        else if (std::string(rt) == "neox") out.rope_type = GGML_ROPE_TYPE_NEOX;
+    }
+    // Within-block attention convention. The bare-"dflash" vendor drafter
+    // follows the DFlash paper: the reference implementation
+    // (llama.cpp models/dflash.cpp) runs the noise block with "cache-aware,
+    // non-causal attention", i.e. every noise slot sees every other. The
+    // Qwen3-style drafters in this tree were converted and validated against
+    // the causal-in-block mask and keep it.
+    out.block_bidirectional = (arch_s == "dflash");
+    std::fprintf(stderr, "[draft GGUF] rope: base=%.0f type=%s block=%s\n",
+                 out.rope_theta,
+                 out.rope_type == GGML_ROPE_TYPE_NEOX ? "neox" : "normal",
+                 out.block_bidirectional ? "bidirectional" : "causal");
     if (out.rope_theta == 0.0f) {
         fprintf(stderr, "[draft-gguf] WARNING: rope.freq_base not found in GGUF, draft RoPE will be wrong\n");
     }
@@ -250,17 +307,25 @@ bool load_draft_gguf(const std::string & path,
     auto g = [&](const char * name) -> ggml_tensor * {
         return ggml_get_tensor(meta_ctx, name);
     };
-    auto g_any = [&](const char * a, const char * b) -> ggml_tensor * {
-        if (ggml_tensor * t = g(a)) return t;
-        return g(b);
+    auto g_any = [&](std::initializer_list<const char *> names) -> ggml_tensor * {
+        for (const char * n : names) {
+            if (ggml_tensor * t = g(n)) return t;
+        }
+        return nullptr;
     };
 
-    out.fc          = g_any("dflash.fc.weight", "dflash_fc.weight");
-    out.hidden_norm = g_any("dflash.hidden_norm.weight", "dflash_hidden_norm.weight");
+    // Three naming conventions for the same two tensors. The bare
+    // `fc.weight` / `enc.output_norm.weight` pair is what the muse-glimmer
+    // vendor drafter ships; ours prefix with `dflash.` or `dflash_`.
+    out.fc          = g_any({"dflash.fc.weight", "dflash_fc.weight", "fc.weight"});
+    out.hidden_norm = g_any({"dflash.hidden_norm.weight",
+                             "dflash_hidden_norm.weight",
+                             "enc.output_norm.weight"});
     out.out_norm    = g("output_norm.weight");
     if (!out.fc || !out.hidden_norm || !out.out_norm) {
         set_last_error("draft GGUF: missing top-level tensors "
-                       "(dflash.fc|dflash_fc / dflash.hidden_norm|dflash_hidden_norm / output_norm)");
+                       "(dflash.fc|dflash_fc|fc / dflash.hidden_norm|"
+                       "dflash_hidden_norm|enc.output_norm / output_norm)");
         ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
         out.ctx = nullptr;
         gguf_free(gctx);

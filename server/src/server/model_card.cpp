@@ -286,6 +286,18 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
         out.source_label = "family:gemma4";
         return true;
     }
+    if (arch == "muse-glimmer") {
+        // Muse-Glimmer-30B: 52-layer dense agentic VLM. The reasoning
+        // channel (`to=self`) runs before the visible turn, so the reply
+        // budget has to cover reasoning + answer; 4096 matches the
+        // measured tail of the 122-item agentic suite the geo-quant
+        // artifacts are gated on (server/docs/MUSE_GLIMMER.md).
+        out.max_tokens                 = 32768;
+        out.complex_problem_max_tokens = 0;
+        out.hard_limit_reply_budget    = 4096;
+        out.source_label = "family:muse-glimmer";
+        return true;
+    }
     if (arch == "laguna") {
         // Laguna (DeepSeek-V3-derivative) — same conservative ceiling
         // as the Qwen family until a verified card lands.

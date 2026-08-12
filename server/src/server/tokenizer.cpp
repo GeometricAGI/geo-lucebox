@@ -213,9 +213,18 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             }
         }
 
-        // Pattern 3: \p{N}  (single digit)
+        // Pattern 3: digits. \p{N} for the qwen dialects, \p{N}{1,3} for
+        // the llama3/llama4/gpt-4 family — see the PreTokenizer comment.
         if (is_digit(cp)) {
             pos += cplen;
+            if (pre_type_ == PreTokenizer::LLAMA_BPE) {
+                for (int taken = 1; taken < 3 && pos < text.size(); ++taken) {
+                    int nl = 0;
+                    const uint32_t nc = peek_cp(pos, &nl);
+                    if (!is_digit(nc)) break;
+                    pos += nl;
+                }
+            }
             pieces.push_back(text.substr(start, pos - start));
             continue;
         }
@@ -598,6 +607,14 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         const char * pre = gguf_get_val_str(gctx, pre_key);
         if (pre && std::strcmp(pre, "qwen35") == 0) {
             pre_type_ = PreTokenizer::QWEN35;
+        } else if (pre && (std::strcmp(pre, "llama4") == 0 ||
+                           std::strcmp(pre, "llama3") == 0 ||
+                           std::strcmp(pre, "llama-bpe") == 0 ||
+                           std::strcmp(pre, "gpt-4") == 0)) {
+            // Digit-grouping family: runs of up to three digits are ONE
+            // pre-token. Falling through to the qwen default here silently
+            // retokenizes every number in every prompt.
+            pre_type_ = PreTokenizer::LLAMA_BPE;
         } else {
             pre_type_ = PreTokenizer::QWEN2;
         }
@@ -628,7 +645,8 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 
     std::fprintf(stderr, "[tokenizer] loaded vocab=%d merges=%zu bos=%d eos=%d eot=%d pre=%s sp=%s\n",
                  n_vocab, merge_rank_.size(), bos_id_, eos_id_, eos_chat_id_,
-                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2",
+                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" :
+                 pre_type_ == PreTokenizer::LLAMA_BPE ? "llama-bpe" : "qwen2",
                  is_sentencepiece_ ? "yes" : "no");
     return true;
 }
