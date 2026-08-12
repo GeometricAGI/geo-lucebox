@@ -1474,6 +1474,22 @@ if(DFLASH27B_TESTS)
     endforeach()
     unset(_muse_art_test)
 
+    # Decode-throughput bench for the muse step driver. Not a test (it needs an
+    # artifact and reports timings rather than asserting), but it shares the
+    # muse test targets' include/link shape.
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_muse_decode.cpp")
+        add_executable(bench_muse_decode test/bench_muse_decode.cpp)
+        target_include_directories(bench_muse_decode PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/muse
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_muse_decode PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+
     # ── Muse-Glimmer ATEM chat format (CPU-only; backend-agnostic) ──
     # Two levels: a grammar unit test, and a byte-exact comparison against
     # prompts rendered by the MODEL's own chat template (fixtures under

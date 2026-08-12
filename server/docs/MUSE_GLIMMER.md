@@ -147,9 +147,73 @@ row, and batching/CUDA-graph replay tuning.
   drift. Host-resident mix tensors are refused by name: decode is GPU-only,
   and on unified memory (Strix Halo) a host pointer may read something valid
   but wrong instead of faulting.
-- **S5 — gate parity.** Run the 122-item agentic golden suite against
-  lucebox-served muse-v4 and compare with the llama.cpp bands
-  (muse-v4 103–106, muse-lowbpw-r1 101–103, official 100–101, bf16 103).
+- **S5 — gate parity. DONE (CUDA).** The 122-item agentic golden suite against
+  lucebox-served artifacts reproduces the llama.cpp bands: **muse-v4 105/122**
+  (band 103–106) and **muse-lowbpw-r1 101/122** (band 101–103). Notably r1
+  scores AGENT 9/12 against v4's 8 — the 3.30 bpw artifact holds multi-step
+  agentic behaviour. AMD is still owed.
+
+## Decode throughput: the dense mix matvec was never tuned for a dense model
+
+`bench_muse_decode` (prefill once, time N single-token steps, no sampling)
+reproduces the golden suite's throughput in ~30 s instead of ~80 min, which is
+what made the following tractable.
+
+Measured on an H200, muse-lowbpw-r1:
+
+| | decode | prefill |
+|---|---|---|
+| before | 25.95 tok/s (38.53 ms/tok) | 499 tok/s |
+| after | **53.56 tok/s (18.67 ms/tok)** | 502 tok/s |
+
+**2.06× decode, and the output is bit-identical** — 202048 f32 logits compare
+byte-for-byte equal between the two builds (`MUSE_DUMP_LOGITS`). Quality is
+therefore unchanged by construction, not merely within a noise band. muse-v4
+is untouched (13.81 vs 13.77 ms/tok).
+
+The diagnosis is worth recording because it inverts the intuition for a
+quantized kernel. ncu on `mix_matvec_rocmfp3_kernel` measured **1.65% DRAM
+throughput, 97% L1 throughput, 98.4% L1 hit rate**, and 56% of all warp cycles
+stalled on **LG throttle**. It was not bandwidth bound at all — it was bound on
+the *number* of narrow global load instructions. SASS confirmed it exactly:
+**320 32-bit `LDG.E.CONSTANT` for activations against 35 `LDG.E.U16` for
+weights**, i.e. 90% of load issue was the activation vector, entirely
+unvectorized.
+
+Two bit-exact changes:
+
+1. **float4 activation staging.** The 32 activations a block consumes are
+   contiguous (128 B), so they cost 8 loads instead of 32. Same values, same
+   ascending-j fold.
+2. **Two output rows per warp.** Both rows consume the SAME activations, so one
+   stage feeds two accumulators — halving activation load issue per unit work.
+
+The second is not a new idea: the MoE and 3-D-slice kernels in the same files
+have done it since the DS4 line, for this exact reason. **The dense 2-D kernel
+never got it, because the model this family was built for is MoE and never took
+that path.** Muse-Glimmer is the first dense consumer of qtype 105/106.
+
+Result on the kernel itself: 151 µs → 40 µs, global load instructions 1.12 M →
+318 k, warp cycles per issued instruction 59.5 → 10.7, no register spilling
+(`local_ld` = 0). L1 dropped from 97% to 54% and nothing is saturated now.
+
+Remaining headroom, for whoever picks this up:
+
+- The kernel is now partly **launch-bound on small tensors** — ncu reports
+  0.6 full waves for `attn_gate` (out=4096), and doubling rows-per-warp halved
+  the grid. A rows-per-warp choice made at launch from `out` would suit both
+  ends; it is bit-exact either way (verified: 2-row output == 1-row output).
+- **fp3 weight staging is still 7× `LDG.U16` per 14-byte block.** fp2 already
+  does load-from-floor wide staging (2 × u64 + funnel shift). The fp3 analogue
+  needs a 24 B window (14 B block at a 2-aligned offset), which overruns the
+  tensor end by up to 10 B — so it needs the same registration-time shape guard
+  fp2 carries, not a bare port. Deliberately not attempted here.
+- **These changes are untested on AMD.** The shapes they replace were tuned on
+  wave64/CDNA-era parts and the fp2 kernel still carries an
+  `amdgpu_waves_per_eu(12,12)` pin chosen against a measured occupancy cliff.
+  Wider loads and register blocking *should* help there too, but that is a
+  hypothesis until measured on gfx1151/gfx1201 — and a divergent result is the
+  case for genuinely forking the launch config per backend.
 
 S1–S3 make `muse-v4` (the byte-parity artifact that beats the vendor GGUF)
 servable with no kernel work at all. S4 adds the 3.30 bpw artifact.
