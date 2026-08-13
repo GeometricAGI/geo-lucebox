@@ -279,6 +279,29 @@ verify), and it is *more* numerically faithful, because the dequant path rounds
 through bf16 where MMQ keeps integer dot products. On CUDA it is 1.20× and r1
 remains a net loss.
 
+**MMQ is not uniformly better, so the runtime picks per multiply, not per
+process.** It wins when the batch is narrow and loses when it is wide: a wide
+`ne11` hands the dequant path a well-tiled dense GEMM, which the MMQ kernel
+does not out-tile. Measured on r1 prefill (`bench_muse_decode`, MMQ off → on):
+
+| ne11 | 8 | 16 | 64 | 256 | 1024 | 2048 |
+|---|---|---|---|---|---|---|
+| gfx1151 | 1.80× | 1.77× | 1.65× | 1.05× | **0.89×** | **0.86×** |
+| gfx1201 | 5.11× | 4.02× | 3.26× | 1.83× | 1.13× | **0.98×** |
+
+`ggml_cuda_should_use_mmq` therefore width-gates the mix qtypes at
+`mix_mmq_max_ne11` — 1024 on RDNA 4, 256 elsewhere — so a served request gets
+the narrow-batch win on its verify steps *and* the dense-GEMM win on its
+prefill without the operator choosing. Re-measured with the gate in place, the
+wide-batch regressions are gone (gfx1151 1024: 0.89× → 0.99×, 2048: 0.86× →
+1.00×; gfx1201 2048: 0.98× → 1.00×) and every narrow-batch win is retained.
+Decode is unaffected in every arm (16.2 / 28.2 tok/s with the flag either way):
+`ne11 == 1` takes the MMV kernel and never reaches this gate.
+
+NVIDIA has no width sweep yet — the H200 1.20× above is an `ne11` 4–16 verify
+figure — so it takes the conservative 256 bound, which keeps every measured
+NVIDIA win. `DFLASH_MIX_MMQ_MAX_NE11` overrides the threshold once swept.
+
 **The flag is inert on DS4**, despite its original name. DS4's 105/106 tensors
 are MoE experts reached through `ggml_mul_mat_id`, which does not take the MMQ
 path. Measured three ways on Strix Halo (gfx1151): six serving configs

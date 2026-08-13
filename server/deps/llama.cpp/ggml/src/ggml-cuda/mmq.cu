@@ -534,6 +534,37 @@ void ggml_cuda_clear_mix_mmq_override() {
     g_mix_mmq_forced = false;
 }
 
+// Widest ne11 at which the mix-qtype MMQ path still beats dequantize-to-bf16 +
+// dense GEMM. MMQ is not uniformly better: it wins by a lot when the batch is
+// narrow and loses when it is wide, because the dequant path hands a wide N to
+// a well-tiled dense GEMM while the MMQ kernel does not tile as far. Measured
+// on muse-lowbpw-r1 (71 dense mix tensors), prefill tok/s, MMQ off -> on:
+//
+//   ne11        8      16      64     256    1024    2048
+//   gfx1151  1.80x   1.77x   1.65x   1.05x   0.89x   0.86x
+//   gfx1201  5.11x   4.02x   3.26x   1.83x   1.13x   0.98x
+//
+// so the crossover sits between 256 and 1024 on RDNA 3.5 and between 1024 and
+// 2048 on RDNA 4. Decline MMQ past it rather than making the operator choose:
+// decode (ne11 == 1) never reaches this gate at all, and a served request wants
+// the narrow-batch win on its verify steps AND the wide-batch win on its
+// prefill, which one process-wide boolean cannot deliver.
+//
+// NVIDIA has no width sweep yet — the H200 result behind this path (1.20x) was
+// measured on ne11 4..16 verify batches. It therefore takes the conservative
+// RDNA 3.5 bound, which keeps every measured NVIDIA win and declines only the
+// widths nothing has measured there. Raise it with the env var once swept.
+static int64_t mix_mmq_max_ne11(int cc) {
+    static const int64_t override_value = []() -> int64_t {
+        const char * value = getenv("DFLASH_MIX_MMQ_MAX_NE11");
+        return value ? strtoll(value, nullptr, 10) : -1;
+    }();
+    if (override_value >= 0) {
+        return override_value;
+    }
+    return GGML_CUDA_CC_IS_RDNA4(cc) ? 1024 : 256;
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -594,7 +625,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // NVIDIA is opted in behind the same env var so the claim can be
             // measured rather than assumed: the DP4A tile these types declare
             // is portable, but nothing has gated it here yet.
+            //
+            // Width-gated: see mix_mmq_max_ne11 for why wide batches decline.
             mmq_supported = ggml_cuda_mix_mmq_enabled() &&
+                ne11 <= mix_mmq_max_ne11(cc) &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
                  GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
@@ -614,7 +648,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // NVIDIA is opted in behind the same env var so the claim can be
             // measured rather than assumed: the DP4A tile these types declare
             // is portable, but nothing has gated it here yet.
+            //
+            // Width-gated: see mix_mmq_max_ne11 for why wide batches decline.
             mmq_supported = ggml_cuda_mix_mmq_enabled() &&
+                ne11 <= mix_mmq_max_ne11(cc) &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
                  GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
