@@ -1,5 +1,5 @@
 #include "common.cuh"
-#include "mix-mmq.h"
+#include "ggml-cuda.h"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
@@ -473,18 +473,12 @@ void ggml_cuda_op_mul_mat_q(
 }
 
 #ifndef GGML_CUDA_MIX_MMQ_DEFAULT
-// ON by default. Gated on:
-//   - test_rocmfp_mix_mmq (MMQ vs the validated matvec kernel, 1% relative-rms
-//     bar) passing on gfx1151, gfx1201 and NVIDIA;
-//   - muse-glimmer r1 scoring 103/122 on the agentic golden suite with MMQ on,
-//     against 101/122 for the AR baseline, at 81.0 tok/s vs 43.5 with MMQ off.
-// Set DFLASH_MIX_MMQ=0 to fall back to dequantize-to-bf16 + dense GEMM.
-//
-// Note this default is a no-op for DS4: its 105/106 tensors are MoE experts
-// reached through ggml_mul_mat_id, which does not take the MMQ path. Measured
-// inert, not measured correct — six serving configs and a 3974-token prefill
-// were byte-identical with the flag on and off.
-#define GGML_CUDA_MIX_MMQ_DEFAULT true
+// OFF unless a model backend opts in (MuseBackend::init does). The measured
+// win — muse-glimmer r1 at 103/122 and 81.0 tok/s, against 101/122 and 43.5
+// with it off — is muse's, and muse's mix tensors are dense ggml_mul_mat.
+// A process-wide default would extend that result to models it was never
+// measured on, which is how the "inert on DS4" mistake happened.
+#define GGML_CUDA_MIX_MMQ_DEFAULT false
 #endif
 
 // ── Batched path for the mix qtypes (105/106) ───────────────────────────
@@ -499,22 +493,36 @@ void ggml_cuda_op_mul_mat_q(
 static bool g_mix_mmq_forced     = false;
 static bool g_mix_mmq_forced_val = false;
 
+static const char * mix_mmq_env_value() {
+    const char * value = getenv("DFLASH_MIX_MMQ");
+    if (value == nullptr) {
+        // Legacy spelling; the flag predates its use outside DS4 prefill.
+        value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+    }
+    return value;
+}
+
+bool ggml_cuda_mix_mmq_env_pinned() {
+    static const bool pinned = mix_mmq_env_value() != nullptr;
+    return pinned;
+}
+
+// Precedence: an explicit set_ call (the test's A/B harness) beats the
+// environment, which beats the compiled default. Backends opting in for their
+// own model must therefore check ggml_cuda_mix_mmq_env_pinned() first, so an
+// operator running DFLASH_MIX_MMQ=0 is not silently overridden.
 bool ggml_cuda_mix_mmq_enabled() {
     if (g_mix_mmq_forced) {
         return g_mix_mmq_forced_val;
     }
-    static const bool from_env = []() {
-        const char * value = getenv("DFLASH_MIX_MMQ");
-        if (value == nullptr) {
-            // Legacy spelling; the flag predates its use outside DS4 prefill.
-            value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-        }
-        if (value == nullptr) {
-            return GGML_CUDA_MIX_MMQ_DEFAULT;
-        }
-        return !(value[0] == '0' && value[1] == '\0');
-    }();
-    return from_env;
+    if (ggml_cuda_mix_mmq_env_pinned()) {
+        static const bool from_env = []() {
+            const char * value = mix_mmq_env_value();
+            return !(value[0] == '0' && value[1] == '\0');
+        }();
+        return from_env;
+    }
+    return GGML_CUDA_MIX_MMQ_DEFAULT;
 }
 
 void ggml_cuda_set_mix_mmq_enabled(bool enabled) {

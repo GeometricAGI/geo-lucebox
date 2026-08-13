@@ -48,10 +48,9 @@
 #include <string>
 #include <vector>
 
-// Runtime override so one process can A/B both paths against the same weights;
-// without it the env var is read once per process and the comparison would
-// need two runs.
-#include "mix-mmq.h"
+// ggml-cuda.h also declares the mix-MMQ runtime override, so one process can
+// A/B both paths against the same weights; without it the env var is read once
+// per process and the comparison would need two runs.
 
 extern "C" void ggml_cuda_rocmfp3_mix_register_host(
     const void * base, size_t nb02, int n_experts, int out, int in,

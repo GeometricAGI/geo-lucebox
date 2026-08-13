@@ -253,8 +253,13 @@ on each one. Quality is inside the ±2 band the suite is noisy to. This is why
 the 1.20× measured on a short chat set understates the effect on real
 reasoning/code traffic.
 
-**Mix MMQ is on by default** (`DFLASH_MIX_MMQ=0` to disable; the old
-`DFLASH_DS4_MIX_MMQ_PREFILL` spelling is still read as a fallback). With it
+**Mix MMQ is a per-backend opt-in, and the muse backend opts in**
+(`MuseBackend::init()` calls `ggml_cuda_set_mix_mmq_enabled(true)` unless the
+environment already pinned the toggle). `DFLASH_MIX_MMQ=0/1` overrides the
+opt-in and the compiled default in either direction; the old
+`DFLASH_DS4_MIX_MMQ_PREFILL` spelling is still read as a fallback. The compiled
+default stays off because the measured win is muse's alone — muse's mix tensors
+are dense `ggml_mul_mat`, which is where the MMQ path applies. With it
 off, `ne11 > 1` for qtypes 105/106 falls back to dequantize-to-bf16 + dense
 GEMM — **48% of a 16-token verify's GPU time sits in
 `dequantize_rocmfp{2,3}_mix_kernel`** (nsys), i.e. the multiply throws away the
@@ -274,12 +279,17 @@ verify), and it is *more* numerically faithful, because the dequant path rounds
 through bf16 where MMQ keeps integer dot products. On CUDA it is 1.20× and r1
 remains a net loss.
 
-**The default flip is a no-op for DS4**, despite the flag's original name. DS4's
-105/106 tensors are MoE experts reached through `ggml_mul_mat_id`, which does not
-take the MMQ path — so the flag was measured *inert* there, not measured correct.
-Six serving configs (11-token prompts) and a 3974-token prefill were byte-identical
-with it on and off, the long prefill landing at 184.1 s ±0.1% either way. The
-evidence backing the default is muse's, not DS4's.
+**The flag is inert on DS4**, despite its original name. DS4's 105/106 tensors
+are MoE experts reached through `ggml_mul_mat_id`, which does not take the MMQ
+path. Measured three ways on Strix Halo (gfx1151): six serving configs
+(11-token prompts) byte-identical with it on and off; a 3974-token prefill at
+184.1 s ±0.1% either way; and a controlled decode A/B (one server at a time,
+hard teardown, arm order 0,1,1,0, warmup discarded) at 21.72 / 21.72 / 21.74
+tok/s across the arms. An earlier reading of a 35% regression under the flag
+was a harness artifact — a failed arm left the previous server's ~91 GiB
+unified allocation live. This inertness is why the opt-in is scoped to muse
+rather than a process-wide default: DS4 was measured *unaffected*, not
+measured to benefit.
 
 **Why CUDA gains less, measured rather than guessed.** The mix types already
 have an MMA tile and already use it on NVIDIA: `vec_dot_mma` is

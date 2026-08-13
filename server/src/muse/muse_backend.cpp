@@ -38,6 +38,16 @@ void MuseBackend::shutdown() {
 }
 
 bool MuseBackend::init() {
+    // Opt this model into the batched mix-qtype (MMQ) path. muse's 105/106
+    // tensors are dense and go through ggml_mul_mat, which is where MMQ
+    // applies; measured 103/122 on the golden suite at 81.0 tok/s with it on,
+    // against 101/122 at 43.5 with it off. It is enabled here rather than as a
+    // process-wide default because that result is muse's alone — models whose
+    // mix tensors are MoE experts reach them through ggml_mul_mat_id and were
+    // never measured to benefit. An explicit DFLASH_MIX_MMQ wins over this.
+    if (!ggml_cuda_mix_mmq_env_pinned()) {
+        ggml_cuda_set_mix_mmq_enabled(true);
+    }
     // `ggml_backend_cuda_init` is the HIP entry point too — the HIP build
     // compiles the same ggml-cuda sources, so this line is backend-agnostic
     // exactly as it is for the other families.
