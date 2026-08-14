@@ -74,7 +74,8 @@ namespace dflash::common {
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
-    ToolMemory & tool_memory);
+    ToolMemory & tool_memory,
+    ChatFormat chat_format);
 }
 
 namespace {
@@ -529,7 +530,10 @@ TEST_CASE(ServerUnitFixture, test_tool_syntax_scanner_declared_name_guards) {
 
     json invalid = edit_tools();
     invalid[0]["function"]["name"] = std::string(65, 'x');
-    TEST_ASSERT(tool_syntax_holdback(invalid) == 15);
+    // An over-long name is not a declared tool, so the holdback falls back to
+    // the longest fixed opener: `<atem:function_calls>` (20). Was 15 when
+    // `<parameter name=` was the longest.
+    TEST_ASSERT(tool_syntax_holdback(invalid) == 20);
     pos = std::string::npos;
     TEST_ASSERT(!find_tool_syntax_start("<" + std::string(65, 'x') + ">",
                                         invalid, pos));
@@ -2671,7 +2675,10 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
         }
     });
 
-    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES, tool_memory);
+    // QWEN3 (any non-ATEM format) keeps the XML tool-call rendering this test
+    // asserts on; ATEM would replay through render_tool_call_atem instead.
+    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES,
+                                             tool_memory, ChatFormat::QWEN3);
     TEST_ASSERT(chat_msgs.size() == 4);
     if (chat_msgs.size() == 4) {
         TEST_ASSERT(chat_msgs[0].role == "system");
