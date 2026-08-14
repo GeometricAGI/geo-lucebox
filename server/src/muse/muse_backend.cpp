@@ -38,6 +38,16 @@ void MuseBackend::shutdown() {
 }
 
 bool MuseBackend::init() {
+    // Opt this model into the batched mix-qtype (MMQ) path. muse's 105/106
+    // tensors are dense and go through ggml_mul_mat, which is where MMQ
+    // applies; measured 103/122 on the golden suite at 81.0 tok/s with it on,
+    // against 101/122 at 43.5 with it off. It is enabled here rather than as a
+    // process-wide default because that result is muse's alone — models whose
+    // mix tensors are MoE experts reach them through ggml_mul_mat_id and were
+    // never measured to benefit. An explicit DFLASH_MIX_MMQ wins over this.
+    if (!ggml_cuda_mix_mmq_env_pinned()) {
+        ggml_cuda_set_mix_mmq_enabled(true);
+    }
     // `ggml_backend_cuda_init` is the HIP entry point too — the HIP build
     // compiles the same ggml-cuda sources, so this line is backend-agnostic
     // exactly as it is for the other families.
@@ -220,18 +230,26 @@ bool MuseBackend::load_decode_draft() {
 
     std::printf("[muse] spec-decode ready: depth=%d mirror_cap=%d\n",
                 dw_.block_size, feat_cap);
-    // Honest expectation-setting, same spirit as the --fa-window warning.
-    // Measured on H200 + muse-v4 (chat traffic through the server): ~2.4-3.2
-    // tokens committed per verify round, 73-101 vs ~70 tok/s AR = 1.05-1.45x.
-    // Real but well short of the vendor's 3.1x llama.cpp figure, mostly
-    // because a 16-token verify forward costs ~1.9 AR steps on these kernels
-    // and the context features are re-projected every round instead of cached.
-    // The per-request "[muse-spec]" line reports the live rate.
+    // Honest expectation-setting, same spirit as the --fa-window warning, and
+    // platform-specific because the measurement is: acceptance is the same
+    // everywhere (~0.15-0.24) but the batched verify is not. A 16-token verify
+    // costs ~1.9 AR steps on H200, ~4.4 on gfx1201, ~6.6 on gfx1151, so
+    // speculation pays on CUDA (1.05-1.45x) and LOSES on both AMD parts
+    // (0.28-0.76x). A user who passes --draft expects a speedup; on HIP they
+    // will get the opposite, so say so rather than let them discover it.
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    std::fprintf(stderr,
+        "[muse] WARNING speculative decode is output-verified but is a "
+        "SLOWDOWN on the AMD parts measured so far: 0.49-0.76x vs AR on "
+        "gfx1201, 0.28-0.46x on gfx1151 (acceptance is fine; the 16-token "
+        "verify costs 4.4-6.6 AR steps). Prefer plain AR decode here.\n");
+#else
     std::fprintf(stderr,
         "[muse] speculative decode: output-verified; measured 1.05-1.45x vs AR "
         "on H200 chat traffic (vendor's llama.cpp reference reaches 3.1x — "
         "verify-cost headroom remains). Watch the [muse-spec] line per "
         "request.\n");
+#endif
     std::fflush(stdout);
     return true;
 }
