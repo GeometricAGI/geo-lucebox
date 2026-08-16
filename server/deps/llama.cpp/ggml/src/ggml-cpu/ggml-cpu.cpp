@@ -428,6 +428,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // GQH CAN dequantize on the CPU (ggml/src/gqh.cpp), but MUL_MAT dispatches on
+    // type_traits_cpu.vec_dot, which these types do not have -- the entry is
+    // zero-initialised, so a node reaching the CPU backend would call through a null
+    // pointer. Refuse until a vec_dot exists; the CUDA/HIP backend claims these.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && (op->src[i]->type == GGML_TYPE_GQH3 ||
+                           op->src[i]->type == GGML_TYPE_GQH2_H ||
+                           op->src[i]->type == GGML_TYPE_GQH2_C)) {
+            return false;
+        }
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

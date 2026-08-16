@@ -506,7 +506,29 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
+// ggml_is_quantized() is true for these, but mul_mat_vec_q has no case for them and
+// falls into its default GGML_ABORT. The ROCmFPX mix qtypes read a per-expert codebook
+// from an out-of-band registry a block-local quant kernel cannot reach; GQH has no
+// vec_dot yet. EVERY path that can reach mul_mat_vec_q must consult this -- the batch
+// caps below, the unfused dispatch, AND the fusion gate in ggml-cuda.cu. The per-arch
+// switches list the mix types individually, which is how a path gets missed.
+bool ggml_cuda_qtype_has_no_mmvq(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+        case GGML_TYPE_GQH3:
+        case GGML_TYPE_GQH2_H:
+        case GGML_TYPE_GQH2_C:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    if (ggml_cuda_qtype_has_no_mmvq(type)) {
+        return 0;
+    }
     // [TAG_MMID_GROUPED] the grouped kernel handles any supported type up to the
     // MoE batch ceiling; this also keeps CUDA graphs on for these batches.
     // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.

@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/rocmfp3_mix.cuh"
+#include "ggml-cuda/gqh.cuh"
 #include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2579,7 +2580,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     const int64_t ncols_dst = is_mul_mat_id ? dst->ne[2] : src1->ne[1];
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    // Fusion cannot be a way in to a kernel the unfused path already refuses. For
+    // mul_mat_id the batch-cap check below catches these types indirectly, but a plain
+    // fused MUL_MAT matvec (gate/up SwiGLU) had no such check and would reach
+    // mul_mat_vec_q's default GGML_ABORT.
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !ggml_cuda_qtype_has_no_mmvq(src0->type) &&
+                             !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
 
@@ -2821,7 +2827,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
+    const bool no_mmvq         = ggml_cuda_qtype_has_no_mmvq(src0->type);
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !no_mmvq && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
@@ -2879,6 +2886,28 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const char * e = getenv("DFLASH_MIX_FUSED");
         return e ? atoi(e) != 0 : true;
     }();
+
+    // GQH fused decode matvec, same shape of hook and same reason: the generic chain
+    // would dequantize the whole weight matrix to f16 per token. Returns false for an
+    // unregistered tensor, keeping the fallback. GGML_GQH_FUSED=0 forces the fallback.
+    static const bool gqh_fused_on = []() {
+        const char * e = getenv("GGML_GQH_FUSED");
+        return e ? atoi(e) != 0 : true;
+    }();
+    if (gqh_fused_on && !split
+            && (src0->type == GGML_TYPE_GQH3 || src0->type == GGML_TYPE_GQH2_H
+                || src0->type == GGML_TYPE_GQH2_C)
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[2] == 1 && src1->ne[3] == 1
+            && src1->ne[1] <= luce_mmvq_max_ncols
+            && ggml_cuda_gqh_mul_mat_vec(
+                   src0->type, src0->data, (const float *) src1->data, (float *) dst->data,
+                   (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
+                   (int64_t) (src1->nb[1] / sizeof(float)),
+                   (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
+        return;
+    }
     if (mix_fused_on && is_rocmfp3_mix && !split
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
             && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)

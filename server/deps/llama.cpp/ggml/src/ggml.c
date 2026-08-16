@@ -9,6 +9,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "gqh.h"
 #include "../rocmfp4/rocmfp4.h"
 #include "../rocmfpx/rocmfpx.h"
 
@@ -635,6 +636,15 @@ static void rocmfpx_mix_to_float_unsupported(const void * GGML_RESTRICT x, float
 // Symmetric hole: producing one of these types needs a FITTED per-expert codebook plus the
 // sidecar/KV that carries it. from_float_ref could previously mint a qtype-105/106 tensor
 // with no codebook at all -- a tensor nothing can decode correctly.
+// Minting a GQH tensor needs the geo-quant encoder's per-tensor grid search and the
+// header KV it emits, so a from_float_ref would produce a tensor nothing can decode.
+// Decoding is fine (see gqh.cpp); only the quantize direction is missing.
+static void gqh_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("gqh: quantization requires the geo-quant encoder (per-tensor grid search "
+               "plus the header KV it emits).");
+}
+
 static void rocmfpx_mix_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
     GGML_ABORT("rocmfpx_mix: quantization requires a fitted per-expert codebook and its "
@@ -1031,6 +1041,39 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 0,
         .type_size                = 0,
         .is_quantized             = false,
+    },
+    [GGML_TYPE_GQH3] = {
+        // GQH 3-bit rung (3.28125 bpw). 105-byte superblock for 256 weights: 1 byte
+        // E4M3 scale, 8 bytes of 16 uint4 sub-block ratios, then the codes split into a
+        // 64-byte low-2-bit plane and a 32-byte high-1-bit plane. to_float resolves the
+        // per-tensor header from the gqh.cpp registry.
+        .type_name                = "gqh3",
+        .blck_size                = GQH_SUPERBLOCK,
+        .type_size                = GQH3_SB_BYTES,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_gqh3,
+        .from_float_ref           = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
+    [GGML_TYPE_GQH2_H] = {
+        // GQH 2-bit rung (2.28125 bpw). Same head as gqh3, then 64 bytes of uint2 codes
+        // into a 4-level grid {-1, -a, +a, +1} picked per tensor.
+        .type_name                = "gqh2_h",
+        .blck_size                = GQH_SUPERBLOCK,
+        .type_size                = GQH2H_SB_BYTES,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_gqh2_h,
+        .from_float_ref           = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
+    [GGML_TYPE_GQH2_C] = {
+        // GQH codebook rung (2.0625 bpw). 66-byte superblock: fp16 scale then 8 blocks of
+        // 32, each a uint32 of four 7-bit sign indices plus a uint4 ratio and four
+        // codebook indices. No registry: everything it needs is in-block or frozen.
+        .type_name                = "gqh2_c",
+        .blck_size                = GQH_SUPERBLOCK,
+        .type_size                = GQH2C_SB_BYTES,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_gqh2_c,
+        .from_float_ref           = (ggml_from_float_t) gqh_from_float_unsupported,
     },
 };
 

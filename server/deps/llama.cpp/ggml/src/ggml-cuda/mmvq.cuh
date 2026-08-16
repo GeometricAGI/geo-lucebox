@@ -9,6 +9,10 @@
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
+// True for quantized types that have NO mul_mat_vec_q case. Every path that can reach
+// mul_mat_vec_q must check it; see the definition in mmvq.cu.
+bool ggml_cuda_qtype_has_no_mmvq(enum ggml_type type);
+
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 bool ggml_cuda_mmvq_mmid_grouped_enabled(
