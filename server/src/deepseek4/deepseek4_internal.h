@@ -32,6 +32,10 @@ namespace dflash::common {
 // the raw-cache rounding boundary between them.
 inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
 inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 4096;
+// Normal verification stays within one ratio-4 compressor window. Q5 is an
+// explicit opt-in whose fused graph models a second boundary.
+inline constexpr int DS4_CONSERVATIVE_VERIFY_MAX_TOKENS = 4;
+inline constexpr int DS4_Q5_VERIFY_TOKENS = 5;
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
@@ -437,6 +441,14 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     MoeHybridStorage &          out,
     std::string *               err = nullptr,
     ggml_backend_t              cold_gpu_backend = nullptr);
+
+// Attach each compact GPU owner tensor to the learned decode-table rows for
+// the global experts stored in that tensor.
+bool register_deepseek4_moe_hybrid_mix_tables(
+    const std::string &         path,
+    const DeepSeek4Weights &    w,
+    MoeHybridStorage &          storage,
+    std::string *               err = nullptr);
 
 // Snapshot
 struct DeepSeek4Snapshot {

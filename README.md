@@ -101,6 +101,23 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 
 `server/` (DFlash) builds with CMake 3.18+ and vendors the required `ggml` sources directly; only `Block-Sparse-Attention` remains a git submodule. No PyTorch is needed for `server/`. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
+## Recommended Setups
+
+Use the flags below as the recommended starting configuration for each supported
+model and tested hardware setup. Replace placeholder device indices and paths for your system.
+
+Entries are `dflash_server` settings unless the cell shows another command.
+
+| Model | RTX 3090 (24 GB) | Strix Halo `gfx1151` | Strix Halo + R9700 `gfx1201` |
+|---|---|---|---|
+| **Qwen 3.5/3.6 27B Q4_K_M** | `DFLASH27B_KV_TQ3=1`<br>`--target-device cuda:0`<br>`--draft-device cuda:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency auto`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` | `--target-device hip:0`<br>`--draft-device hip:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency persistent`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--draft-device hip:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency persistent`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` |
+| **Qwen 3.6 35B-A3B Q4_K_M** | `--target-device cuda:0`<br>`--spark`<br>`--kvflash auto` | `--target-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--kvflash auto` |
+| **Laguna XS 2.1 33B Q4_K_M** | `--target-device cuda:0`<br>`--draft <path>`<br>`--prefill-drafter <path>`<br>`--max-ctx 262144`<br>`--kvflash 8192`<br>`--chunk 1024` | `--target-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--kvflash auto` |
+| **Gemma 4 26B-A4B / 31B** | `--target-device cuda:0`<br>`--draft-device cuda:0`<br>`--kvflash auto` | `--target-device hip:0`<br>`--draft-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--draft-device hip:0`<br>`--kvflash auto` |
+| **DeepSeek V4 Flash 0731 adaptive ROCmFPX** | — | `DFLASH_DS4_SPEC=1`<br>`DFLASH_DS4_SPEC_Q=4`<br>`DFLASH_DS4_FUSED_VERIFY=1`<br>`DFLASH_DS4_DRAFT=<path>`<br>`DFLASH_DS4_DRAFT_GPU=0`<br>`--target-device hip:0`<br>`--ds4-fused-decode`<br>`--ds4-expert-top-k 6`<br>`--ds4-prefill exact` | — |
+| **DeepSeek V4 Flash ROCmFPX (dual-GPU burn-in)** | — | — | Single HIP binary CMake: `-DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201'`<br>`-DGGML_HIP_GRAPHS=ON`<br>`HIP_VISIBLE_DEVICES=<r9700-index>,<strix-index>`<br>`DFLASH_DS4_MOE_TP=1`<br>`DFLASH_DS4_MOE_TP_INPROC=1`<br>`DFLASH_DS4_MOE_TP_GPU=1`<br>`DFLASH_EXPERT_BUDGET_MB=11700`<br>`DFLASH_DS4_SPEC=1`<br>`DFLASH_DS4_SPEC_Q=4`<br>`DFLASH_DS4_FUSED_VERIFY=1`<br>`DFLASH_DS4_DRAFT=<path>`<br>`DFLASH_DS4_DRAFT_GPU=0`<br>`LUCE_MMVQ_MAX_NCOLS=4`<br>`--target-device hip:0`<br>`--peer-access`<br>`--ds4-expert-top-k 4` (approximate)<br>`--ds4-prefill sparse` (approximate) |
+| **Qwen 3.5 0.8B Megakernel** | `uv run --directory optimizations/megakernel python final_bench.py --backend bf16` | — | — |
+
 ## Quick Start On Harnesses
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
@@ -326,17 +343,17 @@ End-to-end repro: `DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--prefill-compression {off,auto,always}` | `off` | When to score+compress the prompt |
-| `--prefill-threshold N` | `32000` | In `auto`, the prompt-token count above which a single-shot prompt is compressed. Also the per-message minimum that an aged message must exceed before FlowKV compresses it on multi-turn requests. Lower it (e.g. `1024`) if you want FlowKV to act on shorter history. |
+| `--prefill-threshold N` | `32000` | In `auto`, the token count above which a single prompt is compressed. On multi-turn requests, this applies to the total aged history, not each message separately. Individual aged messages below 512 tokens stay verbatim to avoid compression overhead. |
 | `--prefill-keep-ratio F` | `0.05` | Fraction of source tokens kept (0.02 @128K, 0.10 @32K) |
 | `--prefill-curve T:R [T:R ...]` | off (flat keep-ratio) | Piecewise keep-ratio curve, linear-interpolated over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression @10K, 5× @40K, 10× @100K+). Overrides `--prefill-keep-ratio`; per-session bandit override still wins. |
 | `--prefill-drafter <gguf>` | required if on | Drafter weights (Qwen3-0.6B BF16 GGUF) |
-| `--prefill-skip-park` | off | Keep drafter resident across requests (more VRAM, faster) |
+| `--prefill-skip-park` | off | Do not park the target and decode draft while PFlash runs. Faster when all three models fit together; leave off on 24 GB GPUs. |
 | `PFLASH_FREEZE_HOT_WINDOW=N` | `2` | FlowKV: how many of the most recent messages stay verbatim. Everything older than this window (but after the system prompt) is compressed once and cached. Larger = more recent context kept uncompressed. |
 | `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (sm_80+); required for headline 10.4× |
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
 | `DFLASH_FP_PROFILE=1` | `0` | Per-stage timing log |
 
-When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the disk prefix cache from `--prefix-cache-slots` keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
+When compression is on, multi-turn continuations automatically use **FlowKV**: aged messages are compressed in one PFlash residency window, while the system prompt and recent turns stay verbatim. Other oversized prompts use whole-prompt PFlash. `--prefill-curve` selects the keep ratio from the total context length, so compression can become more aggressive as a conversation grows. With `--prefill-compression off` the request path is identical to a build without compression.
 
 **KV cache**
 
