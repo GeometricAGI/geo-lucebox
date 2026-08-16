@@ -17,6 +17,7 @@
 #include "internal.h"
 #include "dflash27b.h"
 #include "common/gguf_bounds.h"
+#include "../common/gqh_headers.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_types.h"
 #include "ggml-cuda.h"
@@ -459,207 +460,6 @@ static FILE * ds4_open_sidecar(const std::string & gguf_path,
     }
     const std::string p = gguf_path + suffix;
     return std::fopen(p.c_str(), "rb");
-}
-
-// ---- GQH (108/109) per-tensor headers, embedded in the GGUF ----
-// gqh3/gqh2_h scale every weight by a 5-byte per-tensor header (float32
-// tensor_scale + uint8 grid code) that a fixed-size ggml block cannot hold, so it
-// rides in the "geoquant.gqh.headers" KV. Wire (schema v1, FROZEN, mirrored in the
-// geo-quant exporter):
-//   header : magic "GQHh1\0\0\0" (8) | entry_count u32 | reserved u32 (=0)
-//   entry  : name_len u32 | name utf-8 | qtype u32 (108|109)
-//            | tensor_scale f32 LE | grid_code u8 | pad[3] (=0)
-// gqh2_c (110) needs no entry: its scale is fp16 in-block.
-//
-// Unlike the mix sidecars there is no loose-file fallback -- the payload is five
-// bytes per tensor, so it is always embedded.
-
-static const char GQH_KV_KEY[] = "geoquant.gqh.headers";
-static const uint8_t GQH_MAGIC[8] = { 'G', 'Q', 'H', 'h', '1', 0, 0, 0 };
-static const uint32_t GQH_GRID_CODES_MAX = 12;   // GAMMA_GRID / A_GRID length
-static const int64_t  GQH_ROW_ALIGN      = 256;  // superblock, spec C4
-
-struct ds4_gqh_entry {
-    int32_t qtype        = 0;
-    float   tensor_scale = 0.0f;
-    uint8_t grid_code    = 0;
-    bool    matched      = false;
-};
-
-static bool ds4_gqh_qtype_has_header(int32_t q) {
-    return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H;
-}
-
-static bool ds4_register_gqh_headers(const std::string & gguf_path,
-                                     DeepSeek4Weights & out) {
-    // Collect the resident header-bearing GQH tensors. Walk the context rather than
-    // the named members: GQH is not tied to a surface the way the mix qtypes are.
-    std::vector<ggml_tensor *> gqh_tensors;
-    if (out.ctx) {
-        for (ggml_tensor * t = ggml_get_first_tensor(out.ctx); t != nullptr;
-             t = ggml_get_next_tensor(out.ctx, t)) {
-            if (ds4_gqh_qtype_has_header((int32_t) t->type)) {
-                gqh_tensors.push_back(t);
-            }
-        }
-    }
-    if (gqh_tensors.empty()) {
-        return true;
-    }
-
-    std::vector<uint8_t> blob;
-    {
-        struct gguf_init_params gip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
-        struct gguf_context * g = gguf_init_from_file(gguf_path.c_str(), gip);
-        if (!g) {
-            std::fprintf(stderr, "[deepseek4] gqh: cannot reopen %s to read '%s'\n",
-                         gguf_path.c_str(), GQH_KV_KEY);
-            return false;
-        }
-        const int64_t id = gguf_find_key(g, GQH_KV_KEY);
-        if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY ||
-            gguf_get_arr_type(g, id) != GGUF_TYPE_UINT8) {
-            gguf_free(g);
-            std::fprintf(stderr, "[deepseek4] gqh: %zu qtype-108/109 tensor(s) resident but "
-                         "'%s' is missing or not a u8 array -- their per-tensor scale and "
-                         "grid code are out-of-band and they cannot be decoded\n",
-                         gqh_tensors.size(), GQH_KV_KEY);
-            return false;
-        }
-        const size_t n = gguf_get_arr_n(g, id);
-        const uint8_t * d = (const uint8_t *) gguf_get_arr_data(g, id);
-        blob.assign(d, d + n);
-        gguf_free(g);
-    }
-
-    // Parse. Every field is bounds-checked before use; a corrupt KV must fail the
-    // load, not produce a tensor that aborts at decode time.
-    std::map<std::string, ds4_gqh_entry> entries;
-    {
-        const size_t n = blob.size();
-        auto fail = [&](const std::string & msg) {
-            std::fprintf(stderr, "[deepseek4] gqh: invalid '%s': %s\n", GQH_KV_KEY, msg.c_str());
-            return false;
-        };
-        if (n < 16) {
-            return fail("blob truncated (" + std::to_string(n) + " B < 16 B header)");
-        }
-        if (std::memcmp(blob.data(), GQH_MAGIC, 8) != 0) {
-            return fail("bad magic (expected GQHh1)");
-        }
-        uint32_t count = 0, reserved = 0;
-        std::memcpy(&count,    blob.data() +  8, 4);
-        std::memcpy(&reserved, blob.data() + 12, 4);
-        if (reserved != 0) {
-            return fail("reserved field " + std::to_string(reserved) + " != 0 (format drift?)");
-        }
-        size_t off = 16;
-        for (uint32_t i = 0; i < count; ++i) {
-            const std::string at = "entry " + std::to_string(i);
-            if (off + 4 > n) return fail(at + ": truncated before name_len");
-            uint32_t name_len = 0;
-            std::memcpy(&name_len, blob.data() + off, 4);
-            off += 4;
-            if (name_len == 0 || name_len > 1024 || off + name_len > n) {
-                return fail(at + ": bad name_len " + std::to_string(name_len));
-            }
-            std::string name((const char *) blob.data() + off, name_len);
-            off += name_len;
-            if (entries.count(name)) return fail("duplicate entry for '" + name + "'");
-            if (off + 12 > n) return fail("'" + name + "': truncated metadata");
-            uint32_t qtype = 0;
-            float    scale = 0.0f;
-            std::memcpy(&qtype, blob.data() + off + 0, 4);
-            std::memcpy(&scale, blob.data() + off + 4, 4);
-            const uint8_t grid_code = blob[off + 8];
-            if (blob[off + 9] || blob[off + 10] || blob[off + 11]) {
-                return fail("'" + name + "': padding is not zero (format drift?)");
-            }
-            off += 12;
-            if (!ds4_gqh_qtype_has_header((int32_t) qtype)) {
-                return fail("'" + name + "': qtype " + std::to_string(qtype) + " is not 108/109");
-            }
-            if (grid_code >= GQH_GRID_CODES_MAX) {
-                return fail("'" + name + "': grid code " + std::to_string(grid_code) +
-                            " >= " + std::to_string(GQH_GRID_CODES_MAX));
-            }
-            // The encoder sets tensor_scale to max|w|, falling back to 1.0 for an
-            // all-zero tensor, so a non-finite or non-positive scale means the KV is
-            // wrong rather than the tensor being unusual.
-            if (!std::isfinite(scale) || scale <= 0.0f) {
-                return fail("'" + name + "': tensor_scale is not finite and positive");
-            }
-            ds4_gqh_entry e;
-            e.qtype        = (int32_t) qtype;
-            e.tensor_scale = scale;
-            e.grid_code    = grid_code;
-            entries.emplace(std::move(name), e);
-        }
-        if (off != n) {
-            return fail(std::to_string(n - off) + " trailing bytes after " +
-                        std::to_string(count) + " entries");
-        }
-    }
-
-    // Validate the whole cover BEFORE registering anything, so a bad KV leaves no
-    // partial state behind.
-    for (const ggml_tensor * t : gqh_tensors) {
-        const std::string name = t->name;
-        auto it = entries.find(name);
-        if (it == entries.end()) {
-            std::fprintf(stderr, "[deepseek4] gqh: resident tensor '%s' (%s) has no '%s' "
-                         "entry -- refusing to load a tensor that would abort at decode\n",
-                         name.c_str(), ggml_type_name(t->type), GQH_KV_KEY);
-            return false;
-        }
-        if (it->second.qtype != (int32_t) t->type) {
-            std::fprintf(stderr, "[deepseek4] gqh: entry for '%s' says qtype %d but the "
-                         "tensor is %d\n", name.c_str(), it->second.qtype, (int32_t) t->type);
-            return false;
-        }
-        if (t->ne[2] != 1 || t->ne[3] != 1) {
-            // tensor_scale is fitted per 2-D matrix and this KV is keyed by tensor
-            // name, so a fused 3-D expert stack has no way to carry one scale per
-            // expert. Refuse rather than apply expert 0's scale to all of them.
-            std::fprintf(stderr, "[deepseek4] gqh: '%s' is not 2-D -- the header KV carries "
-                         "one scale per tensor, so fused expert stacks are unsupported\n",
-                         name.c_str());
-            return false;
-        }
-        if (t->ne[0] % GQH_ROW_ALIGN != 0) {
-            std::fprintf(stderr, "[deepseek4] gqh: '%s' row length %" PRId64 " is not a "
-                         "multiple of %" PRId64 " -- the exporter must leave short rows on "
-                         "a stock qtype\n", name.c_str(), (int64_t) t->ne[0], GQH_ROW_ALIGN);
-            return false;
-        }
-        if (!ggml_is_contiguous(t)) {
-            std::fprintf(stderr, "[deepseek4] gqh: '%s' is not contiguous\n", name.c_str());
-            return false;
-        }
-        it->second.matched = true;
-    }
-
-    // Entries with no resident tensor are EXPECTED, not an error: MTP-block weights
-    // are skipped outside an MTP context, so a correct artifact carries entries this
-    // load will never match. Refusing them is the trap that cost a build on the mix
-    // line. A MIS-NAMED entry still fails, via the loop above.
-    size_t unmatched = 0;
-    for (const auto & kv : entries) {
-        if (!kv.second.matched) ++unmatched;
-    }
-    if (unmatched) {
-        std::fprintf(stderr, "[deepseek4] gqh: %zu header entr%s name no resident tensor "
-                     "(expected for MTP-block weights outside an MTP context)\n",
-                     unmatched, unmatched == 1 ? "y" : "ies");
-    }
-
-    for (const ggml_tensor * t : gqh_tensors) {
-        const ds4_gqh_entry & e = entries.at(t->name);
-        ggml_gqh_register(t->data, ggml_nbytes(t), e.tensor_scale, (int) e.grid_code);
-    }
-    std::fprintf(stderr, "[deepseek4] gqh: registered %zu tensor(s) from '%s'\n",
-                 gqh_tensors.size(), GQH_KV_KEY);
-    return true;
 }
 
 static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
@@ -1849,7 +1649,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     // GQH headers, same timing as the mix sidecars: after the weights are uploaded,
     // because the registry is keyed by the tensor's device pointer.
-    if (!ds4_register_gqh_headers(path, out)) {
+    if (!dflash::common::register_gqh_headers(path, out.ctx)) {
         std::fprintf(stderr, "[deepseek4] gqh header registration failed for %s\n",
                      path.c_str());
         free_deepseek4_weights(out);
@@ -2108,14 +1908,7 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     // range, so a stale entry would shadow a later load that reuses the address.
     // Walked over the context because GQH is not tied to named members the way the
     // mix qtypes are. Unregistering an absent base is a no-op.
-    if (w.ctx) {
-        for (ggml_tensor * t = ggml_get_first_tensor(w.ctx); t != nullptr;
-             t = ggml_get_next_tensor(w.ctx, t)) {
-            if ((t->type == GGML_TYPE_GQH3 || t->type == GGML_TYPE_GQH2_H) && t->data) {
-                ggml_gqh_unregister(t->data);
-            }
-        }
-    }
+    dflash::common::unregister_gqh_headers(w.ctx);
     // Drop qtype-105 registry entries (and free their device side-data) while the
     // tensors are still valid — BEFORE ggml_free destroys them and the GPU buffer
     // is released. Otherwise the entries leak device memory across park/unpark and
