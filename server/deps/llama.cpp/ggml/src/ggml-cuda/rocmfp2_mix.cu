@@ -569,6 +569,52 @@ __device__ __forceinline__ void mix_block_accum2(
     mix_block_accum_x(b1, xv, mode, lut, acc1);
 }
 
+// One block of the MoE fold: stage the block's 32 activations ONCE, then fold them
+// against this warp's two `up` rows and (fused only) its two `gate` rows.
+//
+// Measured motivation (H200 sm_90, ncu on the real decode geometry
+// in=7168/out=2048/top-k 4): the FUSED kernel sat at 89.7% L1/TEX throughput with
+// DRAM at 3.9% and issue slots at 21% -- bound on L1 tag-lookup wavefronts, not on
+// bandwidth, arithmetic or occupancy. 31.7 M global-load sectors against 1.16 M
+// requests is 27.2 sectors/request, i.e. essentially the 32-sector worst case,
+// because consecutive lanes own blocks 32 floats apart: each float4 activation
+// request touches 32 distinct sectors and uses only 16 of each 32 B.
+//
+// The caller used to invoke mix_block_accum() once per fold, each of which staged the
+// SAME 32 activations from the SAME address. The comment there asserted nvcc would CSE
+// those loads to one issue per element; the SASS says otherwise (288 static LDG.E.128
+// for a loop that needs 36), so the fused path paid the 32-sector activation request
+// four times per block. Staging once cuts activation requests 4x on the fused path and
+// 2x on the unfused one. This is the same register-blocking mix_block_accum2() already
+// does for the dense 2-D path, extended to the fused gate/up pair.
+//
+// Bit-exact: identical to the four mix_block_accum() calls it replaces. The same 32
+// activation values arrive from the same addresses, and each row is folded by the same
+// mix_block_accum_x into its own accumulator over the same fixed ascending-j order, so
+// every acc keeps its exact left-fold summation order. Only the load *route* changes,
+// not which terms enter which accumulator in what order -- required, because the
+// correctness gate hashes the greedy token stream and any reassociation could flip it.
+template <bool FUSE_GLU>
+__device__ __forceinline__ void mix_moe_block_fold(
+        // row1/growbase1 deliberately NOT __restrict__: an odd-`out` tail warp aliases
+        // them onto row0/growbase0 (see the `two` ternary in the caller), so asserting
+        // no-alias here would be a lie for that shape. All four are read-only const, so
+        // the aliasing costs nothing to permit.
+        const uint8_t * __restrict__ rowbase0, const uint8_t * rowbase1,
+        const uint8_t * __restrict__ growbase0, const uint8_t * growbase1,
+        const float * __restrict__ xcol, int b,
+        int mode, int gmode, const float * __restrict__ lut,
+        float & acc0, float & acc1, float & gacc0, float & gacc1) {
+    float xv[MIX_QK];
+    mix_load_x32(xcol + b * MIX_QK, xv);
+    mix_block_accum_x(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xv, mode, lut, acc0);
+    mix_block_accum_x(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xv, mode, lut, acc1);
+    if (FUSE_GLU) {
+        mix_block_accum_x(growbase0 + (int64_t) b * MIX_BLOCK_BYTES, xv, gmode, lut + 2 * MIX_K, gacc0);
+        mix_block_accum_x(growbase1 + (int64_t) b * MIX_BLOCK_BYTES, xv, gmode, lut + 2 * MIX_K, gacc1);
+    }
+}
+
 // The lane's block loop is unrolled by MIX_UNROLL into a SINGLE accumulator kept
 // in the exact original block order (acc += dot(blk), stride MIX_WARP), so the
 // f32 output is bit-for-bit identical to the un-unrolled path — required because
@@ -854,39 +900,36 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // src1 is [in, ne11, ntok]; the get_rows-equivalent row for (slot, token)
     // is token*ne11 + slot%ne11 — i.e. token column + the slot%ne11 broadcast.
     const float * xcol = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
-    // Two output rows in one warp. Each row is folded by the SAME mix_block_accum
+    // Two output rows in one warp. Each row is folded by the SAME mix_block_accum_x
     // that the single-row path uses (byte-identical inlined body, same fixed j
     // order, same acc-add chain) so acc0/acc1 are bit-for-bit identical to the
-    // single-row kernel's output for those rows. The two calls per block share the
-    // same __restrict__ xcol + col0, so the compiler CSEs the strided activation
-    // loads to one issue per element — halving activation LSU issue on this partly
-    // load-instruction-bound matvec — WITHOUT reordering either row's summation.
+    // single-row kernel's output for those rows. The folds share ONE explicit
+    // activation stage per block (mix_moe_block_fold) instead of relying on the
+    // compiler to CSE a separate stage per fold: it does not (the SASS showed 288
+    // static LDG.E.128 for a loop that needs 36), and on this L1-wavefront-bound
+    // kernel that stage is the most expensive request in the loop. Sharing it does
+    // NOT reorder either row's summation.
     float acc0 = 0.0f, acc1 = 0.0f;
     // Gate accumulates in its own registers over the SAME block order, so gacc is bit-identical
-    // to what the separate gate launch produced. All four folds share one `xcol`, so the fused
-    // form reads the activation column once for four rows instead of once for two -- on a launch
-    // that is partly load-issue bound, that is the second saving after the launch itself.
+    // to what the separate gate launch produced. All four folds consume ONE staged copy of the
+    // block's activations, so the fused form reads the activation column once for four rows
+    // instead of once per row -- on a launch measured at 89.7% L1/TEX throughput with DRAM at
+    // 3.9%, that is the second saving after the launch itself, and the larger of the two.
     float gacc0 = 0.0f, gacc1 = 0.0f;
     int blk = lane;
     for (; blk + (MIX_UNROLL - 1) * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
         #pragma unroll
         for (int u = 0; u < MIX_UNROLL; ++u) {
             const int b = blk + u * MIX_WARP;
-            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc0);
-            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc1);
-            if (FUSE_GLU) {
-                mix_block_accum(growbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
-                mix_block_accum(growbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
-            }
+            mix_moe_block_fold<FUSE_GLU>(rowbase0, rowbase1, growbase0, growbase1,
+                                         xcol, b, mode, gmode, s_lut,
+                                         acc0, acc1, gacc0, gacc1);
         }
     }
     for (; blk < nb; blk += MIX_WARP) {
-        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
-        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
-        if (FUSE_GLU) {
-            mix_block_accum(growbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
-            mix_block_accum(growbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
-        }
+        mix_moe_block_fold<FUSE_GLU>(rowbase0, rowbase1, growbase0, growbase1,
+                                     xcol, blk, mode, gmode, s_lut,
+                                     acc0, acc1, gacc0, gacc1);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
