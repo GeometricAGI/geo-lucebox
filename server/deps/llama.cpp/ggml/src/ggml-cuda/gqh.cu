@@ -290,26 +290,51 @@ static __global__ void gqh_matvec_kernel(
     const int sub = j0 >> 4;               // two lanes share a 16-weight sub-block
 
     float acc[GQH_MAX_COLS] = { 0.0f };
-    for (int sb = 0; sb < nsb; ++sb) {
-        const uint8_t * __restrict__ b = PLANAR ? rowbase : rowbase + (int64_t) sb * sb_bytes;
 
+    // Strength-reduced plane cursors. Recomputing each plane's address from sb costs
+    // real instructions: rocprofv3 SQ_INSTS_VALU on gfx1151 measured planar at +2.22%
+    // (gqh3) / +1.08% (gqh2_h) VALU over tight, and for gqh2_h that was the whole
+    // regression (+0.79% kernel time). The four planes advance by fixed strides, so
+    // carry cursors and add a constant instead. Addresses only -- the arithmetic below
+    // is untouched, so results stay bit-identical.
+    const uint8_t * __restrict__ p_d  = rowbase;                                   // +1
+    const uint8_t * __restrict__ p_rb = rowbase + off_r  + (sub >> 1);             // +8
+    const uint8_t * __restrict__ p_lo = rowbase + off_lo + lane * 2;               // +64
+    const uint8_t * __restrict__ p_hi = rowbase + off_hi + lane;                   // +32
+    // The tight path keeps its original `rowbase + sb*sb_bytes`: it is a single
+    // induction variable the compiler already strength-reduces, and carrying a cursor
+    // there measured 1.4% SLOWER on gfx1201 for no instruction saving.
+
+    for (int sb = 0; sb < nsb; ++sb) {
+        // Ternary, not an unconditional add: PLANAR is a template parameter, so this
+        // folds to `rowbase` and the multiply disappears from the planar instantiation.
+        const uint8_t * __restrict__ p_t =
+            PLANAR ? rowbase : rowbase + (int64_t) sb * sb_bytes;
         // same order as the reference: d_real = e4m3(d) * tensor_scale, then
         // s_b = d_real * (ratio/15). The d byte is warp-uniform so its table read
         // broadcasts. Identical arithmetic in both layouts -- only the addresses move,
         // so the result stays bit-identical.
-        const uint8_t d  = PLANAR ? b[sb] : b[0];
+        const uint8_t d  = PLANAR ? *p_d : p_t[0];
         const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
-        const uint8_t rb = PLANAR ? b[off_r + (sb << 3) + (sub >> 1)] : b[1 + (sub >> 1)];
+        const uint8_t rb = PLANAR ? *p_rb : p_t[1 + (sub >> 1)];
         const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
 
         uint16_t lo2;                                  // 8 codes x 2 bits
         if (PLANAR) {
-            // off_lo is 64 B-aligned and (sb<<6) keeps it so, hence a real aligned load.
-            lo2 = *(const uint16_t *) (b + off_lo + (sb << 6) + lane * 2);
+            // p_lo started 64 B-aligned and advances by 64, so this stays a real
+            // aligned load rather than the straddling one the tight stream forces.
+            lo2 = *(const uint16_t *) p_lo;
         } else {
-            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
+            memcpy(&lo2, p_t + 9 + lane * 2, sizeof(lo2));
         }
-        const uint8_t hi1 = IS_GQH3 ? (PLANAR ? b[off_hi + (sb << 5) + lane] : b[73 + lane]) : 0;
+        const uint8_t hi1 = IS_GQH3 ? (PLANAR ? *p_hi : p_t[73 + lane]) : 0;
+
+        if (PLANAR) {
+            p_d  += 1;
+            p_rb += 8;
+            p_lo += 64;
+            if (IS_GQH3) { p_hi += 32; }
+        }
 
         // Decode this lane's 8 weights ONCE, then reuse them for every column.
         float w[GQH_PER_LANE];
