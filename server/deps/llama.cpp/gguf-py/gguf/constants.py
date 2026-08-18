@@ -4033,6 +4033,20 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
+    # Lucebox/geoquant qtypes. Values mirror ggml.h (GGML_TYPE_*); block and type
+    # sizes below are taken from the ggml type-traits table, not re-derived here.
+    TQ3_0            = 42
+    Q4_0_ROCMFP4     = 100
+    Q4_0_ROCMFP4_FAST = 101
+    Q6_0_ROCMFPX     = 102
+    Q8_0_ROCMFPX     = 103
+    Q3_0_ROCMFPX     = 104
+    Q3_1_ROCMFP3_MIX = 105
+    Q2_1_ROCMFP2_MIX = 106
+    Q2_0_ROCMFP2     = 107
+    GQH3             = 108
+    GQH2_H           = 109
+    GQH2_C           = 110
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4204,6 +4218,22 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+    # Lucebox/geoquant. GQH superblock is 256 weights (GQH_SUPERBLOCK); the byte
+    # counts are GQH{3,2H,2C}_SB_BYTES from ggml/src/gqh-tables.h. gqh3/gqh2_h
+    # additionally carry a 5 B per-tensor header in the "geoquant.gqh.headers"
+    # KV, which is out-of-band and therefore NOT part of type_size.
+    GGMLQuantizationType.TQ3_0:            (32, 14),
+    GGMLQuantizationType.Q4_0_ROCMFP4:     (32, 18),
+    GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 17),
+    GGMLQuantizationType.Q6_0_ROCMFPX:     (32, 26),
+    GGMLQuantizationType.Q8_0_ROCMFPX:     (32, 33),
+    GGMLQuantizationType.Q3_0_ROCMFPX:     (32, 14),
+    GGMLQuantizationType.Q3_1_ROCMFP3_MIX: (32, 14),
+    GGMLQuantizationType.Q2_1_ROCMFP2_MIX: (32, 10),
+    GGMLQuantizationType.Q2_0_ROCMFP2:     (32, 10),
+    GGMLQuantizationType.GQH3:             (256, 105),
+    GGMLQuantizationType.GQH2_H:           (256, 73),
+    GGMLQuantizationType.GQH2_C:           (256, 66),
 }
 
 
