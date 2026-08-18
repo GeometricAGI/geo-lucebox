@@ -441,7 +441,8 @@ extern "C" {
         GGML_TYPE_GQH3    = 108, // GQH 3.28125 bpw; 256-weight superblock, 105 B; 5 B per-tensor header in GGUF KV
         GGML_TYPE_GQH2_H  = 109, // GQH 2.28125 bpw; 256-weight superblock,  73 B; 5 B per-tensor header in GGUF KV
         GGML_TYPE_GQH2_C  = 110, // GQH 2.0625  bpw; 256-weight superblock,  66 B; no header (fp16 d in-block)
-        GGML_TYPE_COUNT   = 111,
+        GGML_TYPE_GQH4    = 111, // GQH 4.28125 bpw; 256-weight superblock, 137 B; 5 B per-tensor header in GGUF KV
+        GGML_TYPE_COUNT   = 112,
     };
 
     // precision

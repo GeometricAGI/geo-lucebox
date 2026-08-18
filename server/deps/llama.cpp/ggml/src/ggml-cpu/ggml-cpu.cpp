@@ -435,7 +435,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && (op->src[i]->type == GGML_TYPE_GQH3 ||
                            op->src[i]->type == GGML_TYPE_GQH2_H ||
-                           op->src[i]->type == GGML_TYPE_GQH2_C)) {
+                           op->src[i]->type == GGML_TYPE_GQH2_C ||
+                           op->src[i]->type == GGML_TYPE_GQH4)) {
             return false;
         }
     }

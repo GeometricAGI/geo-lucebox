@@ -14,6 +14,7 @@ static __constant__ uint8_t  GQH2C_SIGN_D[128]    = GQH2C_SIGN_MASK_INIT;
 // The grid is per-tensor and only 4-8 floats, so it travels as a by-value kernel
 // argument instead of a device lookup. That is also what keeps an MMVQ vec-dot
 // reachable later: the header resolves once at graph time, not per block.
+struct gqh_grid16 { float v[16]; };
 struct gqh_grid8 { float v[8]; };
 struct gqh_grid4 { float v[4]; };
 
@@ -24,7 +25,7 @@ static __device__ __forceinline__ float gqh_bits(uint32_t u) {
 static __device__ __forceinline__ void gqh_store(float * p, float v) { *p = v; }
 static __device__ __forceinline__ void gqh_store(half  * p, float v) { *p = __float2half(v); }
 
-// gqh3 and gqh2_h share a head: E4M3 superblock scale times the per-tensor scale,
+// gqh4, gqh3 and gqh2_h share a head: E4M3 superblock scale times the per-tensor scale,
 // then the uint4 sub-block ratio. The operation order matches gqh.py exactly --
 // d_real = e4m3(d) * tensor_scale, then s_b = d_real * (ratio/15). Do not reassociate.
 static __device__ __forceinline__ float gqh_subblock_scale(
@@ -68,6 +69,52 @@ static void gqh3_decode_cuda(const void * wire, float tensor_scale, int grid_cod
 void ggml_cuda_gqh3_decode(const void * wire, float tensor_scale, int grid_code,
                            float * dst, int64_t rows, int64_t nsb, cudaStream_t stream) {
     gqh3_decode_cuda(wire, tensor_scale, grid_code, dst, rows * nsb, stream);
+}
+
+// --- gqh4 -------------------------------------------------------------------
+// 137 B superblock: [0] E4M3 d, [1:9] 16x uint4 ratios, [9:137] uint4 codes packed
+// two per byte -- even weight in the low nibble, odd in the high nibble.
+//
+// The 16-level grid is staged into LDS rather than indexed out of the by-value
+// argument: `code` is divergent, and an array kernel arg indexed divergently either
+// spills to local memory or expands into a 7-deep select tree. 16 consecutive floats
+// occupy 16 distinct LDS banks and each bank sees a single address, so the divergent
+// read broadcasts conflict-free -- the same reasoning as s_ratio in the matvec.
+
+template <typename dst_t>
+static __global__ void gqh4_decode_kernel(
+        const uint8_t * __restrict__ wire, float tensor_scale, gqh_grid16 grid,
+        dst_t * __restrict__ dst) {
+    const int64_t sb = blockIdx.x;
+    const int j = threadIdx.x;                                  // 0..255
+    const uint8_t * __restrict__ b = wire + sb * GQH4_SB_BYTES;
+
+    __shared__ float s_grid[16];
+    if (j < 16) {
+        s_grid[j] = grid.v[j];
+    }
+    __syncthreads();
+
+    const float s_b = gqh_subblock_scale(b, j >> 4, tensor_scale);
+
+    const uint8_t cb = b[9 + (j >> 1)];
+    const int code = (j & 1) ? (cb >> 4) : (cb & 0x0f);
+
+    gqh_store(&dst[sb * GQH_SUPERBLOCK + j], s_grid[code] * s_b);
+}
+
+template <typename dst_t>
+static void gqh4_decode_cuda(const void * wire, float tensor_scale, int grid_code,
+                             dst_t * dst, int64_t nsb_total, cudaStream_t stream) {
+    gqh_grid16 grid;
+    memcpy(grid.v, GQH4_GRID[grid_code], sizeof(grid.v));
+    gqh4_decode_kernel<dst_t><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
+        (const uint8_t *) wire, tensor_scale, grid, dst);
+}
+
+void ggml_cuda_gqh4_decode(const void * wire, float tensor_scale, int grid_code,
+                           float * dst, int64_t rows, int64_t nsb, cudaStream_t stream) {
+    gqh4_decode_cuda(wire, tensor_scale, grid_code, dst, rows * nsb, stream);
 }
 
 // --- gqh2_h -----------------------------------------------------------------
@@ -178,12 +225,14 @@ static __device__ __forceinline__ float gqh_warp_shfl_down(float v, int off) {
 #endif
 }
 
-// Both grids are symmetric about zero, so the level is a SIGN plus one of four
+// gqh3/gqh2_h only. Both grids are symmetric about zero, so the level is a SIGN plus one of four
 // magnitudes. Selecting from registers beats indexing the table: the SASS showed
 // the table version dominated by divergent constant-bank loads (8 distinct grid
 // entries per warp serialise into 8 replays), 78 LDC against 23 FP ops.
 // gqh3:   grid = [-m3,-m2,-m1,-m0, m0,m1,m2,m3]
 // gqh2_h: grid = [-1, -a, +a, +1], so m.x = a and the outer level is 1.
+// gqh4's 16 levels would need a 7-deep select tree, so it takes the LDS grid below
+// instead -- 8 magnitudes do not fit this trick cheaply.
 template <bool IS_GQH3>
 static __device__ __forceinline__ float gqh_level(int code, const float4 & m) {
     if (IS_GQH3) {
@@ -200,12 +249,18 @@ static __device__ __forceinline__ float gqh_level(int code, const float4 & m) {
     return hi ? mag : -mag;
 }
 
-template <bool IS_GQH3>
+// RUNG selects the wire layout and the level decode at compile time. gqh2_c has its
+// own kernel below (different block geometry), so RUNG is one of GQH3/GQH2_H/GQH4.
+// `mag` is read only by gqh3/gqh2_h and `grid` only by gqh4; the unused argument
+// costs argument space and nothing else, which keeps the gqh3 codegen untouched.
+template <ggml_type RUNG>
 static __global__ void gqh_matvec_kernel(
         const uint8_t * __restrict__ data, const float * __restrict__ x,
         float * __restrict__ y, int in, int out, int ncols, float tensor_scale, float4 mag,
-        int64_t x_col_stride, int64_t y_col_stride) {
-    const int sb_bytes = IS_GQH3 ? GQH3_SB_BYTES : GQH2H_SB_BYTES;
+        gqh_grid16 grid, int64_t x_col_stride, int64_t y_col_stride) {
+    constexpr bool IS_GQH3 = RUNG == GGML_TYPE_GQH3;
+    constexpr bool IS_GQH4 = RUNG == GGML_TYPE_GQH4;
+    const int sb_bytes = IS_GQH3 ? GQH3_SB_BYTES : (IS_GQH4 ? GQH4_SB_BYTES : GQH2H_SB_BYTES);
     const int warps_per_block = blockDim.x / GQH_WARP;
     const int row  = blockIdx.x * warps_per_block + (threadIdx.x / GQH_WARP);
     const int lane = threadIdx.x % GQH_WARP;
@@ -216,8 +271,14 @@ static __global__ void gqh_matvec_kernel(
     // Hoisted above the early return -- __syncthreads needs the whole block, and
     // `row >= out` retires whole warps in the tail block.
     __shared__ float s_ratio[16];
+    // gqh4's 16 grid levels ride in LDS for the same reason: `code` is divergent, and
+    // 16 consecutive floats land in 16 distinct banks, one address each -> no conflict.
+    __shared__ float s_grid[IS_GQH4 ? 16 : 1];
     if (threadIdx.x < 16) {
         s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
+        if (IS_GQH4) {
+            s_grid[threadIdx.x] = grid.v[threadIdx.x];
+        }
     }
     __syncthreads();
     if (row >= out) return;
@@ -239,17 +300,31 @@ static __global__ void gqh_matvec_kernel(
         const uint8_t rb = b[1 + (sub >> 1)];
         const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
 
-        uint16_t lo2;
-        memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));   // 8 codes x 2 bits
+        // memcpy, not a cast: 9 + lane*k is odd and superblocks are an odd stride
+        // apart, so these are unaligned. memcpy lets the compiler pick byte loads
+        // instead of emitting an access that faults on AMD.
+        uint32_t codes;
+        if (IS_GQH4) {
+            memcpy(&codes, b + 9 + lane * 4, sizeof(uint32_t));   // 8 codes x 4 bits
+        } else {
+            uint16_t lo2;
+            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));          // 8 codes x 2 bits
+            codes = lo2;
+        }
         const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
 
         // Decode this lane's 8 weights ONCE, then reuse them for every column.
         float w[GQH_PER_LANE];
 #pragma unroll
         for (int t = 0; t < GQH_PER_LANE; ++t) {
-            const int lo = (lo2 >> (2 * t)) & 0x03;
-            const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
-            w[t] = gqh_level<IS_GQH3>(code, mag) * s_b;
+            if (IS_GQH4) {
+                // little-endian: byte t>>1, low nibble for even t -> bit 4*t either way
+                w[t] = s_grid[(codes >> (4 * t)) & 0x0f] * s_b;
+            } else {
+                const int lo = (codes >> (2 * t)) & 0x03;
+                const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
+                w[t] = gqh_level<IS_GQH3>(code, mag) * s_b;
+            }
         }
 
         // Fully unrolled so acc[]/xs[] stay in registers; the per-column term order
@@ -342,7 +417,8 @@ bool ggml_cuda_gqh_mul_mat_vec(
         ggml_type type, const void * vx, const float * x, float * y,
         int in, int out, int ncols, int64_t x_col_stride, int64_t y_col_stride,
         cudaStream_t stream) {
-    if (type != GGML_TYPE_GQH3 && type != GGML_TYPE_GQH2_H && type != GGML_TYPE_GQH2_C) {
+    if (type != GGML_TYPE_GQH3 && type != GGML_TYPE_GQH2_H && type != GGML_TYPE_GQH2_C &&
+        type != GGML_TYPE_GQH4) {
         return false;
     }
     if (in % GQH_SUPERBLOCK != 0 || ncols <= 0 || ncols > GQH_MAX_COLS) {
@@ -372,22 +448,36 @@ bool ggml_cuda_gqh_mul_mat_vec(
     }
 
     // Positive half of the grid: gqh3 keeps all four magnitudes, gqh2_h needs only
-    // the inner level a (its outer level is exactly 1).
+    // the inner level a (its outer level is exactly 1). gqh4 has 8 magnitudes, too
+    // many for the register select, so it ships all 16 signed levels for LDS instead.
     float4 mag{};
+    gqh_grid16 grid{};
     if (type == GGML_TYPE_GQH3) {
         memcpy(&mag.x, &GQH3_GRID[code][4], 4 * sizeof(float));
+    } else if (type == GGML_TYPE_GQH4) {
+        memcpy(grid.v, GQH4_GRID[code], sizeof(grid.v));
     } else {
         memcpy(&mag.x, &GQH2H_GRID[code][2], sizeof(float));
     }
 
     const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 1, 1);
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
-    if (type == GGML_TYPE_GQH3) {
-        gqh_matvec_kernel<true><<<blocks, threads, 0, stream>>>(
-            (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
-    } else {
-        gqh_matvec_kernel<false><<<blocks, threads, 0, stream>>>(
-            (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
+    switch (type) {
+        case GGML_TYPE_GQH3:
+            gqh_matvec_kernel<GGML_TYPE_GQH3><<<blocks, threads, 0, stream>>>(
+                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, grid,
+                x_col_stride, y_col_stride);
+            break;
+        case GGML_TYPE_GQH4:
+            gqh_matvec_kernel<GGML_TYPE_GQH4><<<blocks, threads, 0, stream>>>(
+                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, grid,
+                x_col_stride, y_col_stride);
+            break;
+        default:
+            gqh_matvec_kernel<GGML_TYPE_GQH2_H><<<blocks, threads, 0, stream>>>(
+                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, grid,
+                x_col_stride, y_col_stride);
+            break;
     }
     return true;
 }
@@ -398,7 +488,7 @@ bool ggml_cuda_gqh_mul_mat_vec(
 // number of superblocks (a GQH row is cols/256 superblocks and cols % 256 == 0).
 
 template <typename dst_t>
-static void gqh_convert(bool is_gqh3, const void * vx, dst_t * y, int64_t k, cudaStream_t stream) {
+static void gqh_convert(ggml_type type, const void * vx, dst_t * y, int64_t k, cudaStream_t stream) {
     float scale = 0.0f;
     int   code  = 0;
     if (!ggml_gqh_lookup(vx, &scale, &code)) {
@@ -410,24 +500,31 @@ static void gqh_convert(bool is_gqh3, const void * vx, dst_t * y, int64_t k, cud
                    (long long) k);
     }
     const int64_t nsb = k / GQH_SUPERBLOCK;
-    if (is_gqh3) {
-        gqh3_decode_cuda(vx, scale, code, y, nsb, stream);
-    } else {
-        gqh2h_decode_cuda(vx, scale, code, y, nsb, stream);
+    switch (type) {
+        case GGML_TYPE_GQH3: gqh3_decode_cuda(vx, scale, code, y, nsb, stream); break;
+        case GGML_TYPE_GQH4: gqh4_decode_cuda(vx, scale, code, y, nsb, stream); break;
+        default:             gqh2h_decode_cuda(vx, scale, code, y, nsb, stream); break;
     }
 }
 
 void dequantize_gqh3_to_fp16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
-    gqh_convert(true, vx, y, k, stream);
+    gqh_convert(GGML_TYPE_GQH3, vx, y, k, stream);
 }
 void dequantize_gqh2h_to_fp16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
-    gqh_convert(false, vx, y, k, stream);
+    gqh_convert(GGML_TYPE_GQH2_H, vx, y, k, stream);
 }
 void dequantize_gqh3_to_fp32_cuda(const void * vx, float * y, int64_t k, cudaStream_t stream) {
-    gqh_convert(true, vx, y, k, stream);
+    gqh_convert(GGML_TYPE_GQH3, vx, y, k, stream);
 }
 void dequantize_gqh2h_to_fp32_cuda(const void * vx, float * y, int64_t k, cudaStream_t stream) {
-    gqh_convert(false, vx, y, k, stream);
+    gqh_convert(GGML_TYPE_GQH2_H, vx, y, k, stream);
+}
+
+void dequantize_gqh4_to_fp16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    gqh_convert(GGML_TYPE_GQH4, vx, y, k, stream);
+}
+void dequantize_gqh4_to_fp32_cuda(const void * vx, float * y, int64_t k, cudaStream_t stream) {
+    gqh_convert(GGML_TYPE_GQH4, vx, y, k, stream);
 }
 
 // gqh2_c takes no registry lookup: nothing about its decode is out of band.

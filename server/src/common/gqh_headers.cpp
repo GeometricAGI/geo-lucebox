@@ -15,13 +15,13 @@
 namespace dflash {
 namespace common {
 
-// ---- GQH (108/109) per-tensor headers, embedded in the GGUF ----
-// gqh3/gqh2_h scale every weight by a 5-byte per-tensor header (float32
+// ---- GQH (108/109/111) per-tensor headers, embedded in the GGUF ----
+// gqh4/gqh3/gqh2_h scale every weight by a 5-byte per-tensor header (float32
 // tensor_scale + uint8 grid code) that a fixed-size ggml block cannot hold, so it
 // rides in the "geoquant.gqh.headers" KV. Wire (schema v1, FROZEN, mirrored in the
 // geo-quant exporter):
 //   header : magic "GQHh1\0\0\0" (8) | entry_count u32 | reserved u32 (=0)
-//   entry  : name_len u32 | name utf-8 | qtype u32 (108|109)
+//   entry  : name_len u32 | name utf-8 | qtype u32 (108|109|111)
 //            | tensor_scale f32 LE | grid_code u8 | pad[3] (=0)
 // gqh2_c (110) needs no entry: its scale is fp16 in-block.
 //
@@ -41,7 +41,7 @@ struct gqh_kv_entry {
 };
 
 static bool gqh_qtype_has_header(int32_t q) {
-    return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H;
+    return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H || q == GGML_TYPE_GQH4;
 }
 
 bool register_gqh_headers(const std::string & gguf_path, ggml_context * ctx) {
@@ -73,7 +73,7 @@ bool register_gqh_headers(const std::string & gguf_path, ggml_context * ctx) {
         if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY ||
             gguf_get_arr_type(g, id) != GGUF_TYPE_UINT8) {
             gguf_free(g);
-            std::fprintf(stderr, "[gqh]: %zu qtype-108/109 tensor(s) resident but "
+            std::fprintf(stderr, "[gqh]: %zu qtype-108/109/111 tensor(s) resident but "
                          "'%s' is missing or not a u8 array -- their per-tensor scale and "
                          "grid code are out-of-band and they cannot be decoded\n",
                          gqh_tensors.size(), GQH_KV_KEY);
@@ -130,7 +130,7 @@ bool register_gqh_headers(const std::string & gguf_path, ggml_context * ctx) {
             }
             off += 12;
             if (!gqh_qtype_has_header((int32_t) qtype)) {
-                return fail("'" + name + "': qtype " + std::to_string(qtype) + " is not 108/109");
+                return fail("'" + name + "': qtype " + std::to_string(qtype) + " is not 108/109/111");
             }
             if (grid_code >= GQH_GRID_CODES_MAX) {
                 return fail("'" + name + "': grid code " + std::to_string(grid_code) +
@@ -222,7 +222,7 @@ void unregister_gqh_headers(ggml_context * ctx) {
     }
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
          t = ggml_get_next_tensor(ctx, t)) {
-        if ((t->type == GGML_TYPE_GQH3 || t->type == GGML_TYPE_GQH2_H) && t->data) {
+        if (gqh_qtype_has_header((int32_t) t->type) && t->data) {
             ggml_gqh_unregister(t->data);
         }
     }

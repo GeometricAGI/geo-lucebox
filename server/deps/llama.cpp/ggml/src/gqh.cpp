@@ -68,7 +68,7 @@ static void gqh_header_or_abort(const void * vx, int64_t k, size_t sb_bytes,
     GGML_UNUSED(sb_bytes);
 }
 
-// gqh3 and gqh2_h share a head: d_real = e4m3(d) * tensor_scale, then
+// gqh4, gqh3 and gqh2_h share a head: d_real = e4m3(d) * tensor_scale, then
 // s_b = d_real * (ratio/15) per 16-weight sub-block.
 static inline float gqh_subblock_scale(const uint8_t * b, int sub, float tensor_scale) {
     const uint8_t d = b[0];
@@ -92,6 +92,28 @@ void dequantize_row_gqh3(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y,
                 const int lo = (b[ 9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
                 const int hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
                 y[sb * GQH_SUPERBLOCK + j] = gqh_f32(GQH3_GRID[code][lo | (hi << 2)]) * s_b;
+            }
+        }
+    }
+}
+
+// gqh4: 137 B superblock. Same head as gqh3, then 128 bytes of uint4 codes packed
+// two per byte -- even weight in the low nibble, odd in the high nibble -- into a
+// 16-level grid +-(j/8)^gamma picked per tensor.
+void dequantize_row_gqh4(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    float scale;
+    int   code;
+    gqh_header_or_abort(vx, k, GQH4_SB_BYTES, &scale, &code);
+
+    const uint8_t * b = (const uint8_t *) vx;
+    for (int64_t sb = 0; sb < k / GQH_SUPERBLOCK; ++sb, b += GQH4_SB_BYTES) {
+        for (int sub = 0; sub < GQH_N_SUB; ++sub) {
+            const float s_b = gqh_subblock_scale(b, sub, scale);
+            for (int t = 0; t < GQH_SUBBLOCK; ++t) {
+                const int j  = sub * GQH_SUBBLOCK + t;
+                const uint8_t cb = b[9 + (j >> 1)];
+                const int c = (j & 1) ? (cb >> 4) : (cb & 0x0f);
+                y[sb * GQH_SUPERBLOCK + j] = gqh_f32(GQH4_GRID[code][c]) * s_b;
             }
         }
     }

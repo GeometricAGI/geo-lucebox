@@ -1093,7 +1093,7 @@ if(DFLASH27B_TESTS)
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
     endif()
-    # GQH (108/109/110) decode bit-exactness against the geo-quant reference vectors.
+    # GQH (108/109/110/111) decode bit-exactness against the geo-quant reference vectors.
     # Deliberately PLAIN C++ targets: these use only the public ggml API, and marking a
     # .cpp as LANGUAGE HIP is what leaves the rocmfp test targets below linking without
     # libstdc++ (undefined operator new / __gxx_personality_v0).
@@ -1107,7 +1107,8 @@ if(DFLASH27B_TESTS)
         endforeach()
         foreach(GQH_CASE "gqh3;1;256" "gqh3;4;512" "gqh3;64;1024"
                          "gqh2_h;1;256" "gqh2_h;4;512" "gqh2_h;64;1024"
-                         "gqh2_c;1;256" "gqh2_c;4;512" "gqh2_c;64;1024")
+                         "gqh2_c;1;256" "gqh2_c;4;512" "gqh2_c;64;1024"
+                         "gqh4;1;256" "gqh4;4;512" "gqh4;64;1024")
             list(GET GQH_CASE 0 GQH_RUNG)
             list(GET GQH_CASE 1 GQH_ROWS)
             list(GET GQH_CASE 2 GQH_COLS)
@@ -1122,6 +1123,20 @@ if(DFLASH27B_TESTS)
                      COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                              "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 3)
         endforeach()
+    endif()
+
+    # The GQH header-KV parser (common/gqh_headers.cpp), model-free. This is the only
+    # qtype-specific gate on the loader side, and it was previously reachable only
+    # through a real multi-GB model load. Plain C++ for the same reason as above.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gqh_headers.cpp")
+        add_executable(test_gqh_headers
+            test/test_gqh_headers.cpp
+            src/common/gqh_headers.cpp)
+        target_link_libraries(test_gqh_headers PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        target_include_directories(test_gqh_headers PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include")
+        add_test(NAME test_gqh_headers COMMAND test_gqh_headers)
     endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")

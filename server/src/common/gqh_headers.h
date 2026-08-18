@@ -1,8 +1,8 @@
 #pragma once
 
-// GQH (108/109) per-tensor header registration, shared by every model family.
+// GQH (108/109/111) per-tensor header registration, shared by every model family.
 //
-// gqh3/gqh2_h scale every weight by a 5-byte per-tensor header (float32
+// gqh4/gqh3/gqh2_h scale every weight by a 5-byte per-tensor header (float32
 // tensor_scale + uint8 grid code) that a fixed-size ggml block cannot hold, so it
 // travels in the "geoquant.gqh.headers" GGUF KV. An unregistered GQH tensor aborts
 // at decode, so the KV is read, validated and registered as part of the load.
@@ -19,7 +19,7 @@ struct ggml_context;
 namespace dflash {
 namespace common {
 
-// Register every resident gqh3/gqh2_h tensor in `ctx` from the KV in `gguf_path`.
+// Register every resident gqh4/gqh3/gqh2_h tensor in `ctx` from the KV in `gguf_path`.
 // Returns true when there is nothing to do (no GQH tensors), so callers can invoke
 // it unconditionally. Returns false, having registered nothing, on any violation:
 // a missing/malformed KV, a resident tensor with no entry, a qtype disagreement, a

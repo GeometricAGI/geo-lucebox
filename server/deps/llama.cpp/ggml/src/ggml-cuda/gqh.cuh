@@ -2,14 +2,15 @@
 // GQH (Geo-Quant Hierarchical) decode -- wire bytes -> f32 weights.
 //
 // GQH is a low-bit weight family from geo-quant (branch feat/custom-format-family).
-// Three rungs, all with a 256-weight superblock along the row (input) axis and a
+// Four rungs, all with a 256-weight superblock along the row (input) axis and a
 // 16-weight sub-block:
 //
+//   gqh4   4.28125 bpw  137 B/superblock  16-level curved grid, uint4 codes
 //   gqh3   3.28125 bpw  105 B/superblock  8-level curved grid, split code planes
 //   gqh2_h 2.28125 bpw   73 B/superblock  4-level grid {-1,-a,+a,+1}
 //   gqh2_c 2.0625  bpw   66 B/superblock  (256,8) codebook + parity signs, fp16 d
 //
-// gqh3/gqh2_h carry a 5-byte PER-TENSOR header (float32 tensor_scale, uint8 grid
+// gqh4/gqh3/gqh2_h carry a 5-byte PER-TENSOR header (float32 tensor_scale, uint8 grid
 // code) ahead of the superblock stream. ggml blocks are fixed-size, so the header
 // cannot live in the block data -- it is passed to these entry points explicitly
 // and the wire pointer here always addresses the FIRST SUPERBLOCK, i.e. wire + 5.
@@ -30,7 +31,7 @@
 
 // rows            : number of weight rows
 // nsb             : superblocks per row (= cols / 256)
-// wire            : device pointer to the superblock stream (post-header for gqh3/gqh2_h)
+// wire            : device pointer to the superblock stream (post-header for gqh4/gqh3/gqh2_h)
 // tensor_scale    : float32 from the per-tensor header
 // grid_code       : uint8 from the per-tensor header (gamma_code / a_code), 0..11
 // dst             : device pointer to rows*nsb*256 float32, row-major
@@ -40,6 +41,9 @@ void ggml_cuda_gqh3_decode(const void * wire, float tensor_scale, int grid_code,
 void ggml_cuda_gqh2h_decode(const void * wire, float tensor_scale, int grid_code,
                             float * dst, int64_t rows, int64_t nsb, cudaStream_t stream);
 
+void ggml_cuda_gqh4_decode(const void * wire, float tensor_scale, int grid_code,
+                           float * dst, int64_t rows, int64_t nsb, cudaStream_t stream);
+
 // gqh2_c carries no per-tensor header.
 void ggml_cuda_gqh2c_decode(const void * wire,
                             float * dst, int64_t rows, int64_t nsb, cudaStream_t stream);
@@ -47,7 +51,7 @@ void ggml_cuda_gqh2c_decode(const void * wire,
 // Fused batch-1..MMVQ-width matvec: y[out, ncols] = W[out, in] . x[in, ncols],
 // decoding inline instead of the dequant->cuBLAS round trip. Returns false when
 // the tensor is not registered or the rung has no fused kernel, so the caller
-// keeps its fallback. All three rungs have a fused kernel.
+// keeps its fallback. All four rungs have a fused kernel.
 bool ggml_cuda_gqh_mul_mat_vec(
         ggml_type type, const void * vx, const float * x, float * y,
         int in, int out, int ncols, int64_t x_col_stride, int64_t y_col_stride,
@@ -62,3 +66,5 @@ void dequantize_gqh3_to_fp32_cuda (const void * vx, float * y, int64_t k, cudaSt
 void dequantize_gqh2h_to_fp32_cuda(const void * vx, float * y, int64_t k, cudaStream_t stream);
 void dequantize_gqh2c_to_fp16_cuda(const void * vx, half  * y, int64_t k, cudaStream_t stream);
 void dequantize_gqh2c_to_fp32_cuda(const void * vx, float * y, int64_t k, cudaStream_t stream);
+void dequantize_gqh4_to_fp16_cuda (const void * vx, half  * y, int64_t k, cudaStream_t stream);
+void dequantize_gqh4_to_fp32_cuda (const void * vx, float * y, int64_t k, cudaStream_t stream);

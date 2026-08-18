@@ -3,7 +3,7 @@
 // GQH (Geo-Quant Hierarchical) decode support shared by every backend.
 //
 // Holds the per-tensor header registry and the CPU decoders. The registry lives
-// here, in ggml-base, rather than in a backend: gqh3/gqh2_h scale every weight by
+// here, in ggml-base, rather than in a backend: gqh4/gqh3/gqh2_h scale every weight by
 // a 5-byte per-tensor header (float32 tensor_scale + uint8 grid code) that a
 // fixed-size ggml block cannot hold, and BOTH the CPU to_float hooks and the CUDA
 // converters need it. One registration at load serves both.
@@ -28,11 +28,12 @@ extern "C" {
 // src0 by rows. Returns false if `p` falls in no registered tensor.
 GGML_API bool ggml_gqh_lookup(const void * p, float * tensor_scale, int * grid_code);
 
-// CPU decoders behind the type traits. gqh3/gqh2_h abort on an unregistered
+// CPU decoders behind the type traits. gqh4/gqh3/gqh2_h abort on an unregistered
 // pointer rather than guess a scale; see the to_float comment in ggml.c.
 void dequantize_row_gqh3  (const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_gqh2_h(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_gqh2_c(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_gqh4  (const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 #ifdef __cplusplus
 }

@@ -1,4 +1,4 @@
-// End-to-end harness for the GQH qtypes (108/109) through the ggml backend.
+// End-to-end harness for the GQH qtypes (108/109/110/111) through the ggml backend.
 //
 // The standalone kernel test (test-gqh-decode.cu) proves the arithmetic. This one
 // proves the REGISTRATION: that ggml's type traits size a GQH tensor correctly,
@@ -21,7 +21,7 @@
 //      compared BITWISE against the f32 reference. gqh2_c has no fused kernel yet
 //      and falls back to path 1, so it skips this check.
 //
-// usage: test-gqh-backend <gqh3|gqh2_h|gqh2_c> <rows> <cols> <wire.bin> <decode.f32> [nvec]
+// usage: test-gqh-backend <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> [nvec]
 //   nvec (default 8) must be <= the tree's fused-matvec column cap, or the hook declines
 //   and the fallback answers in fp16, failing every fused comparison. llama.cpp caps at
 //   MMVQ_MAX_BATCH_SIZE (8); lucebox caps at luce_mmvq_max_ncols (default 3).
@@ -83,7 +83,7 @@ static std::vector<uint8_t> read_file(const char * path) {
 
 int main(int argc, char ** argv) {
     if (argc != 6 && argc != 7) {
-        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c> <rows> <cols> <wire.bin> <decode.f32> [nvec]\n", argv[0]);
+        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> [nvec]\n", argv[0]);
         return 1;
     }
     const std::string rung = argv[1];
@@ -96,6 +96,7 @@ int main(int argc, char ** argv) {
     ggml_type wtype;
     if      (rung == "gqh3")   { wtype = GGML_TYPE_GQH3;   }
     else if (rung == "gqh2_h") { wtype = GGML_TYPE_GQH2_H; }
+    else if (rung == "gqh4")   { wtype = GGML_TYPE_GQH4; }
     else if (rung == "gqh2_c") { wtype = GGML_TYPE_GQH2_C; }
     else { fprintf(stderr, "unknown rung %s\n", rung.c_str()); return 1; }
     // gqh2_c carries no per-tensor header: fp16 scale in-block, frozen codebook.

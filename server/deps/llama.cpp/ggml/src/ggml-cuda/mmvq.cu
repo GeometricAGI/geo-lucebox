@@ -519,6 +519,7 @@ bool ggml_cuda_qtype_has_no_mmvq(enum ggml_type type) {
         case GGML_TYPE_GQH3:
         case GGML_TYPE_GQH2_H:
         case GGML_TYPE_GQH2_C:
+        case GGML_TYPE_GQH4:
             return true;
         default:
             return false;

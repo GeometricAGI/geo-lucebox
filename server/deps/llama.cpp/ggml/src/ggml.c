@@ -1075,6 +1075,17 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_gqh2_c,
         .from_float_ref           = (ggml_from_float_t) gqh_from_float_unsupported,
     },
+    [GGML_TYPE_GQH4] = {
+        // GQH 4-bit rung (4.28125 bpw). Same head as gqh3, then 128 bytes of uint4 codes
+        // (two per byte) into a 16-level grid +-(j/8)^gamma picked per tensor. The widest
+        // rung -- built for a 32 GB GPU budget. Same header registry as gqh3/gqh2_h.
+        .type_name                = "gqh4",
+        .blck_size                = GQH_SUPERBLOCK,
+        .type_size                = GQH4_SB_BYTES,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_gqh4,
+        .from_float_ref           = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
