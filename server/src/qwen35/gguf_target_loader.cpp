@@ -46,6 +46,10 @@
 #include "internal.h"
 #include "../common/dmix2_sidecar.h"
 #include "../common/gqh_headers.h"
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+#include "ggml-cuda.h"          // ggml_backend_cuda_gqh_set_planar
+#include "gqh-stride.h"         // gqh_planar_enabled
+#endif
 #include "common/derived_scalars.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_mmap.h"
@@ -849,6 +853,15 @@ bool load_target_gguf_partial(const std::string & path,
         if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
+        // GQH planar (DFLASH_GQH_PLANAR=1): permute into the 4-plane device layout on
+        // the way in. Returns false for every other type and when planar is off, so the
+        // normal upload stays the default path.
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+        if (gqh_planar_enabled() && ggml_backend_cuda_gqh_set_planar(t, mm_addr + off, sz)) {
+            total += sz;
+            continue;
+        }
+#endif
         ggml_backend_tensor_set(t, mm_addr + off, 0, sz);
         total += sz;
     }

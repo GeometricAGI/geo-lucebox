@@ -1,5 +1,6 @@
 #include "gqh.cuh"
 #include "../gqh.h"
+#include "../gqh-stride.h"
 
 #include <cstdio>
 #include <cstring>
@@ -40,65 +41,115 @@ static __device__ __forceinline__ float gqh_subblock_scale(
 // 105 B superblock: [0] E4M3 d, [1:9] 16x uint4 ratios, [9:73] low-2-bit code
 // plane (4/byte), [73:105] high-1-bit code plane (8/byte).
 
-template <typename dst_t>
+// `nsb_row` is the superblocks-per-row needed to split the flat superblock index
+// back into (row, sb) for the planar layout; it is unused when PLANAR is false.
+template <typename dst_t, bool PLANAR>
 static __global__ void gqh3_decode_kernel(
         const uint8_t * __restrict__ wire, float tensor_scale, gqh_grid8 grid,
-        dst_t * __restrict__ dst) {
-    const int64_t sb = blockIdx.x;
+        dst_t * __restrict__ dst, int nsb_row) {
+    const int64_t sb_flat = blockIdx.x;
     const int j = threadIdx.x;                                  // 0..255
-    const uint8_t * __restrict__ b = wire + sb * GQH3_SB_BYTES;
+    float s_b;
+    int lo, hi;
+    if (PLANAR) {
+        const int64_t row = sb_flat / nsb_row;
+        const int     sb  = (int) (sb_flat - row * nsb_row);
+        int off_r, off_lo, off_hi, stride;
+        gqh_plane_offsets(nsb_row, 1, &off_r, &off_lo, &off_hi, &stride);
+        const uint8_t * __restrict__ rb_ = wire + row * (int64_t) stride;
+        const int sub = j >> 4;
+        const uint8_t d = rb_[sb];
+        const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
+        const uint8_t rbyte = rb_[off_r + (sb << 3) + (sub >> 1)];
+        const int ratio = (sub & 1) ? (rbyte >> 4) : (rbyte & 0x0f);
+        s_b = d_real * gqh_bits(GQH_RATIO_Q_D[ratio][0]);
+        lo = (rb_[off_lo + (sb << 6) + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+        hi = (rb_[off_hi + (sb << 5) + (j >> 3)] >> (j & 7)) & 0x01;
+    } else {
+        const uint8_t * __restrict__ b = wire + sb_flat * GQH3_SB_BYTES;
+        s_b = gqh_subblock_scale(b, j >> 4, tensor_scale);
+        lo = (b[ 9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+        hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
+    }
 
-    const float s_b = gqh_subblock_scale(b, j >> 4, tensor_scale);
-
-    const int lo = (b[ 9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
-    const int hi = (b[73 + (j >> 3)] >> (j & 7)) & 0x01;
-
-    gqh_store(&dst[sb * GQH_SUPERBLOCK + j], grid.v[lo | (hi << 2)] * s_b);
+    gqh_store(&dst[sb_flat * GQH_SUPERBLOCK + j], grid.v[lo | (hi << 2)] * s_b);
 }
 
 template <typename dst_t>
 static void gqh3_decode_cuda(const void * wire, float tensor_scale, int grid_code,
-                             dst_t * dst, int64_t nsb_total, cudaStream_t stream) {
+                             dst_t * dst, int64_t nsb_total, int nsb_row, bool planar,
+                             cudaStream_t stream) {
     gqh_grid8 grid;
     memcpy(grid.v, GQH3_GRID[grid_code], sizeof(grid.v));
-    gqh3_decode_kernel<dst_t><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
-        (const uint8_t *) wire, tensor_scale, grid, dst);
+    if (planar) {
+        GGML_ASSERT(nsb_row > 0 && "gqh3 planar decode needs the row length");
+        gqh3_decode_kernel<dst_t, true><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
+            (const uint8_t *) wire, tensor_scale, grid, dst, nsb_row);
+    } else {
+        gqh3_decode_kernel<dst_t, false><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
+            (const uint8_t *) wire, tensor_scale, grid, dst, nsb_row);
+    }
 }
 
 void ggml_cuda_gqh3_decode(const void * wire, float tensor_scale, int grid_code,
                            float * dst, int64_t rows, int64_t nsb, cudaStream_t stream) {
-    gqh3_decode_cuda(wire, tensor_scale, grid_code, dst, rows * nsb, stream);
+    gqh3_decode_cuda(wire, tensor_scale, grid_code, dst, rows * nsb, (int) nsb,
+                     /*planar=*/false, stream);
 }
 
 // --- gqh2_h -----------------------------------------------------------------
 // 73 B superblock: [0] E4M3 d, [1:9] 16x uint4 ratios, [9:73] uint2 codes (4/byte).
 
-template <typename dst_t>
+template <typename dst_t, bool PLANAR>
 static __global__ void gqh2h_decode_kernel(
         const uint8_t * __restrict__ wire, float tensor_scale, gqh_grid4 grid,
-        dst_t * __restrict__ dst) {
-    const int64_t sb = blockIdx.x;
+        dst_t * __restrict__ dst, int nsb_row) {
+    const int64_t sb_flat = blockIdx.x;
     const int j = threadIdx.x;
-    const uint8_t * __restrict__ b = wire + sb * GQH2H_SB_BYTES;
+    float s_b;
+    int code;
+    if (PLANAR) {
+        const int64_t row = sb_flat / nsb_row;
+        const int     sb  = (int) (sb_flat - row * nsb_row);
+        int off_r, off_lo, off_hi, stride;
+        gqh_plane_offsets(nsb_row, 0, &off_r, &off_lo, &off_hi, &stride);
+        const uint8_t * __restrict__ rb_ = wire + row * (int64_t) stride;
+        const int sub = j >> 4;
+        const uint8_t d = rb_[sb];
+        const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
+        const uint8_t rbyte = rb_[off_r + (sb << 3) + (sub >> 1)];
+        const int ratio = (sub & 1) ? (rbyte >> 4) : (rbyte & 0x0f);
+        s_b = d_real * gqh_bits(GQH_RATIO_Q_D[ratio][0]);
+        code = (rb_[off_lo + (sb << 6) + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+    } else {
+        const uint8_t * __restrict__ b = wire + sb_flat * GQH2H_SB_BYTES;
+        s_b  = gqh_subblock_scale(b, j >> 4, tensor_scale);
+        code = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
+    }
 
-    const float s_b = gqh_subblock_scale(b, j >> 4, tensor_scale);
-    const int code = (b[9 + (j >> 2)] >> (2 * (j & 3))) & 0x03;
-
-    gqh_store(&dst[sb * GQH_SUPERBLOCK + j], grid.v[code] * s_b);
+    gqh_store(&dst[sb_flat * GQH_SUPERBLOCK + j], grid.v[code] * s_b);
 }
 
 template <typename dst_t>
 static void gqh2h_decode_cuda(const void * wire, float tensor_scale, int grid_code,
-                              dst_t * dst, int64_t nsb_total, cudaStream_t stream) {
+                              dst_t * dst, int64_t nsb_total, int nsb_row, bool planar,
+                              cudaStream_t stream) {
     gqh_grid4 grid;
     memcpy(grid.v, GQH2H_GRID[grid_code], sizeof(grid.v));
-    gqh2h_decode_kernel<dst_t><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
-        (const uint8_t *) wire, tensor_scale, grid, dst);
+    if (planar) {
+        GGML_ASSERT(nsb_row > 0 && "gqh2_h planar decode needs the row length");
+        gqh2h_decode_kernel<dst_t, true><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
+            (const uint8_t *) wire, tensor_scale, grid, dst, nsb_row);
+    } else {
+        gqh2h_decode_kernel<dst_t, false><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
+            (const uint8_t *) wire, tensor_scale, grid, dst, nsb_row);
+    }
 }
 
 void ggml_cuda_gqh2h_decode(const void * wire, float tensor_scale, int grid_code,
                             float * dst, int64_t rows, int64_t nsb, cudaStream_t stream) {
-    gqh2h_decode_cuda(wire, tensor_scale, grid_code, dst, rows * nsb, stream);
+    gqh2h_decode_cuda(wire, tensor_scale, grid_code, dst, rows * nsb, (int) nsb,
+                      /*planar=*/false, stream);
 }
 
 // --- gqh2_c -----------------------------------------------------------------
@@ -200,7 +251,7 @@ static __device__ __forceinline__ float gqh_level(int code, const float4 & m) {
     return hi ? mag : -mag;
 }
 
-template <bool IS_GQH3>
+template <bool IS_GQH3, bool PLANAR>
 static __global__ void gqh_matvec_kernel(
         const uint8_t * __restrict__ data, const float * __restrict__ x,
         float * __restrict__ y, int in, int out, int ncols, float tensor_scale, float4 mag,
@@ -223,25 +274,42 @@ static __global__ void gqh_matvec_kernel(
     if (row >= out) return;
 
     const int nsb = in / GQH_SUPERBLOCK;
-    const uint8_t * __restrict__ rowbase = data + (int64_t) row * nsb * sb_bytes;
+    // Tight: one AoS stream, superblock sb at row*nsb*sb_bytes + sb*sb_bytes.
+    // Planar: four per-row planes, each stepped by its own power-of-two stride, so
+    // the low-plane read below is a single aligned 64 B line per warp instead of a
+    // straddling one (see gqh-stride.h).
+    int off_r = 0, off_lo = 0, off_hi = 0, pstride = 0;
+    if (PLANAR) {
+        gqh_plane_offsets(nsb, IS_GQH3 ? 1 : 0, &off_r, &off_lo, &off_hi, &pstride);
+    }
+    const uint8_t * __restrict__ rowbase =
+        PLANAR ? data + (int64_t) row * pstride
+               : data + (int64_t) row * nsb * sb_bytes;
 
     const int j0  = lane * GQH_PER_LANE;   // this lane's first weight in the superblock
     const int sub = j0 >> 4;               // two lanes share a 16-weight sub-block
 
     float acc[GQH_MAX_COLS] = { 0.0f };
     for (int sb = 0; sb < nsb; ++sb) {
-        const uint8_t * __restrict__ b = rowbase + (int64_t) sb * sb_bytes;
+        const uint8_t * __restrict__ b = PLANAR ? rowbase : rowbase + (int64_t) sb * sb_bytes;
 
         // same order as the reference: d_real = e4m3(d) * tensor_scale, then
-        // s_b = d_real * (ratio/15). b[0] is warp-uniform so its table read broadcasts.
-        const uint8_t d = b[0];
+        // s_b = d_real * (ratio/15). The d byte is warp-uniform so its table read
+        // broadcasts. Identical arithmetic in both layouts -- only the addresses move,
+        // so the result stays bit-identical.
+        const uint8_t d  = PLANAR ? b[sb] : b[0];
         const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
-        const uint8_t rb = b[1 + (sub >> 1)];
+        const uint8_t rb = PLANAR ? b[off_r + (sb << 3) + (sub >> 1)] : b[1 + (sub >> 1)];
         const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
 
-        uint16_t lo2;
-        memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));   // 8 codes x 2 bits
-        const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
+        uint16_t lo2;                                  // 8 codes x 2 bits
+        if (PLANAR) {
+            // off_lo is 64 B-aligned and (sb<<6) keeps it so, hence a real aligned load.
+            lo2 = *(const uint16_t *) (b + off_lo + (sb << 6) + lane * 2);
+        } else {
+            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));
+        }
+        const uint8_t hi1 = IS_GQH3 ? (PLANAR ? b[off_hi + (sb << 5) + lane] : b[73 + lane]) : 0;
 
         // Decode this lane's 8 weights ONCE, then reuse them for every column.
         float w[GQH_PER_LANE];
@@ -367,7 +435,8 @@ bool ggml_cuda_gqh_mul_mat_vec(
 
     float scale;
     int   code;
-    if (!ggml_gqh_lookup(vx, &scale, &code)) {
+    int   planar = 0;
+    if (!ggml_gqh_lookup_ex(vx, &scale, &code, nullptr, nullptr, &planar)) {
         return false;   // unregistered -> caller keeps the dequant fallback
     }
 
@@ -383,11 +452,21 @@ bool ggml_cuda_gqh_mul_mat_vec(
     const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 1, 1);
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
     if (type == GGML_TYPE_GQH3) {
-        gqh_matvec_kernel<true><<<blocks, threads, 0, stream>>>(
-            (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
+        if (planar) {
+            gqh_matvec_kernel<true, true><<<blocks, threads, 0, stream>>>(
+                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
+        } else {
+            gqh_matvec_kernel<true, false><<<blocks, threads, 0, stream>>>(
+                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
+        }
     } else {
-        gqh_matvec_kernel<false><<<blocks, threads, 0, stream>>>(
-            (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
+        if (planar) {
+            gqh_matvec_kernel<false, true><<<blocks, threads, 0, stream>>>(
+                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
+        } else {
+            gqh_matvec_kernel<false, false><<<blocks, threads, 0, stream>>>(
+                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
+        }
     }
     return true;
 }
@@ -401,7 +480,9 @@ template <typename dst_t>
 static void gqh_convert(bool is_gqh3, const void * vx, dst_t * y, int64_t k, cudaStream_t stream) {
     float scale = 0.0f;
     int   code  = 0;
-    if (!ggml_gqh_lookup(vx, &scale, &code)) {
+    int64_t ne0 = 0;
+    int     planar = 0;
+    if (!ggml_gqh_lookup_ex(vx, &scale, &code, &ne0, nullptr, &planar)) {
         GGML_ABORT("gqh: tensor slice %p is not registered -- the per-tensor header KV "
                    "was not read at load time", vx);
     }
@@ -410,10 +491,23 @@ static void gqh_convert(bool is_gqh3, const void * vx, dst_t * y, int64_t k, cud
                    (long long) k);
     }
     const int64_t nsb = k / GQH_SUPERBLOCK;
+    // Planar rows are strided by the padded plane stride, so the decode has to know
+    // the row length. It only reaches the registry via ggml_gqh_register_ex, which is
+    // the same call that planarizes -- if it is missing here the buffer is planar but
+    // the row length was never recorded, and guessing would silently corrupt.
+    int nsb_row = 0;
+    if (planar) {
+        if (ne0 <= 0 || ne0 % GQH_SUPERBLOCK != 0) {
+            GGML_ABORT("gqh: planar dequant of %p needs the tensor row length, but the "
+                       "registry has ne0=%lld -- register through ggml_gqh_register_ex",
+                       vx, (long long) ne0);
+        }
+        nsb_row = (int) (ne0 / GQH_SUPERBLOCK);
+    }
     if (is_gqh3) {
-        gqh3_decode_cuda(vx, scale, code, y, nsb, stream);
+        gqh3_decode_cuda(vx, scale, code, y, nsb, nsb_row, planar != 0, stream);
     } else {
-        gqh2h_decode_cuda(vx, scale, code, y, nsb, stream);
+        gqh2h_decode_cuda(vx, scale, code, y, nsb, nsb_row, planar != 0, stream);
     }
 }
 

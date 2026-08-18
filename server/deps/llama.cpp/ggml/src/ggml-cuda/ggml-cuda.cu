@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "../gqh-stride.h"
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -810,6 +811,40 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+bool ggml_backend_cuda_gqh_set_planar(ggml_tensor * tensor, const void * tight, size_t tight_size) {
+    if (tensor->type != GGML_TYPE_GQH3 && tensor->type != GGML_TYPE_GQH2_H) {
+        return false;
+    }
+    GGML_ASSERT(gqh_planar_enabled() && "planar upload requested with DFLASH_GQH_PLANAR unset");
+    GGML_ASSERT(tensor->buffer != nullptr);
+    GGML_ASSERT(tight_size == ggml_nbytes(tensor));
+
+    const int64_t ne0 = tensor->ne[0];
+    GGML_ASSERT(ne0 % GQH_SUPERBLOCK == 0);
+    const int     nsb  = (int) (ne0 / GQH_SUPERBLOCK);
+    const int     is3  = tensor->type == GGML_TYPE_GQH3;
+    const int64_t rows = ggml_nelements(tensor) / ne0;
+    const size_t  planar_size =
+        (size_t) rows * (size_t) gqh_plane_row_bytes(nsb, is3);
+    // get_alloc_size returns max(planar, quantized row padding), so the reservation can
+    // legitimately exceed the planar image for small nsb. Require only that it fits --
+    // a reservation SMALLER than the image would mean the two disagree, and writing it
+    // would run off the end of the allocation.
+    GGML_ASSERT(planar_size <= ggml_backend_buft_get_alloc_size(tensor->buffer->buft, tensor));
+
+    std::vector<uint8_t> planar(planar_size);
+    gqh_planarize(is3, rows, nsb, (const uint8_t *) tight, planar.data());
+
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemcpy(tensor->data, planar.data(), planar_size, cudaMemcpyHostToDevice));
+    // The registry entry (span = planar image, plus ne0 for the plane offsets) is
+    // written later by register_gqh_headers, which runs after upload because it keys
+    // on the device pointer. Nothing to do here.
+    return true;
+}
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -977,6 +1012,30 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
+
+    // GQH planar: the device copy is a 4-plane permutation with a 64 B-aligned row
+    // stride, so it needs more room than the tight ggml_nbytes(). Reporting it here is
+    // the only sanctioned way to over-allocate; ggml-alloc enforces this figure.
+    //
+    // It must never come out BELOW the quantized row padding below, which GQH already
+    // triggers (GQH_SUPERBLOCK 256 is not a multiple of MATRIX_ROW_PADDING 512, so a
+    // 256-wide GQH row is padded by a whole extra superblock). For small nsb the planar
+    // stride is the smaller of the two, and returning it would under-allocate against
+    // kernels that read the padded row -- caught by test-gqh-backend-gqh2_h-1x256.
+    // Take the max so planar only ever adds space.
+    if (gqh_planar_enabled() &&
+        (tensor->type == GGML_TYPE_GQH3 || tensor->type == GGML_TYPE_GQH2_H) &&
+        ne0 % GQH_SUPERBLOCK == 0) {
+        size_t row_padded = size;
+        if (ne0 % MATRIX_ROW_PADDING != 0) {
+            row_padded += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+        }
+        const int     nsb  = (int) (ne0 / GQH_SUPERBLOCK);
+        const int     is3  = tensor->type == GGML_TYPE_GQH3;
+        const int64_t rows = ggml_nelements(tensor) / ne0;
+        const size_t  planar = (size_t) rows * (size_t) gqh_plane_row_bytes(nsb, is3);
+        return planar > row_padded ? planar : row_padded;
+    }
 
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {

@@ -28,6 +28,25 @@ extern "C" {
 // src0 by rows. Returns false if `p` falls in no registered tensor.
 GGML_API bool ggml_gqh_lookup(const void * p, float * tensor_scale, int * grid_code);
 
+// As above, plus the registered tensor's row length (ne[0]) and base pointer. The
+// planar device layout needs both: plane offsets are a function of nsb =
+// ne0/GQH_SUPERBLOCK, and the row index has to be recovered from (p - base) against
+// the PADDED row stride rather than ggml_row_size(). `ne0` is 0 for entries
+// registered through ggml_gqh_register (tight layout, which needs neither).
+// `ne0` and `base` may be NULL.
+// `planar` reports whether THIS tensor's device image is the 4-plane layout. It is a
+// per-tensor property, not a global mode: model weights can be planar while a test or
+// scratch tensor registered through ggml_gqh_register stays tight in the same process.
+// Any of `ne0`, `base`, `planar` may be NULL.
+GGML_API bool ggml_gqh_lookup_ex(const void * p, float * tensor_scale, int * grid_code,
+                                 int64_t * ne0, const void ** base, int * planar);
+
+// Register with the row length recorded. `nbytes` must span the whole device buffer
+// (the PADDED planar size when the planar layout is in use), since lookup resolves
+// interior row slices by pointer range.
+GGML_API void ggml_gqh_register_ex(const void * base, size_t nbytes, float tensor_scale,
+                                   int grid_code, int64_t ne0, int planar);
+
 // CPU decoders behind the type traits. gqh3/gqh2_h abort on an unregistered
 // pointer rather than guess a scale; see the to_float comment in ggml.c.
 void dequantize_row_gqh3  (const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

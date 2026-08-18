@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "gqh-stride.h"   // planar layout: gqh_planar_enabled, gqh_plane_row_bytes
 
 #include <cinttypes>
 #include <cmath>
@@ -208,7 +209,25 @@ bool register_gqh_headers(const std::string & gguf_path, ggml_context * ctx) {
 
     for (const ggml_tensor * t : gqh_tensors) {
         const gqh_kv_entry & e = entries.at(t->name);
-        ggml_gqh_register(t->data, ggml_nbytes(t), e.tensor_scale, (int) e.grid_code);
+        // Span the whole device allocation, not ggml_nbytes(): under the planar layout
+        // the image is padded (gqh-stride.h) and lookup resolves interior row slices by
+        // pointer range, so a tight span would miss the tail rows. Recomputed here from
+        // the same helper the buffer type's get_alloc_size uses rather than pulled from
+        // the backend, to keep this file free of ggml-backend internals.
+        // ne0 lets the planar decode rebuild the plane offsets; harmless when tight.
+        // planar iff the loader actually planarized this tensor -- the same condition
+        // ggml_backend_cuda_gqh_set_planar applies, so the two cannot disagree.
+        int planar = 0;
+        size_t span = ggml_nbytes(t);
+        if (gqh_planar_enabled() && t->ne[0] % GQH_SUPERBLOCK == 0) {
+            planar = 1;
+            const int     nsb  = (int) (t->ne[0] / GQH_SUPERBLOCK);
+            const int     is3  = t->type == GGML_TYPE_GQH3;
+            const int64_t rows = ggml_nelements(t) / t->ne[0];
+            span = (size_t) rows * (size_t) gqh_plane_row_bytes(nsb, is3);
+        }
+        ggml_gqh_register_ex(t->data, span, e.tensor_scale, (int) e.grid_code,
+                             t->ne[0], planar);
     }
     std::fprintf(stderr, "[gqh]: registered %zu tensor(s) from '%s'\n",
                  gqh_tensors.size(), GQH_KV_KEY);

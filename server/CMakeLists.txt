@@ -365,6 +365,9 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
+    # gqh-stride.h (GQH planar layout) is single-sourced with the ggml kernels, so the
+    # host side reads the same plane arithmetic rather than restating it.
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
 )
 
 add_library(dflash_common STATIC

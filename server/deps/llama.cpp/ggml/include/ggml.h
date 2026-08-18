@@ -3114,6 +3114,13 @@ extern "C" {
     // the superblock stream, so the loader reads it from GGUF KV and attaches it to
     // the tensor's data pointer here. Decoding an unregistered GQH tensor aborts.
     GGML_API void ggml_gqh_register(const void * base, size_t nbytes, float tensor_scale, int grid_code);
+    // As above, plus the tensor's row length ne[0]. Only the planar device layout
+    // (ggml/src/gqh-stride.h) needs it: plane offsets are a function of the row's
+    // superblock count, and the dequant converters see only a flat element count.
+    // `nbytes` must span the whole allocation, which for a planar tensor is the padded
+    // image rather than ggml_nbytes().
+    GGML_API void ggml_gqh_register_ex(const void * base, size_t nbytes, float tensor_scale,
+                                       int grid_code, int64_t ne0, int planar);
     GGML_API void ggml_gqh_unregister(const void * base);
 
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);

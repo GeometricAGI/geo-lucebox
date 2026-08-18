@@ -12,18 +12,33 @@ struct gqh_entry {
     size_t       nbytes;
     float        tensor_scale;
     int          grid_code;
+    // Row length (ne[0]) of the registered tensor, or 0 when unknown. Only the
+    // planar device layout needs it: plane offsets are a function of nsb =
+    // ne0/GQH_SUPERBLOCK, and the dequant converters see a flat element count.
+    int64_t      ne0;
+    // True when this tensor's device image is the 4-plane layout. Per tensor, not
+    // global: a process can hold planar model weights while a test or a scratch
+    // tensor registered through ggml_gqh_register stays tight.
+    bool         planar;
 };
 std::mutex                  g_gqh_mtx;
 std::vector<gqh_entry>      g_gqh_registry;
 }  // namespace
 
-void ggml_gqh_register(const void * base, size_t nbytes, float tensor_scale, int grid_code) {
+void ggml_gqh_register_ex(const void * base, size_t nbytes, float tensor_scale, int grid_code,
+                          int64_t ne0, int planar) {
     std::lock_guard<std::mutex> lk(g_gqh_mtx);
-    const gqh_entry ne{base, nbytes, tensor_scale, grid_code};
+    const gqh_entry ne{base, nbytes, tensor_scale, grid_code, ne0, planar != 0};
     for (auto & e : g_gqh_registry) {
         if (e.base == base) { e = ne; return; }
     }
     g_gqh_registry.push_back(ne);
+}
+
+void ggml_gqh_register(const void * base, size_t nbytes, float tensor_scale, int grid_code) {
+    // ne0 unknown: callers on the tight layout (the CPU decoders and the tests) never
+    // need it, and the planar path registers through ggml_gqh_register_ex.
+    ggml_gqh_register_ex(base, nbytes, tensor_scale, grid_code, 0, /*planar=*/0);
 }
 
 void ggml_gqh_unregister(const void * base) {
@@ -37,12 +52,20 @@ void ggml_gqh_unregister(const void * base) {
 }
 
 bool ggml_gqh_lookup(const void * p, float * tensor_scale, int * grid_code) {
+    return ggml_gqh_lookup_ex(p, tensor_scale, grid_code, nullptr, nullptr, nullptr);
+}
+
+bool ggml_gqh_lookup_ex(const void * p, float * tensor_scale, int * grid_code,
+                        int64_t * ne0, const void ** base, int * planar) {
     std::lock_guard<std::mutex> lk(g_gqh_mtx);
     for (const auto & e : g_gqh_registry) {
         const uint8_t * b = (const uint8_t *) e.base;
         if ((const uint8_t *) p >= b && (const uint8_t *) p < b + e.nbytes) {
             *tensor_scale = e.tensor_scale;
             *grid_code    = e.grid_code;
+            if (ne0)    { *ne0    = e.ne0;  }
+            if (base)   { *base   = e.base; }
+            if (planar) { *planar = e.planar ? 1 : 0; }
             return true;
         }
     }

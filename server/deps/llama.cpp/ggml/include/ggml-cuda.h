@@ -71,6 +71,17 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 // changing concurrent requests or other CUDA/HIP backends.
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
+// Upload a GQH tensor in the 4-plane device layout (see ggml/src/gqh-stride.h).
+// `tight` is the tensor's ggml_nbytes() of on-disk superblock bytes; this permutes
+// them into planes on the host and writes the PADDED planar image, which is larger
+// than ggml_nbytes() and therefore out of reach of ggml_backend_tensor_set. Sizing
+// comes from the buffer type's get_alloc_size, so this is only valid when
+// DFLASH_GQH_PLANAR=1 (asserts otherwise). Also records the row length in the GQH
+// registry, which the planar dequant path needs. No-op returning false for types
+// other than GQH3/GQH2_H, so the caller keeps its normal upload.
+GGML_BACKEND_API bool ggml_backend_cuda_gqh_set_planar(
+        struct ggml_tensor * tensor, const void * tight, size_t tight_size);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
