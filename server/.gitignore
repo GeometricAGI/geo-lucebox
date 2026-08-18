@@ -13,6 +13,11 @@ Makefile
 .DS_Store
 /tmp/
 *.bin
+# ...but the GQH bit-exactness vectors are fixture INPUTS, not build output. The
+# blanket *.bin above silently swallowed them, which is why test-gqh-{cpu-decode,backend}
+# fail on a fresh clone: the .decode.f32/.meta.json halves are tracked and the .wire.bin
+# half is not.
+!deps/llama.cpp/tests/gqh-vectors/*.wire.bin
 *.log
 __pycache__/
 *.pyc
