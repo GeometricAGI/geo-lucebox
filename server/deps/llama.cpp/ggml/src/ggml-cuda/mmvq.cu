@@ -698,6 +698,57 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// Number of independent row groups one CUDA block is split into.
+//
+// A `small_k` block is dispatched exactly when blocks_per_row_x (= K/qk) is
+// below the whole block's blocks_per_iter -- which means the k-loop start
+// `tid/(qi/vdr)` already exceeds the block count for the upper warps: they run
+// ZERO iterations while the block still produces only `nwarps` rows.  On the
+// DS4 ROCmFP4-fast decode path that is literally half the block idle
+// (`attn_q_b`, K=1024: 32 blocks per row vs blocks_per_iter 64, so warps 2-3
+// are dead).
+//
+// Splitting the warps into two groups, each covering the full K for its own
+// set of `nwarps` rows, doubles the rows a block writes at unchanged
+// per-thread work, and halves both the grid and the redundant per-block reads
+// of the activation column.
+//
+// It is bit-exact.  Every output row keeps the same per-lane `kbx` assignment
+// (group 0's group-local tid IS the old tid; group 1 reproduces exactly what
+// the next CUDA block used to compute), and each row's cross-warp reduction
+// visits its contributing warps in the same relative order -- the only terms
+// dropped are the +0.0f the idle warps used to contribute.
+//
+// Two groups and not four, even though four (one warp each) would delete the
+// cross-warp reduction entirely: that was tried and it FAILS the greedy-output
+// sha gate.  That failure is measured.  The mechanism is only INFERRED (from the
+// accumulate structure, not confirmed in SASS): with one warp per group a lane
+// runs TWO k-iterations, so the compiler can contract the second accumulate into
+// `fma(d, sumi, tmp)` -- one rounding -- where the two-warp form rounds `d*sumi`
+// and the cross-warp add separately.  If that is right then preserving the
+// reduction shape is not sufficient and each warp must also keep running exactly
+// one k-iteration; confirm before relying on it (rebuild the four-group variant
+// and look for FFMA vs FMUL+FADD in the accumulate -- 3m20, no measure needed).
+//
+// Scoped to ROCmFP4-fast deliberately: `mmvq.cu` is shared llama.cpp
+// infrastructure and this rig's only correctness oracle is a DS4 qtype-101
+// output hash.  For a type whose small-K shapes leave fewer warps idle the
+// split would reorder the reduction with nothing here able to check it.
+static constexpr __host__ __device__ int calc_row_groups(
+        ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+    return (type == GGML_TYPE_Q4_0_ROCMFP4_FAST && small_k && ncols_dst == 1 &&
+            nwarps % 2 == 0 &&
+            calc_rows_per_block(ncols_dst, table_id, small_k, nwarps) == nwarps)
+        ? 2 : 1;
+}
+
+// Rows one CUDA block writes: `calc_rows_per_block` for each row group.
+static constexpr __host__ __device__ int calc_rows_per_block_total(
+        ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+    return calc_row_groups(type, ncols_dst, table_id, small_k, nwarps) *
+           calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+}
+
 static bool is_gfx1151(const int cc) {
     return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
 }
@@ -778,11 +829,39 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
-    const     int blocks_per_row_x = (fixed_ncols_x > 0 ? fixed_ncols_x : ncols_x) / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+    // `rows_per_cuda_block` above is the PER ROW GROUP count, so every row loop
+    // and shared-memory extent below is unchanged; only the block's row origin,
+    // the group-local thread id and the group's k stride move.
+    constexpr int row_groups      = calc_row_groups(type, ncols_dst, table_id, small_k, nwarps);
+    constexpr int warps_per_group = nwarps / row_groups;
 
+    const     int warp_in_group = threadIdx.y % warps_per_group;
+    const     int row_group     = threadIdx.y / warps_per_group;
+    const     int tid = warp_size*warp_in_group + threadIdx.x;
+    const     int row0 = row_groups*rows_per_cuda_block*blockIdx.x + row_group*rows_per_cuda_block;
+    constexpr int blocks_per_iter = vdr * warps_per_group*warp_size / qi;
+    // A split block's trailing row group can start past the last row when
+    // nrows_x is not a multiple of row_groups*rows_per_cuda_block.  The result
+    // write is already guarded; zero the k-loop bound so that group issues no
+    // out-of-range weight loads either.
+    const     int blocks_per_row_x =
+        (row_groups > 1 && (uint32_t) row0 >= stride_col_dst)
+            ? 0 : (int) ((fixed_ncols_x > 0 ? fixed_ncols_x : ncols_x) / qk);
+
+    static_assert(nwarps % row_groups == 0, "row groups must partition the warps");
+    static_assert(row_groups == 1 ||
+                  (fixed_ncols_x == 0 && !unroll_k_loop_2 && !reuse_rocmfp4_weights &&
+                   !c_fp3_packed24 && !c_fp4_x4),
+                  "row-group splitting is limited to the plain small-K k-loop");
+    // Freeze the one geometry this was reasoned about: 4 warps -> 2 groups of 2
+    // warps, 4 rows each, a group k stride of exactly blocks_per_iter/2, and one
+    // k-iteration per warp (see above: four groups measurably fails the sha
+    // gate, most likely via FMA contraction).
+    static_assert(row_groups == 1 ||
+                  (row_groups == 2 && warps_per_group == nwarps/2 &&
+                   rows_per_cuda_block == nwarps &&
+                   blocks_per_iter == vdr*nwarps*warp_size/(2*qi)),
+                  "unexpected row-group split geometry");
     static_assert(fixed_ncols_x == 0 ||
                   type == GGML_TYPE_Q3_0_ROCMFPX ||
                   type == GGML_TYPE_Q2_0_ROCMFP2,
@@ -865,7 +944,7 @@ static __global__ void mul_mat_vec_q(
             const float * x_bias_base = x_bias + sample_dst*stride_sample_dst + row0;
             // 1. Hide latency by prefetching bias and gate here
             // 2. load only on threads that won't die after partial sum calculation
-            if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+            if (threadIdx.x < rows_per_cuda_block && warp_in_group == 0 &&
                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
@@ -880,7 +959,7 @@ static __global__ void mul_mat_vec_q(
         }
         if (use_gate_bias) {
             const float * gate_bias_base = gate_bias + sample_dst*stride_sample_dst + row0;
-            if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+            if (threadIdx.x < rows_per_cuda_block && warp_in_group == 0 &&
                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
@@ -1067,24 +1146,24 @@ static __global__ void mul_mat_vec_q(
     // A one-wave specialization has no cross-wave partials. Avoid reserving
     // shared memory and issuing a block barrier in that common decode path.
     // This does not change the per-lane accumulation or warp reduction order.
-    if constexpr (nwarps > 1) {
-        __shared__ float tmp_shared[nwarps-1][ncols_dst][rows_per_cuda_block][warp_size];
-        __shared__ float tmp_shared_gate[has_fusion ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    if constexpr (warps_per_group > 1) {
+        __shared__ float tmp_shared[row_groups][warps_per_group-1][ncols_dst][rows_per_cuda_block][warp_size];
+        __shared__ float tmp_shared_gate[row_groups][has_fusion ? warps_per_group-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
         if constexpr (!has_fusion) {
             (void) tmp_shared_gate;
         } else if (!use_gate) {
             (void) tmp_shared_gate;
         }
 
-        if (threadIdx.y > 0) {
+        if (warp_in_group > 0) {
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                    tmp_shared[row_group][warp_in_group-1][j][i][threadIdx.x] = tmp[j][i];
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+                            tmp_shared_gate[row_group][warp_in_group-1][j][i][threadIdx.x] = tmp_gate[j][i];
                         }
                     }
                 }
@@ -1092,7 +1171,7 @@ static __global__ void mul_mat_vec_q(
         }
 
         __syncthreads();
-        if (threadIdx.y > 0) {
+        if (warp_in_group > 0) {
             return;
         }
 
@@ -1101,11 +1180,11 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
-                for (int l = 0; l < nwarps-1; ++l) {
-                    tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                for (int l = 0; l < warps_per_group-1; ++l) {
+                    tmp[j][i] += tmp_shared[row_group][l][j][i][threadIdx.x];
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+                            tmp_gate[j][i] += tmp_shared_gate[row_group][l][j][i][threadIdx.x];
                         }
                     }
                 }
@@ -1792,7 +1871,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block_total(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
