@@ -610,7 +610,14 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         } else if (pre && (std::strcmp(pre, "llama4") == 0 ||
                            std::strcmp(pre, "llama3") == 0 ||
                            std::strcmp(pre, "llama-bpe") == 0 ||
-                           std::strcmp(pre, "gpt-4") == 0)) {
+                           std::strcmp(pre, "gpt-4") == 0 ||
+                           // DeepSeek-V4-Flash declares tokenizer.ggml.pre =
+                           // "joyai-llm". Its upstream tokenizer.json opens the
+                           // pre-tokenizer Sequence with
+                           //   {"Split", Regex "\p{N}{1,3}", Isolated}
+                           // so it is a member of this digit-grouping family,
+                           // not a qwen dialect.
+                           std::strcmp(pre, "joyai-llm") == 0)) {
             // Digit-grouping family: runs of up to three digits are ONE
             // pre-token. Falling through to the qwen default here silently
             // retokenizes every number in every prompt.
