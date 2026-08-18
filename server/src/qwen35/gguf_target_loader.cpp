@@ -44,6 +44,7 @@
 // tensor's bytes from the mmap'd file.
 
 #include "internal.h"
+#include "../common/dmix2_sidecar.h"
 #include "../common/gqh_headers.h"
 #include "common/derived_scalars.h"
 #include "common/layer_split_utils.h"
@@ -332,7 +333,25 @@ bool load_target_gguf_partial(const std::string & path,
 
     const uint32_t n_embd  = get_u32_or(gctx, key("embedding_length").c_str(), 0);
     const uint32_t n_ff    = get_u32_or(gctx, key("feed_forward_length").c_str(), 0);
-    const uint32_t n_layer = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t n_layer_all = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t n_layer_nextn = get_u32_or(gctx, key("nextn_predict_layers").c_str(), 0);
+    // Qwen3.5/3.8 GGUFs advertise block_count = trunk + MTP. AR decode uses
+    // the trunk only: n_layer = block_count - nextn_predict_layers, matching
+    // llama.cpp. MTP blocks are not full-attn/deltanet.
+    if (n_layer_nextn >= n_layer_all && n_layer_all != 0) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "nextn_predict_layers=%u must be < block_count=%u",
+            n_layer_nextn, n_layer_all);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+    const uint32_t n_layer = n_layer_all - n_layer_nextn;
+    if (n_layer_nextn > 0) {
+        std::printf("[loader] skipping %u nextn/MTP layer(s); n_layer=%u (block_count=%u)\n",
+                    n_layer_nextn, n_layer, n_layer_all);
+    }
     const uint32_t n_head  = get_u32_or(gctx, key("attention.head_count").c_str(), 0);
     const uint32_t n_headkv= get_u32_or(gctx, key("attention.head_count_kv").c_str(), 0);
     const uint32_t kl      = get_u32_or(gctx, key("attention.key_length").c_str(), 0);
@@ -900,6 +919,11 @@ bool load_target_gguf_partial(const std::string & path,
         free_target_weights(out);
         return false;
     }
+    if (!dflash::common::register_dmix2_sidecar(path, out.ctx)) {
+        set_last_error("dmix2 sidecar registration failed for " + path);
+        free_target_weights(out);
+        return false;
+    }
 
     return true;
 }
@@ -908,6 +932,7 @@ void free_target_weights(TargetWeights & w) {
     // Drop GQH registry entries while the tensors are still valid, BEFORE ggml_free:
     // the registry resolves by pointer range, so a stale entry would shadow a later
     // load that reuses the address.
+    dflash::common::unregister_dmix2_sidecar(w.ctx);
     dflash::common::unregister_gqh_headers(w.ctx);
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
