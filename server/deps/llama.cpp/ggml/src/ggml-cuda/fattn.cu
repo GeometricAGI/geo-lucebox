@@ -434,7 +434,11 @@ __global__ static void ds4_fa_indexed_rows_parallel_kernel(
         const int c = base + tid;
         const bool selected = c < n_comp_rows &&
             ds4_fa_load<Mask, Mask>(token_mask + raw_rows + c) > -1.0e20f;
-        const unsigned long long selected_bits = __ballot(selected);
+        // Use the portable spelling: raw __ballot() is HIP-only and ptxas
+        // rejects a non-.sync vote on sm_70+. Every lane of each warp reaches
+        // this ballot (out-of-range c only makes `selected` false), so the
+        // full participation mask DS4_FA_BALLOT uses is the correct one.
+        const unsigned long long selected_bits = DS4_FA_BALLOT(selected);
         if (lane == 0) {
             warp_offsets[warp] = __popcll(selected_bits);
         }
