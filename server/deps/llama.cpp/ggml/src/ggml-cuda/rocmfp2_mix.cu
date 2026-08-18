@@ -326,6 +326,112 @@ __device__ __forceinline__ float mix_fp2_fixed(uint32_t code) {
     return (float) ((int) code - 1);   // 0->-1, 1->0, 2->1, 3->2
 }
 
+// ---- nibble-expanded codebook table ----
+//
+// Why. After iteration 3's LDS activation staging this fold is no longer memory-bound:
+// ncu on the fused MoE launch (H200 sm_90, in=7168 / out=2048 / top-k 4) puts DRAM at
+// 11.6% and names ALU the top pipe at 64.4%, with 17.15 M ALU against 10.76 M FMA
+// instructions. Hopper has 64 INT32 lanes to 128 FP32 lanes per SM, so at half rate that
+// ALU count is ~3x the FMA load: the integer extract/address work AROUND each MAC is the
+// cost, not the MAC. Per term the old gather `bk[mix_fp2_code_u64(codes, j)]` spent a
+// shift, a mask and an index-scale (3 ALU) plus a 4 B LDS -- 3.67 M times per launch.
+//
+// The fix. Codes are 2 bits, four to a byte, and a fold consumes them in ascending j, so
+// the pair (j, j+1) for EVEN j sits at bit offset 2*(j&3) with (j&3) in {0, 2} -- bit 0 or
+// bit 4 of its byte, exactly nibble-aligned. Expand the 4-entry codebook into a 16-entry
+// table keyed by that nibble, each entry the float2 {level[n & 3], level[(n >> 2) & 3]}:
+// one shift + one mask + one 8 B LDS now serves TWO terms instead of one.
+//
+// Bit-exact. The table holds the same f32 values the gather read (a codebook level
+// widened from bf16 once, or mix_fp2_fixed's exact small integer); each term still
+// multiplies by the same scale and the same activation in the same ascending-j order.
+// Even j runs 0..30, so a pair lies wholly inside one half of the block and can never
+// straddle j == MIX_QK/2 and take the wrong scale. Only the route changes.
+// Bank replication, and why the naive table is a LOSS without it. Both the nibble and
+// the codebook select are per-lane weight data, so an unreplicated table is a
+// data-dependent LDS gather. Laid out flat, the 2 * MIX_NIB = 32 float2 entries span
+// 256 B = two bank rounds, so entry e and entry e+16 share a bank pair whatever
+// permutation you pick (any 8 B-granular stride shares gcd >= 2 with 32, so 32 entries
+// can only reach 16 distinct bank pairs). MEASURED: the flat version cut ALU 17.15 M ->
+// 11.43 M exactly as intended, and still ran 51.0 -> 58.4 us on the fused kernel because
+// bank conflicts went 0.41 M -> 3.98 M and shared wavefronts 5.61 M -> 9.18 M.
+//
+// The fix is the standard per-bank LUT replication: MIX_NIB_COPIES = 16 copies of the
+// table (one per 8 B bank pair), with copy p of entry e at float2 index
+// e * MIX_NIB_COPIES + p, and lane L reading copy L & 15. A 64-bit LDS access is serviced
+// in phases of 16 consecutive lanes (16 x 8 B = 128 B = all 32 banks), so every lane of a
+// phase reads bank pair (L & 15) -- distinct by construction, for ANY weight data. It
+// costs 4 KB of LDS per tensor and a 16-store fill; the fold's address arithmetic is
+// unchanged (the entry stride is just 128 B instead of 8 B).
+#define MIX_NIB          16                              // nibble values per codebook
+#define MIX_NIB_ENTRIES  (2 * MIX_NIB)                    // (codebook, nibble) entries
+#define MIX_NIB_COPIES   16                               // bank-pair copies of each
+#define MIX_NIB_SHIFT    7                                // log2(MIX_NIB_COPIES * 8 B)
+#define MIX_NIB_SLAB     (MIX_NIB_ENTRIES * MIX_NIB_COPIES)  // float2 per tensor = 4 KB
+
+// Byte offset of nibble j's entry from the lane's copy base -- nibble(j) * 128 -- in one
+// shift and one mask rather than extract-then-scale. `j` is a compile-time constant in
+// the fully-unrolled fold, so the shift direction folds away. The highest bit touched is
+// 8*(30>>2) + 2*(30&3) + 3 = 63, so the read stays inside `codes`.
+__device__ __forceinline__ uint32_t mix_nib_off(uint64_t codes, int j) {
+    const int bit = 8 * (j >> 2) + 2 * (j & 3);
+    const uint64_t s = (bit >= MIX_NIB_SHIFT) ? (codes >> (bit - MIX_NIB_SHIFT))
+                                             : (codes << (MIX_NIB_SHIFT - bit));
+    return (uint32_t) s & (uint32_t) ((MIX_NIB - 1) << MIX_NIB_SHIFT);
+}
+
+// The two levels for terms (j, j+1), one conflict-free 8 B LDS from the lane's own copy.
+__device__ __forceinline__ float2 mix_nib_pair(
+        const float2 * __restrict__ t, uint64_t codes, int j) {
+    return *(const float2 *) ((const char *) t + mix_nib_off(codes, j));
+}
+
+// The lane's copy base within a tensor's slab. Bias the pointer ONCE per kernel rather
+// than per gather; MIX_NIB_SLAB is a whole number of copies, so adding a tensor's slab
+// offset to an already-biased pointer stays on the same copy.
+__device__ __forceinline__ const float2 * mix_nib_lane(
+        const float2 * __restrict__ slab, int lane) {
+    return slab + (lane & (MIX_NIB_COPIES - 1));
+}
+
+// Cooperative fill of one tensor's replicated slab from its resolved-expert codebook.
+// Codebook `cb` (selected per block by the meta byte's top bit) owns entries
+// [cb * MIX_NIB, (cb+1) * MIX_NIB). mode 0 ignores the codebook entirely -- its levels
+// are the fixed {-1, 0, 1, 2} -- and filling BOTH codebooks with them keeps the fold's
+// `m >> 7` table select valid there without a second branch in the hot loop.
+//
+// Written a float4 -- TWO adjacent bank copies of one entry -- per thread per step, so a
+// tensor's 4 KB slab costs 4 steps a thread instead of 32. That matters more than it looks:
+// the fill is per BLOCK while the fold it feeds is per row-window, so on the dense kernels
+// (which have no activation staging to amortise it against) the fill is most of what this
+// table costs.
+//
+// The stride is over the flat float4 index on purpose: consecutive threads write
+// consecutive 16 B slots, which is 8 distinct bank quads across the 8 lanes of a 128-bit
+// phase -- conflict-free. Grouping it the other way (one thread owns a value and writes
+// all MIX_NIB_COPIES copies of it) would save the repeated codebook read but land every
+// lane of a store in the SAME bank quad, a 16-way conflict. The repeated read is free:
+// `book` is 16 B, so it is an L1 hit after the first.
+__device__ __forceinline__ void mix_fill_nib(
+        float2 * __restrict__ slab, const nv_bfloat16 * __restrict__ book,
+        int mode, int tid, int nthreads) {
+    float4 * __restrict__ t4 = (float4 *) slab;
+    // Two float2 copies per float4 slot, so MIX_NIB_COPIES/2 slots per entry.
+    const int slots = MIX_NIB_ENTRIES * (MIX_NIB_COPIES / 2);
+    for (int q = tid; q < slots; q += nthreads) {
+        const int e    = q / (MIX_NIB_COPIES / 2);   // (codebook, nibble) entry
+        const int nib  = e & (MIX_NIB - 1);
+        const int cb   = e / MIX_NIB;
+        const int c0   = nib & 3;                    // term j
+        const int c1   = (nib >> 2) & 3;             // term j+1
+        const float v0 = (mode == 0) ? mix_fp2_fixed((uint32_t) c0)
+                                     : __bfloat162float(book[cb * MIX_K + c0]);
+        const float v1 = (mode == 0) ? mix_fp2_fixed((uint32_t) c1)
+                                     : __bfloat162float(book[cb * MIX_K + c1]);
+        t4[q] = make_float4(v0, v1, v0, v1);
+    }
+}
+
 // One thread per element of a single expert slice (k = out*in elements).
 __global__ void dequantize_rocmfp2_mix_kernel(
         const uint8_t * __restrict__ data, const nv_bfloat16 * __restrict__ book,
@@ -522,26 +628,30 @@ __device__ __forceinline__ MixBlock mix_block_load(const uint8_t * __restrict__ 
 // mix_block_accum_x, which is now this plus mix_block_load.
 __device__ __forceinline__ void mix_block_fma(
         const MixBlock & blk, const float (&xv)[MIX_QK],
-        int mode, const float * __restrict__ lut, float & acc) {
+        int mode, const float2 * __restrict__ nib, float & acc) {
     const uint64_t codes = blk.codes;
     const uint8_t  m0 = blk.m0, m1 = blk.m1;
-    if (mode == 0) {
-        const float s0 = mix_ue4m3(m0), s1 = mix_ue4m3(m1);
-        #pragma unroll
-        for (int j = 0; j < MIX_QK; ++j) {
-            const float s = (j < MIX_QK/2) ? s0 : s1;
-            acc += s * mix_fp2_fixed(mix_fp2_code_u64(codes, j)) * xv[j];
-        }
-    } else {
-        const float s0 = mix_ue4m3(m0 & 0x7F), s1 = mix_ue4m3(m1 & 0x7F);
-        const float * bk0 = lut + (m0 >> 7) * MIX_K;
-        const float * bk1 = lut + (m1 >> 7) * MIX_K;
-        #pragma unroll
-        for (int j = 0; j < MIX_QK; ++j) {
-            const float s = (j < MIX_QK/2) ? s0 : s1;
-            const float * bk = (j < MIX_QK/2) ? bk0 : bk1;
-            acc += s * bk[mix_fp2_code_u64(codes, j)] * xv[j];
-        }
+    // mode 0 reads the WHOLE meta byte as the ue4m3 scale; mode 1 reserves its top bit
+    // for the codebook select, so the scale is the low 7. That difference is the only
+    // thing left that distinguishes the modes -- the level lookup is now common, because
+    // mix_fill_nib has already resolved mode 0's fixed {-1, 0, 1, 2} into both tables.
+    // Folding the two 32-term bodies into one is not just tidier: the mode branch is
+    // block-uniform, so both unrolled bodies used to be resident in the binary and in the
+    // register allocator's live-range problem.
+    const float s0 = mix_ue4m3((mode == 0) ? m0 : (uint8_t) (m0 & 0x7F));
+    const float s1 = mix_ue4m3((mode == 0) ? m1 : (uint8_t) (m1 & 0x7F));
+    const float2 * t0 = nib + (m0 >> 7) * (MIX_NIB * MIX_NIB_COPIES);
+    const float2 * t1 = nib + (m1 >> 7) * (MIX_NIB * MIX_NIB_COPIES);
+    // Two terms per iteration, one nibble and one 8 B LDS each. EVEN j only, so a pair
+    // never straddles the s0/s1 boundary at j == MIX_QK/2, and the terms still enter acc
+    // in ascending j -- the summation order the greedy-sha gate depends on is untouched.
+    #pragma unroll
+    for (int j = 0; j < MIX_QK; j += 2) {
+        const float      s = (j < MIX_QK/2) ? s0 : s1;
+        const float2 *   t = (j < MIX_QK/2) ? t0 : t1;
+        const float2     v = mix_nib_pair(t, codes, j);
+        acc += s * v.x * xv[j];
+        acc += s * v.y * xv[j + 1];
     }
 }
 
@@ -555,23 +665,23 @@ __device__ __forceinline__ void mix_block_fma(
 // compiler overlap their loads even though the acc-add chain stays serial.
 __device__ __forceinline__ void mix_block_accum_x(
         const uint8_t * __restrict__ b, const float (&xv)[MIX_QK],
-        int mode, const float * __restrict__ lut, float & acc) {
+        int mode, const float2 * __restrict__ nib, float & acc) {
     // Exactly mix_block_load + mix_block_fma, and deliberately not a second copy of
     // the 32-term fold: the dense/slice kernels and the MoE kernel must not be able
     // to drift apart numerically. Both callees are __forceinline__, so this composes
     // to the same code the one-piece version emitted (verified: dense 64 regs, slice
     // 70, harness hashes unchanged).
-    mix_block_fma(mix_block_load(b), xv, mode, lut, acc);
+    mix_block_fma(mix_block_load(b), xv, mode, nib, acc);
 }
 
 // Original (col0-addressed) entry point, kept for the MoE and 3-D slice kernels.
 // Stages the activations itself; identical arithmetic.
 __device__ __forceinline__ void mix_block_accum(
         const uint8_t * __restrict__ b, const float * __restrict__ xc, int col0,
-        int mode, const float * __restrict__ lut, float & acc) {
+        int mode, const float2 * __restrict__ nib, float & acc) {
     float xv[MIX_QK];
     mix_load_x32(xc + col0, xv);
-    mix_block_accum_x(b, xv, mode, lut, acc);
+    mix_block_accum_x(b, xv, mode, nib, acc);
 }
 
 // Two output rows, ONE activation stage. The 32 activations a block consumes are
@@ -586,12 +696,12 @@ __device__ __forceinline__ void mix_block_accum(
 // for element.
 __device__ __forceinline__ void mix_block_accum2(
         const uint8_t * __restrict__ b0, const uint8_t * __restrict__ b1,
-        const float * __restrict__ xp, int mode, const float * __restrict__ lut,
+        const float * __restrict__ xp, int mode, const float2 * __restrict__ nib,
         float & acc0, float & acc1) {
     float xv[MIX_QK];
     mix_load_x32(xp, xv);
-    mix_block_accum_x(b0, xv, mode, lut, acc0);
-    mix_block_accum_x(b1, xv, mode, lut, acc1);
+    mix_block_accum_x(b0, xv, mode, nib, acc0);
+    mix_block_accum_x(b1, xv, mode, nib, acc1);
 }
 
 // ---- LDS activation staging for the MoE fold ----
@@ -709,7 +819,7 @@ __device__ __forceinline__ void mix_moe_block_fold(
         // read-only const, so permitting the aliasing costs nothing.
         const uint8_t * const (&rowbase)[ROWS], const uint8_t * const (&growbase)[ROWS],
         const float (&xv)[MIX_QK], int b,
-        int mode, int gmode, const float * __restrict__ lut,
+        int mode, int gmode, const float2 * __restrict__ nib,
         float (&acc)[ROWS], float (&gacc)[ROWS]) {
     const int64_t off = (int64_t) b * MIX_BLOCK_BYTES;
     // Issue all 2*ROWS weight-block loads before any FMA. Leaving the loads inside
@@ -725,10 +835,10 @@ __device__ __forceinline__ void mix_moe_block_fold(
         for (int i = 0; i < ROWS; ++i) gw[i] = mix_block_load(growbase[i] + off);
     }
     #pragma unroll
-    for (int i = 0; i < ROWS; ++i) mix_block_fma(w[i], xv, mode, lut, acc[i]);
+    for (int i = 0; i < ROWS; ++i) mix_block_fma(w[i], xv, mode, nib, acc[i]);
     if (FUSE_GLU) {
         #pragma unroll
-        for (int i = 0; i < ROWS; ++i) mix_block_fma(gw[i], xv, gmode, lut + 2 * MIX_K, gacc[i]);
+        for (int i = 0; i < ROWS; ++i) mix_block_fma(gw[i], xv, gmode, nib + MIX_NIB_SLAB, gacc[i]);
     }
 }
 
@@ -739,7 +849,7 @@ template <bool FUSE_GLU, int ROWS, bool FULL>
 __device__ __forceinline__ void mix_moe_window(
         float * __restrict__ sxw, const float * __restrict__ xcol, int base, int nblk, int lane,
         const uint8_t * const (&rowbase)[ROWS], const uint8_t * const (&growbase)[ROWS],
-        int mode, int gmode, const float * __restrict__ lut,
+        int mode, int gmode, const float2 * __restrict__ nib,
         float (&acc)[ROWS], float (&gacc)[ROWS]) {
     mix_stage_window<FULL>(sxw, xcol + (int64_t) base * MIX_QK, nblk, lane);
     // Required, not warp-synchrony folklore: sm_90 schedules threads independently, so a
@@ -751,7 +861,7 @@ __device__ __forceinline__ void mix_moe_window(
         float xv[MIX_QK];
         mix_read_x32(sxw, lane, xv);
         mix_moe_block_fold<FUSE_GLU, ROWS>(rowbase, growbase, xv, base + lane,
-                                           mode, gmode, lut, acc, gacc);
+                                           mode, gmode, nib, acc, gacc);
     }
     // WAR: a lane that races ahead to the next window's fill must not overwrite slots a
     // sibling lane is still reading.
@@ -778,17 +888,16 @@ __global__ void mix_matvec_rocmfp2_kernel(
     const int row  = warp * 2;                  // two output rows per warp
     const int lane = threadIdx.x % MIX_WARP;
     const int col  = blockIdx.y;
-    // Widen the 2 * MIX_K bf16 codebook to f32 in LDS once per workgroup instead of
-    // re-loading it from global per weight inside mix_block_accum. HOISTED ABOVE the
-    // row early-return: __syncthreads() requires every thread of the workgroup to
-    // arrive, and `row >= out` retires whole warps in the tail block.
-    __shared__ float s_lut[2 * MIX_K];
-    if ((int) threadIdx.x < 2 * MIX_K) {
-        s_lut[threadIdx.x] = __bfloat162float(book[threadIdx.x]);
-    }
+    // Expand the bf16 codebook into the nibble-keyed f32 table (see mix_fill_nib) once
+    // per workgroup instead of re-loading it from global per weight inside
+    // mix_block_accum. HOISTED ABOVE the row early-return: __syncthreads() requires every
+    // thread of the workgroup to arrive, and `row >= out` retires whole warps in the tail
+    // block. `mode` is hoisted with it because the table's contents depend on it.
+    const int mode = (int) mode_ptr[0];
+    __shared__ __align__(16) float2 s_nib[MIX_NIB_SLAB];
+    mix_fill_nib(s_nib, book, mode, (int) threadIdx.x, (int) blockDim.x);
     __syncthreads();
     if (row >= out) return;
-    const int mode = (int) mode_ptr[0];
     const int nb   = in / MIX_QK;
     // `two` is warp-uniform, so the hot loop never diverges. It is false only for
     // the tail warp of an odd `out`; that warp reuses row0's base so every load
@@ -817,14 +926,14 @@ __global__ void mix_matvec_rocmfp2_kernel(
             const int b = blk + u * MIX_WARP;
             mix_block_accum2(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES,
                              rowbase1 + (int64_t) b * MIX_BLOCK_BYTES,
-                             xc + b * MIX_QK, mode, s_lut, acc0, acc1);
+                             xc + b * MIX_QK, mode, mix_nib_lane(s_nib, lane), acc0, acc1);
         }
     }
     // Remainder: fewer than MIX_UNROLL strided blocks left for this lane.
     for (; blk < nb; blk += MIX_WARP) {
         mix_block_accum2(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES,
                          rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES,
-                         xc + blk * MIX_QK, mode, s_lut, acc0, acc1);
+                         xc + blk * MIX_QK, mode, mix_nib_lane(s_nib, lane), acc0, acc1);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
@@ -896,16 +1005,16 @@ __global__ void mix_matvec_rocmfp2_slice_kernel(
     const int expert = slot;                    // DENSE: the weight slice is the grid slice,
                                                 // not a routing lookup. This is the ONLY
                                                 // change from the MoE kernel.
-    __shared__ float s_lut[2 * MIX_K];
-    if ((int) threadIdx.x < 2 * MIX_K) {
-        s_lut[threadIdx.x] =
-            __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
-    }
+    // `mode` is read up here with the expert because mix_fill_nib's table contents
+    // depend on it (mode 0's levels are the fixed set, not the codebook).
+    const int mode = (int) modes[expert];
+    __shared__ __align__(16) float2 s_nib[MIX_NIB_SLAB];
+    mix_fill_nib(s_nib, codebooks + (int64_t) expert * 2 * MIX_K, mode,
+                 (int) threadIdx.x, (int) blockDim.x);
     __syncthreads();
     if (row0 >= out) return;
     const bool two  = (row0 + 1) < out;         // false only for an odd-out tail warp
     const uint8_t     * edata   = data + (int64_t) expert * nb02;
-    const int           mode    = (int) modes[expert];
     const int           nb      = in / MIX_QK;
     const uint8_t     * rowbase0 = edata + (int64_t) row0 * nb * MIX_BLOCK_BYTES;
     // For an odd tail warp (no row1) reuse row0's base so the loads stay in-bounds;
@@ -929,13 +1038,13 @@ __global__ void mix_matvec_rocmfp2_slice_kernel(
         #pragma unroll
         for (int u = 0; u < MIX_UNROLL; ++u) {
             const int b = blk + u * MIX_WARP;
-            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc0);
-            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc1);
+            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, mix_nib_lane(s_nib, lane), acc0);
+            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, mix_nib_lane(s_nib, lane), acc1);
         }
     }
     for (; blk < nb; blk += MIX_WARP) {
-        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
-        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
+        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, mix_nib_lane(s_nib, lane), acc0);
+        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, mix_nib_lane(s_nib, lane), acc1);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
@@ -999,9 +1108,11 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // an invalid id to a ZERO contribution for this (token, slot): deterministic, and the
     // same thing a masked-out slot means. All threads still reach the barrier below.
     const bool bad_expert = expert < 0 || expert >= n_experts;
-    // Both tables in one array so the staging stays a single guarded write per thread and one
-    // barrier. Gate's table occupies [2*MIX_K, 4*MIX_K).
-    __shared__ float s_lut[FUSE_GLU ? 4 * MIX_K : 2 * MIX_K];
+    // Both tensors' nibble tables in one array so the fill stays one barrier. Gate's table
+    // occupies [MIX_NIB_SLAB, 2*MIX_NIB_SLAB) -- the offset the fold adds for the gate fold.
+    // 4 KB per tensor against the old 32 B; 16 KB total per block still leaves this kernel
+    // register-limited (96 regs -> 10 blocks/SM = 160 KB of the 228 KB an SM has).
+    __shared__ __align__(16) float2 s_nib[FUSE_GLU ? 2 * MIX_NIB_SLAB : MIX_NIB_SLAB];
     // One MIX_WARP-block activation window per warp (4 KB), swizzled -- see
     // mix_swz_word. PER-WARP rather than shared by the whole block on purpose: both
     // warps do walk the identical block sequence, so one buffer would serve both, but
@@ -1011,15 +1122,19 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // and cross-warp sharing would only take activation line-lookups 32 -> 16 after
     // coalescing has already taken them 256 -> 32. Not worth a block barrier.
     __shared__ __align__(16) float s_xw[WARPS][MIX_WARP * MIX_QK];
-    if (!bad_expert && (int) threadIdx.x < 2 * MIX_K) {
-        s_lut[threadIdx.x] =
-            __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
-    }
-    if (FUSE_GLU) {
-        const int gt = (int) threadIdx.x - 2 * MIX_K;
-        if (!bad_expert && gt >= 0 && gt < 2 * MIX_K) {
-            s_lut[2 * MIX_K + gt] =
-                __bfloat162float(gcodebooks[(int64_t) expert * 2 * MIX_K + gt]);
+    // The modes are read here rather than after the barrier because mix_fill_nib's table
+    // contents depend on them (mode 0's levels are the fixed set, not the codebook). A bad
+    // expert must not index modes/codebooks at all, so it fills a mode-0 table it will
+    // never read -- every thread still reaches the barrier below.
+    const int mode  = bad_expert ? 0 : (int) modes[expert];
+    const int gmode = (FUSE_GLU && !bad_expert) ? (int) gmodes[expert] : 0;
+    if (!bad_expert) {
+        mix_fill_nib(s_nib, codebooks + (int64_t) expert * 2 * MIX_K, mode,
+                     (int) threadIdx.x, (int) blockDim.x);
+        if (FUSE_GLU) {
+            mix_fill_nib(s_nib + MIX_NIB_SLAB,
+                         gcodebooks + (int64_t) expert * 2 * MIX_K, gmode,
+                         (int) threadIdx.x, (int) blockDim.x);
         }
     }
     __syncthreads();
@@ -1036,12 +1151,10 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     }
 
     const uint8_t     * edata   = data + (int64_t) expert * nb02;
-    const int           mode    = (int) modes[expert];
     const int           nb      = in / MIX_QK;
     // Gate shares the shape, the expert and the row indices -- only the bytes and the table
     // differ -- so it reuses `nb`, `row0` and the same activation column below.
     const uint8_t * gedata = FUSE_GLU ? gdata + (int64_t) expert * gnb02 : nullptr;
-    const int       gmode  = FUSE_GLU ? (int) gmodes[expert] : 0;
     // Row bases for this warp's MIX_MOE_ROWS rows. A tail warp whose row index is past
     // `out` CLAMPS onto row0 so its loads stay in bounds; that accumulator is simply
     // never stored. `out` is a multiple of MIX_MOE_ROWS for this model (2048), so the
@@ -1098,7 +1211,7 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     for (int w = 0; w < nfull; ++w) {
         mix_moe_window<FUSE_GLU, MIX_MOE_ROWS, true>(
                 sxw, xcol, w * MIX_WARP, MIX_WARP, lane,
-                rowbase, growbase, mode, gmode, s_lut, acc, gacc);
+                rowbase, growbase, mode, gmode, mix_nib_lane(s_nib, lane), acc, gacc);
     }
     // At most ONE partial window, and only for shapes with nb % MIX_WARP != 0 (the model's
     // nb=224 has none). Its block count is a multiple of 4 -- mix_validate_shape forces
@@ -1106,7 +1219,7 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     if (nb % MIX_WARP) {
         mix_moe_window<FUSE_GLU, MIX_MOE_ROWS, false>(
                 sxw, xcol, nfull * MIX_WARP, nb % MIX_WARP, lane,
-                rowbase, growbase, mode, gmode, s_lut, acc, gacc);
+                rowbase, growbase, mode, gmode, mix_nib_lane(s_nib, lane), acc, gacc);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
