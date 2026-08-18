@@ -167,7 +167,7 @@ static __device__ __forceinline__ float4 vec_dot_rocmfp4_fast_q8_1_x4(
     for (int l = 0; l < VDR_ROCMFP4_FAST_Q8_1_MMVQ; ++l) {
         const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
         const int2 v =
-            rocmfp4_get_int_from_codebook_16(aux_q4, kvalues_rocmfp4);
+            rocmfp4_expand_codebook_16(aux_q4);
         sumi0 = ggml_cuda_dp4a(v.x, q80[l + 0], sumi0);
         sumi0 = ggml_cuda_dp4a(v.y, q80[l + 4], sumi0);
         sumi1 = ggml_cuda_dp4a(v.x, q81[l + 0], sumi1);
@@ -715,7 +715,7 @@ static __device__ __forceinline__ void vec_dot_rocmfp4_fast_q8_1_4cols(
 #pragma unroll
     for (int l = 0; l < VDR_ROCMFP4_FAST_Q8_1_MMVQ; ++l) {
         const int packed = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
-        weights[l] = rocmfp4_get_int_from_codebook_16(packed, kvalues_rocmfp4);
+        weights[l] = rocmfp4_expand_codebook_16(packed);
     }
 
     const float weight_scale = rocmfp4_ue4m3_to_fp32_half_finite(bq4->e);
