@@ -467,6 +467,115 @@ static __device__ __forceinline__ int rocmfpx_pack4_fp2_vec_cuda(const uint8_t *
     return rocmfpx_pack4_fp2_bits8_vec_cuda(qs[base >> 2]);
 }
 
+// Expand eight packed ROCmFP4 nibbles into two DP4A operands, table-free.
+//
+// The shared helper `rocmfp4_get_int_from_codebook_16` only has a permute-based
+// fast path under HIP; every other target falls through to a 16-entry table
+// expander, and on CUDA `kvalues_rocmfp4` is a `__device__` global, so each
+// call compiles to EIGHT data-dependent `LDG.E.U8` gathers (measured in SASS:
+// 8 gathers / ~44 instructions).  In batch-1 MMVQ that lookup, not the weight
+// stream, is the throughput limit.
+//
+// CUDA has `prmt` (`__byte_perm`), which llama.cpp already uses for the same
+// job in `get_int_from_table_16` above, so reuse that structure here with the
+// ROCmFP4 codebook inlined as four immediates instead of loaded from the table
+// (0 gathers / ~19 instructions).  Unlike AMD's V_PERM_B32, prmt takes one
+// selector NIBBLE per output byte from the low 16 bits of its third argument,
+// hence the two 16-bit halves and the final even/odd re-gather.
+//
+// Bit-exactness is not an approximation argument: the four immediates are the
+// bytes of `kvalues_rocmfp4` verbatim, and the mapping was verified equal to
+// the table expander for all 2^32 inputs of `q4` on sm_90.  Identical integer
+// operands feed the identical DP4A order, so the float result is unchanged.
+static __device__ __forceinline__ int2 rocmfp4_expand_codebook_16(const int & q4) {
+#if defined(GGML_USE_HIP)
+    // AMD already has a permute path with the codebook inlined; leave it alone.
+    return rocmfp4_get_int_from_codebook_16(q4, kvalues_rocmfp4);
+#elif !defined(GGML_USE_MUSA)
+    constexpr uint32_t values0 = 0x03020100u; //   0,  1,  2,  3
+    constexpr uint32_t values1 = 0x0a080604u; //   4,  6,  8, 10
+    constexpr uint32_t values2 = 0xfdfeff00u; //   0, -1, -2, -3
+    constexpr uint32_t values3 = 0xf6f8fafcu; //  -4, -6, -8,-10
+
+    const uint32_t q4u = (uint32_t) q4;
+    // Low 3 bits of each nibble pick the magnitude, the 4th bit picks the sign
+    // half of the codebook by biasing the selector into the `high` operand.
+    const uint32_t low_high_selection_indices = 0x32103210u | ((q4u & 0x88888888u) >> 1);
+
+    uint32_t tmp[2];
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16*i;
+        const uint32_t low  = __byte_perm(values0, values1, q4u >> shift);
+        const uint32_t high = __byte_perm(values2, values3, q4u >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+
+    // tmp holds the codebook bytes in nibble order; split into even/odd streams.
+    return make_int2((int) __byte_perm(tmp[0], tmp[1], 0x6420),
+                     (int) __byte_perm(tmp[0], tmp[1], 0x7531));
+#else
+    return rocmfp4_get_int_from_codebook_16(q4, kvalues_rocmfp4);
+#endif
+}
+
+// Load `nints` CONSECUTIVE int32 of a ROCmFP4 `qs` array with aligned dword
+// loads instead of 4*nints byte loads.
+//
+// `block_rocmfp4_fast` is 17 bytes (16 qs + 1 scale), so only one block in four
+// starts 4-byte aligned and the portable branch of `rocmfp4_get_qs_i32`
+// assembles every int32 from four separate `LDG.E.U8`.  At VDR=2 that is eight
+// byte loads per `vec_dot`; post-codebook-inlining they are essentially all the
+// memory traffic the kernel issues (measured in SASS: 9 of 9 `LDG.E.U8`, the
+// ninth being the scale).  CUDA cannot issue an unaligned `ld.global.u32` (the
+// HIP branch above can, which is why AMD has no problem here), but 4*nints
+// consecutive bytes span only nints+1 aligned dwords, and `__funnelshift_r`
+// re-assembles each int32 from an adjacent pair.  8 loads -> 3.
+//
+// Bit-exact: the bytes delivered are the same bytes, in the same order, so the
+// DP4A operands and their summation order are unchanged.
+//
+// Bounds.  With `r = addr & 3` the reads cover [addr-r, addr-r+4*nints+3].
+//  - Below `addr`: r > 0 requires a preceding block in the same tensor (block 0
+//    of a tensor is 128-byte aligned => r == 0), so the low end never precedes
+//    the tensor.
+//  - Above: the final dword is issued only when r != 0, and then it reaches at
+//    most 2 bytes past the last block.  That is still in bounds, in both of the
+//    only two cases `ggml_backend_cuda_buffer_type_get_alloc_size()` allows:
+//    ne0 % MATRIX_ROW_PADDING(512) == 0, so ne0/32 is a multiple of 16, so the
+//    tensor's block count is a multiple of 4, so its last block has r == 3 and
+//    the reach is exactly the scale byte; or ne0 % 512 != 0, in which case that
+//    function appends >= one zeroed block (17 B) of padding after ggml_nbytes.
+template <int nints>
+static __device__ __forceinline__ void rocmfp4_load_qs_i32x(
+        const uint8_t * __restrict__ qs, const int & i32, int (&out)[nints]) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#pragma unroll
+    for (int i = 0; i < nints; ++i) {
+        out[i] = rocmfp4_get_qs_i32(qs, i32 + i);
+    }
+#else
+    const uintptr_t   addr  = (uintptr_t) (qs + 4*i32);
+    const uint32_t    r     = (uint32_t) (addr & 3);
+    const uint32_t    shift = 8*r;
+    const uint32_t * __restrict__ p = (const uint32_t *) (addr - r);
+
+    uint32_t d[nints + 1];
+#pragma unroll
+    for (int i = 0; i < nints; ++i) {
+        d[i] = p[i];
+    }
+    // Only the low r bytes of the last dword are consumed, so skip it entirely
+    // when r == 0 -- that is the one case where it would read past the block.
+    d[nints] = r != 0 ? p[nints] : 0;
+
+#pragma unroll
+    for (int i = 0; i < nints; ++i) {
+        out[i] = (int) __funnelshift_r(d[i], d[i + 1], shift);
+    }
+#endif
+}
+
 static __device__ __forceinline__ float vec_dot_rocmfp4_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -479,7 +588,7 @@ static __device__ __forceinline__ float vec_dot_rocmfp4_q8_1(
 #pragma unroll
     for (int l = 0; l < VDR_ROCMFP4_Q8_1_MMVQ; ++l) {
         const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
-        const int2 v = rocmfp4_get_int_from_codebook_16(aux_q4, kvalues_rocmfp4);
+        const int2 v = rocmfp4_expand_codebook_16(aux_q4);
 
         sumi0 = ggml_cuda_dp4a(v.x, q8[l + 0], sumi0);
         sumi1 = ggml_cuda_dp4a(v.y, q8[l + 4], sumi1);
@@ -496,11 +605,13 @@ static __device__ __forceinline__ float vec_dot_rocmfp4_fast_q8_1(
 
     const int * q8 = (const int *) bq8_1->qs + iqs;
 
+    int aux_q4[VDR_ROCMFP4_FAST_Q8_1_MMVQ];
+    rocmfp4_load_qs_i32x<VDR_ROCMFP4_FAST_Q8_1_MMVQ>(bq4->qs, iqs, aux_q4);
+
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_ROCMFP4_FAST_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
-        const int2 v = rocmfp4_get_int_from_codebook_16(aux_q4, kvalues_rocmfp4);
+        const int2 v = rocmfp4_expand_codebook_16(aux_q4[l]);
 
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
