@@ -187,6 +187,20 @@ static void test_feature_gate_tensor_parallel_requirements() {
     TEST_ASSERT(gate_result(
         valid, "qwen35", PlacementBackend::Cuda).empty());
 
+    // GQH planar pads the weight row stride; tensor parallelism slices rows on the
+    // tight stride, so the same config must be refused once planar is requested.
+    BackendFeatureConfig planar;
+    planar.gqh_planar_requested = true;
+    TEST_ASSERT(!gate_result(
+        valid, "qwen35", PlacementBackend::Cuda, planar).empty());
+    // ...and layer split, which keeps whole tensors per rank, must stay allowed.
+    BackendArgs layer_split;
+    layer_split.model_path = "/nonexistent/model.gguf";
+    TEST_ASSERT(parse_placement_device_list(
+        "cuda:0,cuda:1", layer_split.device));
+    TEST_ASSERT(gate_result(
+        layer_split, "qwen35", PlacementBackend::Cuda, planar).empty());
+
     BackendArgs missing_devices;
     missing_devices.model_path = "/nonexistent/model.gguf";
     missing_devices.device.split_mode = TargetSplitMode::Tensor;

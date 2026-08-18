@@ -24,6 +24,7 @@
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
+#include "gqh-stride.h"   // gqh_planar_enabled (GQH planar layout opt-in)
 
 #include <algorithm>
 #include <csignal>
@@ -613,6 +614,8 @@ int main(int argc, char ** argv) {
     backend_features.routing_stats_requested =
         sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
     backend_features.adaptive_experts_requested = adaptive_experts_set;
+    // Single-source the flag with the ggml kernels rather than re-reading the env name.
+    backend_features.gqh_planar_requested = gqh_planar_enabled() != 0;
     const BackendPreparation backend_preparation =
         prepare_backend(bargs, backend_features);
     if (!backend_preparation.ok()) {

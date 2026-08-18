@@ -95,6 +95,15 @@ std::string check_feature_compatibility(
         if (args.device.is_mixed_layer_split()) {
             return "tensor parallelism requires homogeneous local devices";
         }
+        // GQH planar splits each weight ROW into 64 B-aligned planes with a padded row
+        // stride (ggml/src/gqh-stride.h). TP slices a tensor across ranks and derives
+        // each slice from the tight ggml row size, so the two disagree on where row i
+        // starts. The planar upload would trip its own size assertion; refuse here so
+        // the reason is legible. Layer split is fine -- each rank holds whole tensors.
+        if (features.gqh_planar_requested) {
+            return "tensor parallelism is incompatible with DFLASH_GQH_PLANAR=1 "
+                   "(planar pads the GQH row stride; TP slices rows on the tight stride)";
+        }
         if (args.remote_target_shard.enabled()) {
             return "tensor parallelism is incompatible with --target-shard-ipc-bin";
         }

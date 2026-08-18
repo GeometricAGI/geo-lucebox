@@ -25,6 +25,11 @@ struct BackendFeatureConfig {
     // time rather than through BackendArgs.
     bool routing_stats_requested = false;    // --freq / --collect-routing
     bool adaptive_experts_requested = false; // --adaptive-experts
+
+    // GQH 4-plane device layout (DFLASH_GQH_PLANAR=1). Recorded here rather than
+    // read from the environment inside the gate so the gate stays a pure function of
+    // its arguments and test_feature_gate is not affected by the ambient env.
+    bool gqh_planar_requested = false;
 };
 
 // A superset of all per-architecture config fields. The factory reads only
