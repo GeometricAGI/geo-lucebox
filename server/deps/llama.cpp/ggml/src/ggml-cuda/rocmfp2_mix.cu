@@ -369,6 +369,15 @@ __device__ __forceinline__ float mix_fp2_fixed(uint32_t code) {
 #define MIX_NIB_SHIFT    7                                // log2(MIX_NIB_COPIES * 8 B)
 #define MIX_NIB_SLAB     (MIX_NIB_ENTRIES * MIX_NIB_COPIES)  // float2 per tensor = 4 KB
 
+// MIX_NIB_SHIFT is hand-computed, and mix_nib_off folds it into a MASK as well as a shift.
+// Changing MIX_NIB_COPIES without it would silently read the wrong table entry -- caught by
+// the harness hashes, but only if someone runs them. Make it a compile error instead.
+static_assert(MIX_NIB_COPIES * sizeof(float2) == (1u << MIX_NIB_SHIFT),
+              "MIX_NIB_SHIFT must be log2(MIX_NIB_COPIES * sizeof(float2))");
+// 16 copies is not a tunable: a 64-bit LDS phase is 16 lanes, so it is exactly the number
+// needed for one copy per bank pair.
+static_assert(MIX_NIB_COPIES == 16, "one table copy per 8 B bank pair of a 16-lane phase");
+
 // Byte offset of nibble j's entry from the lane's copy base -- nibble(j) * 128 -- in one
 // shift and one mask rather than extract-then-scale. `j` is a compile-time constant in
 // the fully-unrolled fold, so the shift direction folds away. The highest bit touched is
