@@ -159,6 +159,11 @@ void ggml_cuda_gqh2c_decode(const void * wire, float * dst,
 #define GQH_WARP          32
 #define GQH_MATVEC_WARPS   4
 #define GQH_PER_LANE       (GQH_SUPERBLOCK / GQH_WARP)   // 8
+// Columns handled by one pass over the weights. The weight matrix is the whole
+// DRAM cost of a decode matvec, so re-reading it per column makes an N-slot server
+// N times slower than it should be -- measured as 8 slots buying only 1.35x over
+// single-stream. Every column is accumulated against one load instead.
+#define GQH_MAX_COLS       8
 
 // Down-shift shuffle confined to a 32-lane logical group. The explicit width is
 // what keeps the reduction self-contained on wave64 (GFX8/9), and is a no-op on
@@ -198,13 +203,12 @@ static __device__ __forceinline__ float gqh_level(int code, const float4 & m) {
 template <bool IS_GQH3>
 static __global__ void gqh_matvec_kernel(
         const uint8_t * __restrict__ data, const float * __restrict__ x,
-        float * __restrict__ y, int in, int out, float tensor_scale, float4 mag,
+        float * __restrict__ y, int in, int out, int ncols, float tensor_scale, float4 mag,
         int64_t x_col_stride, int64_t y_col_stride) {
     const int sb_bytes = IS_GQH3 ? GQH3_SB_BYTES : GQH2H_SB_BYTES;
     const int warps_per_block = blockDim.x / GQH_WARP;
     const int row  = blockIdx.x * warps_per_block + (threadIdx.x / GQH_WARP);
     const int lane = threadIdx.x % GQH_WARP;
-    const int col  = blockIdx.y;
 
     // ratio/15 in LDS, not constant memory: the index is the lane's sub-block, so
     // it is divergent, and a divergent constant-bank load serialises per address.
@@ -220,12 +224,11 @@ static __global__ void gqh_matvec_kernel(
 
     const int nsb = in / GQH_SUPERBLOCK;
     const uint8_t * __restrict__ rowbase = data + (int64_t) row * nsb * sb_bytes;
-    const float   * __restrict__ xc      = x + (int64_t) col * x_col_stride;
 
     const int j0  = lane * GQH_PER_LANE;   // this lane's first weight in the superblock
     const int sub = j0 >> 4;               // two lanes share a 16-weight sub-block
 
-    float acc = 0.0f;
+    float acc[GQH_MAX_COLS] = { 0.0f };
     for (int sb = 0; sb < nsb; ++sb) {
         const uint8_t * __restrict__ b = rowbase + (int64_t) sb * sb_bytes;
 
@@ -236,28 +239,51 @@ static __global__ void gqh_matvec_kernel(
         const uint8_t rb = b[1 + (sub >> 1)];
         const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
 
-        const float4 x0 = *(const float4 *) (xc + sb * GQH_SUPERBLOCK + j0);
-        const float4 x1 = *(const float4 *) (xc + sb * GQH_SUPERBLOCK + j0 + 4);
-        const float xs[GQH_PER_LANE] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
-
         uint16_t lo2;
         memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));   // 8 codes x 2 bits
         const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
 
+        // Decode this lane's 8 weights ONCE, then reuse them for every column.
+        float w[GQH_PER_LANE];
 #pragma unroll
         for (int t = 0; t < GQH_PER_LANE; ++t) {
             const int lo = (lo2 >> (2 * t)) & 0x03;
             const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
-            acc += (gqh_level<IS_GQH3>(code, mag) * s_b) * xs[t];
+            w[t] = gqh_level<IS_GQH3>(code, mag) * s_b;
+        }
+
+        // Fully unrolled so acc[]/xs[] stay in registers; the per-column term order
+        // is unchanged, so each output is bit-identical to the one-column-per-block
+        // version this replaces.
+#pragma unroll
+        for (int c = 0; c < GQH_MAX_COLS; ++c) {
+            if (c >= ncols) {
+                continue;
+            }
+            const float * __restrict__ xcc = x + (int64_t) c * x_col_stride
+                                               + sb * GQH_SUPERBLOCK + j0;
+            const float4 x0 = *(const float4 *) (xcc);
+            const float4 x1 = *(const float4 *) (xcc + 4);
+            const float xs[GQH_PER_LANE] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                acc[c] += w[t] * xs[t];
+            }
         }
     }
 
 #pragma unroll
-    for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
-        acc += gqh_warp_shfl_down(acc, off);
-    }
-    if (lane == 0) {
-        y[(int64_t) col * y_col_stride + row] = acc;
+    for (int c = 0; c < GQH_MAX_COLS; ++c) {
+        if (c >= ncols) {
+            continue;
+        }
+#pragma unroll
+        for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+            acc[c] += gqh_warp_shfl_down(acc[c], off);
+        }
+        if (lane == 0) {
+            y[(int64_t) c * y_col_stride + row] = acc[c];
+        }
     }
 }
 
@@ -319,8 +345,8 @@ bool ggml_cuda_gqh_mul_mat_vec(
     if (type != GGML_TYPE_GQH3 && type != GGML_TYPE_GQH2_H && type != GGML_TYPE_GQH2_C) {
         return false;
     }
-    if (in % GQH_SUPERBLOCK != 0 || ncols <= 0) {
-        return false;
+    if (in % GQH_SUPERBLOCK != 0 || ncols <= 0 || ncols > GQH_MAX_COLS) {
+        return false;   // wider batches keep the dequant->GEMM path
     }
     // The kernel reads activations as float4. in is a multiple of 256 and lanes are
     // 8 floats apart, so every offset is 32-byte aligned -- but only if the base is
@@ -354,14 +380,14 @@ bool ggml_cuda_gqh_mul_mat_vec(
         memcpy(&mag.x, &GQH2H_GRID[code][2], sizeof(float));
     }
 
-    const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, ncols, 1);
+    const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 1, 1);
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
     if (type == GGML_TYPE_GQH3) {
         gqh_matvec_kernel<true><<<blocks, threads, 0, stream>>>(
-            (const uint8_t *) vx, x, y, in, out, scale, mag, x_col_stride, y_col_stride);
+            (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
     } else {
         gqh_matvec_kernel<false><<<blocks, threads, 0, stream>>>(
-            (const uint8_t *) vx, x, y, in, out, scale, mag, x_col_stride, y_col_stride);
+            (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, x_col_stride, y_col_stride);
     }
     return true;
 }

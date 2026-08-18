@@ -47,7 +47,7 @@ void ggml_cuda_gqh2c_decode(const void * wire,
 // Fused batch-1..MMVQ-width matvec: y[out, ncols] = W[out, in] . x[in, ncols],
 // decoding inline instead of the dequant->cuBLAS round trip. Returns false when
 // the tensor is not registered or the rung has no fused kernel, so the caller
-// keeps its fallback. gqh2_c is not handled yet.
+// keeps its fallback. All three rungs have a fused kernel.
 bool ggml_cuda_gqh_mul_mat_vec(
         ggml_type type, const void * vx, const float * x, float * y,
         int in, int out, int ncols, int64_t x_col_stride, int64_t y_col_stride,
