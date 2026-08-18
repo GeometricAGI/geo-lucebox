@@ -594,6 +594,88 @@ __device__ __forceinline__ void mix_block_accum2(
     mix_block_accum_x(b1, xv, mode, lut, acc1);
 }
 
+// ---- LDS activation staging for the MoE fold ----
+//
+// The problem this solves. Lane L owns blocks L, L+MIX_WARP, ..., so lane L consumes
+// activations xcol[32*L .. 32*L+31] -- consecutive lanes are 32 floats = 128 B apart.
+// A warp-wide float4 activation request therefore touches 32 DISTINCT 128 B lines and
+// uses only 16 B of each: 8 requests x 32 lines = 256 L1 line-lookups per
+// warp-iteration, which is why ncu put this kernel at 89.7% (pre-iter-1) / 66.6%
+// (post) L1/TEX throughput with DRAM at <8%. It is bound on L1 tag-lookup
+// wavefronts, not bandwidth.
+//
+// But the warp's 32 lanes together consume a CONTIGUOUS 1024-float (4 KB) window per
+// iteration -- only the lane->element map is a permutation. So load that window
+// COALESCED (each request 32 consecutive float4 = 512 B = 4 lines: 8 x 4 = 32
+// line-lookups, an 8x cut) into LDS, then let each lane read its own 32 floats back.
+//
+// The swizzle. A block's 32 floats are 8 float4 chunks; chunk c of the window's local
+// block b lands at word `b*MIX_QK + 4*((c + b) & 7)`. A 128-bit LDS access is serviced
+// in phases of 8 lanes (8 x 16 B = 128 B = all 32 banks), so conflict-freedom only
+// needs the 8 lanes of a phase to hit disjoint bank quads:
+//   read-back  (b = lane, c fixed): bank = 4*((c + lane) & 7); over any 8 consecutive
+//     lanes (c + lane) & 7 takes all 8 values -> 8 disjoint quads = all 32 banks.
+//   fill (b = g>>3, c = g&7, g = lane + i*MIX_WARP): within an 8-lane phase b is fixed
+//     and c runs 0..7 -> again all 8 values.
+// A rotate rather than the 36-float pad the obvious fix would use: same
+// conflict-freedom, but 4 KB/warp instead of 4.5 KB and no dead words.
+__device__ __forceinline__ int mix_swz_word(int b, int c) {
+    return b * MIX_QK + 4 * ((c + b) & (MIX_QK / 4 - 1));
+}
+
+// Stage `nblk` blocks' worth of a contiguous activation window into this warp's LDS
+// buffer with coalesced float4 loads. Bit-exact: the SAME f32 values reach the fold,
+// only the route changes.
+//
+// The trip count is exact, never ragged: mix_validate_shape() forces in % 128 == 0, so
+// nb % 4 == 0, and `nblk` is either MIX_WARP or nb % MIX_WARP -- a multiple of 4 either
+// way -- hence nblk * (MIX_QK/4) is a multiple of MIX_WARP. No lane sits out a
+// half-iteration, and the caller's __syncwarp() sees a fully-written buffer.
+//
+// The alignment test is warp-uniform (the window base is a multiple of MIX_QK floats =
+// 128 B, so it inherits xcol's alignment), so the branch costs no divergence. The
+// scalar arm is live: ggml can hand this path a strided/offset src1 column.
+// FULL says the window is a whole MIX_WARP blocks, which makes `iters` the compile-time
+// constant MIX_QK/4 and lets the fill unroll completely. It matters: with a runtime trip
+// count nvcc emits a rolled loop with an unroll-remainder epilogue, and the model's shape
+// (nb=224 = 7 full windows) would pay that even though it never runs a partial window.
+template <bool FULL>
+__device__ __forceinline__ void mix_stage_window(
+        float * __restrict__ s, const float * __restrict__ xw, int nblk, int lane) {
+    const int iters = FULL ? MIX_QK / 4 : nblk * (MIX_QK / 4) / MIX_WARP;
+    if ((((uintptr_t) xw) & 15u) == 0) {
+        const float4 * __restrict__ p4 = (const float4 *) xw;
+        #pragma unroll
+        for (int i = 0; i < iters; ++i) {
+            const int g = lane + i * MIX_WARP;
+            const float4 v = p4[g];
+            float * __restrict__ d = s + mix_swz_word(g / (MIX_QK / 4), g & (MIX_QK / 4 - 1));
+            d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < iters; ++i) {
+            const int g = lane + i * MIX_WARP;
+            const float * __restrict__ q = xw + 4 * g;
+            float * __restrict__ d = s + mix_swz_word(g / (MIX_QK / 4), g & (MIX_QK / 4 - 1));
+            d[0] = q[0]; d[1] = q[1]; d[2] = q[2]; d[3] = q[3];
+        }
+    }
+}
+
+// Read local block `b`'s 32 activations back out of the staged window, ascending j, as
+// 8 conflict-free 128-bit LDS loads. `s` is 16 B aligned and mix_swz_word is a multiple
+// of 4 words, so every float4 access is aligned.
+__device__ __forceinline__ void mix_read_x32(
+        const float * __restrict__ s, int b, float (&xv)[MIX_QK]) {
+    #pragma unroll
+    for (int c = 0; c < MIX_QK / 4; ++c) {
+        const float4 v = *(const float4 *) (s + mix_swz_word(b, c));
+        xv[4*c + 0] = v.x; xv[4*c + 1] = v.y;
+        xv[4*c + 2] = v.z; xv[4*c + 3] = v.w;
+    }
+}
+
 // One block of the MoE fold: stage the block's 32 activations ONCE, then fold them
 // against this warp's ROWS `up` rows and (fused only) its ROWS `gate` rows.
 //
@@ -626,16 +708,15 @@ __device__ __forceinline__ void mix_moe_block_fold(
         // so asserting no-alias here would be a lie for that shape. Every base is
         // read-only const, so permitting the aliasing costs nothing.
         const uint8_t * const (&rowbase)[ROWS], const uint8_t * const (&growbase)[ROWS],
-        const float * __restrict__ xcol, int b,
+        const float (&xv)[MIX_QK], int b,
         int mode, int gmode, const float * __restrict__ lut,
         float (&acc)[ROWS], float (&gacc)[ROWS]) {
     const int64_t off = (int64_t) b * MIX_BLOCK_BYTES;
-    // Issue EVERY load this block needs -- the activations and all 2*ROWS weight
-    // blocks -- before any FMA. Leaving the loads inside per-row accumulate calls let
-    // nvcc serialise row i's load behind row i-1's 32-term fold, which on a
-    // latency-bound kernel is the whole cost.
-    float xv[MIX_QK];
-    mix_load_x32(xcol + b * MIX_QK, xv);
+    // Issue all 2*ROWS weight-block loads before any FMA. Leaving the loads inside
+    // per-row accumulate calls let nvcc serialise row i's load behind row i-1's
+    // 32-term fold, which on a latency-bound kernel is the whole cost. The
+    // activations arrive pre-staged in `xv` (the caller reads them out of LDS), so
+    // this block issues nothing to L1 but weights.
     MixBlock w[ROWS], gw[ROWS];
     #pragma unroll
     for (int i = 0; i < ROWS; ++i) w[i] = mix_block_load(rowbase[i] + off);
@@ -649,6 +730,32 @@ __device__ __forceinline__ void mix_moe_block_fold(
         #pragma unroll
         for (int i = 0; i < ROWS; ++i) mix_block_fma(gw[i], xv, gmode, lut + 2 * MIX_K, gacc[i]);
     }
+}
+
+// One MIX_WARP-block window of the MoE fold: stage this warp's activation window into
+// LDS, then fold the lane's own block against it. FULL drops both the runtime trip count
+// in the fill and the `lane < nblk` predicate, so the hot path carries neither.
+template <bool FUSE_GLU, int ROWS, bool FULL>
+__device__ __forceinline__ void mix_moe_window(
+        float * __restrict__ sxw, const float * __restrict__ xcol, int base, int nblk, int lane,
+        const uint8_t * const (&rowbase)[ROWS], const uint8_t * const (&growbase)[ROWS],
+        int mode, int gmode, const float * __restrict__ lut,
+        float (&acc)[ROWS], float (&gacc)[ROWS]) {
+    mix_stage_window<FULL>(sxw, xcol + (int64_t) base * MIX_QK, nblk, lane);
+    // Required, not warp-synchrony folklore: sm_90 schedules threads independently, so a
+    // lane's LDS writes are not ordered against a sibling lane's reads without it.
+    // Warp-scoped, so unlike __syncthreads() it does not couple the block's two warps and
+    // cost the latency hiding iteration 2 showed this kernel lives on.
+    __syncwarp();
+    if (FULL || lane < nblk) {
+        float xv[MIX_QK];
+        mix_read_x32(sxw, lane, xv);
+        mix_moe_block_fold<FUSE_GLU, ROWS>(rowbase, growbase, xv, base + lane,
+                                           mode, gmode, lut, acc, gacc);
+    }
+    // WAR: a lane that races ahead to the next window's fill must not overwrite slots a
+    // sibling lane is still reading.
+    __syncwarp();
 }
 
 // The lane's block loop is unrolled by MIX_UNROLL into a SINGLE accumulator kept
@@ -855,7 +962,7 @@ __global__ void mix_matvec_rocmfp2_slice_kernel(
 // Naming follows the mmvq fusion convention: the PRIMARY tensor is `up` (src0 of the surviving
 // mul_mat_id) and `gate` arrives as the extra operand, because
 // ggml_cuda_op_swiglu_ds4_single(gate, up, limit) is not symmetric -- silu() is applied to gate.
-template <bool FUSE_GLU, int MIX_MOE_ROWS>
+template <bool FUSE_GLU, int MIX_MOE_ROWS, int WARPS>
 __global__ void mix_matvec_rocmfp2_moe_kernel(
         const uint8_t * __restrict__ data, size_t nb02,
         const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
@@ -870,8 +977,11 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
         const uint8_t * __restrict__ gdata, size_t gnb02,
         const nv_bfloat16 * __restrict__ gcodebooks, const uint8_t * __restrict__ gmodes,
         float glu_limit) {
-    const int warps_per_block = blockDim.x / MIX_WARP;
-    const int warp  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
+    // WARPS is a template parameter, not blockDim.x/MIX_WARP, because it also sizes the
+    // per-warp LDS activation buffer below -- a runtime warp count could index past it.
+    // Both mul_mat_id wrappers launch WARPS * MIX_WARP threads.
+    const int wib   = threadIdx.x / MIX_WARP;   // warp index within the block
+    const int warp  = blockIdx.x * WARPS + wib;
     const int row0  = warp * MIX_MOE_ROWS;      // MIX_MOE_ROWS output rows per warp
     const int lane  = threadIdx.x % MIX_WARP;
     const int slot  = blockIdx.y;
@@ -892,6 +1002,15 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // Both tables in one array so the staging stays a single guarded write per thread and one
     // barrier. Gate's table occupies [2*MIX_K, 4*MIX_K).
     __shared__ float s_lut[FUSE_GLU ? 4 * MIX_K : 2 * MIX_K];
+    // One MIX_WARP-block activation window per warp (4 KB), swizzled -- see
+    // mix_swz_word. PER-WARP rather than shared by the whole block on purpose: both
+    // warps do walk the identical block sequence, so one buffer would serve both, but
+    // that needs __syncthreads() in the hot loop and this block has only 2 warps.
+    // Iteration 2 measured that trading warp-level independence for fewer loads loses
+    // here (MIX_MOE_ROWS=4 on the fused kernel: 1.6x fewer sectors, 0.96x the speed),
+    // and cross-warp sharing would only take activation line-lookups 32 -> 16 after
+    // coalescing has already taken them 256 -> 32. Not worth a block barrier.
+    __shared__ __align__(16) float s_xw[WARPS][MIX_WARP * MIX_QK];
     if (!bad_expert && (int) threadIdx.x < 2 * MIX_K) {
         s_lut[threadIdx.x] =
             __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
@@ -959,18 +1078,35 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     float gacc[MIX_MOE_ROWS];
     #pragma unroll
     for (int i = 0; i < MIX_MOE_ROWS; ++i) { acc[i] = 0.0f; gacc[i] = 0.0f; }
-    int blk = lane;
-    for (; blk + (MIX_UNROLL - 1) * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
-        #pragma unroll
-        for (int u = 0; u < MIX_UNROLL; ++u) {
-            const int b = blk + u * MIX_WARP;
-            mix_moe_block_fold<FUSE_GLU, MIX_MOE_ROWS>(rowbase, growbase, xcol, b,
-                                                       mode, gmode, s_lut, acc, gacc);
-        }
+    // Walk the row in MIX_WARP-block windows. Lane L still folds blocks L, L+MIX_WARP,
+    // ... in ascending order into its own accumulator, exactly as the strided loop this
+    // replaces did -- so every acc keeps its bit-identical left-fold summation order.
+    // What changed is only how the activations reach `xv`: staged once per window,
+    // coalesced, through LDS instead of 8 32-line-wide global requests per block.
+    //
+    // Windowing (rather than the old `blk += MIX_WARP` stride) is what makes the
+    // staging legal at all: with nb % MIX_WARP != 0 the strided loop lets lanes exit at
+    // different trip counts, so a departed lane would stop contributing to the
+    // cooperative fill while its neighbours read slots nobody wrote.
+    //
+    // This also retires the MIX_UNROLL path, which was dead code: its guard
+    // `blk + 7*MIX_WARP < nb` is false on the first test at the model's nb=224, so every
+    // block already went through the tail loop. Ordering is unaffected either way --
+    // the unrolled body visited the same ascending b sequence.
+    float * __restrict__ sxw = s_xw[wib];
+    const int nfull = nb / MIX_WARP;
+    for (int w = 0; w < nfull; ++w) {
+        mix_moe_window<FUSE_GLU, MIX_MOE_ROWS, true>(
+                sxw, xcol, w * MIX_WARP, MIX_WARP, lane,
+                rowbase, growbase, mode, gmode, s_lut, acc, gacc);
     }
-    for (; blk < nb; blk += MIX_WARP) {
-        mix_moe_block_fold<FUSE_GLU, MIX_MOE_ROWS>(rowbase, growbase, xcol, blk,
-                                                   mode, gmode, s_lut, acc, gacc);
+    // At most ONE partial window, and only for shapes with nb % MIX_WARP != 0 (the model's
+    // nb=224 has none). Its block count is a multiple of 4 -- mix_validate_shape forces
+    // in % 128 == 0 -- so the fill's trip count stays exact there too.
+    if (nb % MIX_WARP) {
+        mix_moe_window<FUSE_GLU, MIX_MOE_ROWS, false>(
+                sxw, xcol, nfull * MIX_WARP, nb % MIX_WARP, lane,
+                rowbase, growbase, mode, gmode, s_lut, acc, gacc);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
@@ -1059,7 +1195,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     // so a workgroup of `warps_per_block` warps covers that many times as many rows.
     const int rows_per_block = MIX_MOE_ROWS_UNFUSED * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    mix_matvec_rocmfp2_moe_kernel<false, MIX_MOE_ROWS_UNFUSED><<<grid, dim3(threads), 0, stream>>>(
+    mix_matvec_rocmfp2_moe_kernel<false, MIX_MOE_ROWS_UNFUSED, warps_per_block><<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
         src1, ids, dst, in, out, e.n_experts, ne11,
         ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
@@ -1099,7 +1235,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
     const int threads = warps_per_block * MIX_WARP;
     const int rows_per_block = MIX_MOE_ROWS_FUSED * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    mix_matvec_rocmfp2_moe_kernel<true, MIX_MOE_ROWS_FUSED><<<grid, dim3(threads), 0, stream>>>(
+    mix_matvec_rocmfp2_moe_kernel<true, MIX_MOE_ROWS_FUSED, warps_per_block><<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
         src1, ids, dst, in, out, eu.n_experts, ne11,
         ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
