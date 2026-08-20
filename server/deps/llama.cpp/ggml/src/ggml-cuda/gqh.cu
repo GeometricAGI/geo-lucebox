@@ -310,6 +310,86 @@ void ggml_cuda_gqh2c_decode(const void * wire, float * dst,
 // this device, so there is at most ~8% left in it from ANY amount of extra depth.
 #define GQH_MATVEC_DEPTH   3
 
+// Output rows one warp owns on the SPECIALIZED multi-column arm, and the whole reason
+// that arm exists.
+//
+// A multi-column matvec reads the weight stream ONCE for all N columns, but the generic
+// instantiation re-reads the ACTIVATIONS per (row, superblock, column): 1024 B per warp
+// per column against 137 B of wire. Over a forward that is ~100 GB of x reads PER COLUMN
+// (105 M superblock-rows x 1 KB), and the measured llama-bench pp ladder --
+// 42.4 / 56.8 / 64.0 / 71.9 / 80.1 ms per forward at N = 1 / 2 / 3 / 4 / 5 -- puts each
+// extra column at ~8 ms, i.e. ~12 TB/s effective. That is AT L0-hit bandwidth for 64 CUs,
+// so those loads are not latency-starved; there are simply too many of them, and the only
+// fix is to issue fewer. Every row a warp owns folds the SAME activations, so ROWS rows
+// per warp cut the activation traffic by ROWS -- the same lever GQH_MATVEC_ROWS pulls on
+// the batch-1 path (worth 1.3-1.6x there), which is why the hoist below and this constant
+// are one change and not two: at ROWS == 1 the hoist has nothing to share.
+//
+// Swept on the R9700 against a SAME-BINARY control (GGML_GQH_MULTICOL=0 sends every
+// ncols > 1 dispatch back to the generic instantiation), llama-bench pp3 per-forward ms,
+// -r 24, one build per row. The control reproduces to 0.3% across all four builds, which
+// is what makes the cross-build comparison of the candidates fair:
+//
+//   ROWS   pp3 ms   control   speedup   VGPRs (GQH4 / GQH3)   occupancy
+//     1     50.41    59.31     1.177x        47 /  56            16
+//     2     46.35    59.41     1.282x        68 /  83            16
+//     3     42.76    59.43     1.390x        87 /  97         16 / 12   <- landed
+//     4     43.15    59.49     1.379x       102 / 122         12 / 10
+//
+// **That sweep predates the wave-uniform addressing (UNIFORM_ADDR in the kernel), which
+// deleted ~16 VGPRs of 64-bit address chain from every instantiation on this arm and so
+// moved the cliff this table is fitted against. RE-MEASURED after it, same rig:**
+//
+//   ROWS   pp3 ms   control   speedup   VGPRs (GQH4 / GQH3)   occupancy
+//     3     39.44    59.20     1.501x        71 /  93            16      <- landed
+//     4     39.31    59.03     1.502x        85 /  93            16
+//     5       --       --        --          98 / 106         12 / 12
+//
+// So ROWS == 4 is no longer refuted by occupancy -- it is simply a NON-EVENT (0.33%,
+// inside the ~0.5% cross-build spread of this rig; ROWS == 3 itself read 39.26 and 39.44
+// on two builds). The traffic it saves is 1/12 of the activation stream, and after the
+// addressing fix that stream is no longer what this arm is waiting on. 3 stays because it
+// is the measured point with the most headroom (25 VGPRs to the cliff, against 11) and
+// because the NCOLS axis spends ~10-11 VGPRs per column out of that headroom -- which is
+// what raising GQH_MULTICOL_SPEC_MAX will need. ROWS == 5 is refuted outright at 98.
+//
+// GQH3 was the loser of the old fit at 97 VGPRs (12 waves/SIMD, one over the cliff); it is
+// now 93 and gets its 16 waves back for free. Read `.amdhsa_next_free_vgpr` (or clang
+// -Rpass-analysis=kernel-resource-usage) before moving this constant either way.
+#define GQH_MULTICOL_ROWS  3
+
+// Widest ncols that gets an exact-width instantiation. These kernels write EXACTLY
+// NCOLS_MAX columns -- their `c >= ncols` guard is compile-time dead, which is what
+// collapses the superblock body to one basic block and lets the activation read leave the
+// row loop -- so the launcher MUST dispatch them at ncols == NCOLS_MAX, and anything
+// wider stays on the generic runtime-guarded instantiation. Bounded by register pressure,
+// not by taste: acc[ROWS][NCOLS] + xshared[NCOLS][8] both scale with NCOLS, and the arm
+// has to stay at or under 96 VGPRs to keep 16 waves/SIMD (see the sweep in
+// gqh_multicol_launch).
+//
+// Measured VGPRs / occupancy at ROWS == 3, `clang -Rpass-analysis=kernel-resource-usage`,
+// gfx1201, no spills and no scratch anywhere in the table:
+//
+//   NCOLS      2        3        4        5        6         7
+//   GQH4    61/16    72/16    83/16    94/16    95/16     99/12
+//   GQH3    85/16    92/16    92/16    96/16    95/16    100/12
+//   GQH2_H  60/16    71/16    82/16    93/16    97/12     99/12
+//
+// So the wall is at 6-7, not at 5: the NCOLS axis costs ~11 VGPRs per column up to 4 and
+// then flattens as the allocator starts folding the column addressing, which is why 5
+// lands at 93-96 (GQH3 sits exactly ON the 96 cliff and keeps its 16 waves) instead of
+// the ~103 a linear extrapolation from NCOLS 4 predicts. 5 is the cap because it is the
+// widest an MTP verify batch reaches: --spec-draft-n-max 4 verifies 4 drafts + 1 = 5
+// columns. 6 would need a GQH2_H gate (97 VGPRs, 12 waves) and nothing dispatches it.
+#define GQH_MULTICOL_SPEC_MAX 5
+
+// Activation base POINTERS the exact-width arm carries; every further column is addressed
+// as base 0 plus a uniform 32-bit byte offset. This is a statement about how many SGPR
+// base pairs LLVM hands that load group, not a tuning knob -- the hoist in
+// gqh_matvec_kernel carries the per-width dump it is read off. Re-read that dump (and the
+// v_dual_fmac counts next to it) before moving this either way.
+#define GQH_MULTICOL_XBASES 2
+
 // Instruction classes gqh_sched_fence() still lets the scheduler move across:
 // VALU | SALU | DS read | DS write | transcendental. Only VMEM is pinned, because
 // VMEM is the prefetch -- the LDS gathers and the activation loads stay free to
@@ -389,10 +469,19 @@ static __device__ __forceinline__ gqh_wire gqh_wire_load(
 // VALU adds comes back. in <= 17408, so sb*1024 + j0*4 cannot overflow 32 bits, and
 // alignment is unchanged: j0 is a multiple of 8 floats, so every offset is 32-byte
 // aligned and the 128-bit loads stay legal.
+// `col_off` is a WAVE-UNIFORM byte offset added to that 32-bit lane offset rather than to
+// the base pointer, and it exists as a parameter for exactly that reason -- a caller that
+// baked it into `xc` would get a fourth, fifth, ... base pointer, which is the thing the
+// xcol hoist in gqh_matvec_kernel could not make LLVM keep in SGPRs. It does not change
+// the overflow bound in any way that matters: the widest x on this arm is
+// GQH_MULTICOL_SPEC_MAX columns of `in` floats (5 x 17408 x 4 B = 348 KB), so
+// `sb*1024 + j0*4 + col_off` still cannot reach 32 bits, and col_off is a multiple of
+// `in`*4 (>= 20 KB), so the 32-byte alignment the 128-bit loads need is unchanged.
 static __device__ __forceinline__ void gqh_load_x(
-        const float * __restrict__ xc, int sb, int j0, float (&xs)[GQH_PER_LANE]) {
+        const float * __restrict__ xc, int sb, int j0, float (&xs)[GQH_PER_LANE],
+        uint32_t col_off = 0) {
     const uint8_t * __restrict__ xb = (const uint8_t *) xc;
-    const uint32_t xo = (uint32_t) (sb * GQH_SUPERBLOCK + j0) * sizeof(float);
+    const uint32_t xo = (uint32_t) (sb * GQH_SUPERBLOCK + j0) * sizeof(float) + col_off;
     const float4 x0 = *(const float4 *) (xb + xo);
     const float4 x1 = *(const float4 *) (xb + xo + sizeof(float4));
     xs[0] = x0.x; xs[1] = x0.y; xs[2] = x0.z; xs[3] = x0.w;
@@ -560,14 +649,26 @@ static __global__ void gqh_matvec_kernel(
     }
     constexpr bool IS_GQH3 = RUNG == GGML_TYPE_GQH3;
     constexpr bool IS_GQH4 = RUNG == GGML_TYPE_GQH4;
+    // Exact-width multi-column instantiation: ncols == NCOLS_MAX by the launcher's
+    // construction, so the column guards below are compile-time dead and the activation
+    // read can be hoisted out of the row loop and shared by all ROWS rows. The generic
+    // NCOLS_MAX == GQH_MAX_COLS instantiation keeps its runtime guard and its per-column
+    // load, so its codegen does not move (ISA-diffed).
+    constexpr bool XSHARED = NCOLS_MAX > 1 && NCOLS_MAX < GQH_MAX_COLS;
+    // Arms that hand LLVM the uniformity it cannot prove. `row` is wave-uniform by
+    // construction (one warp owns ROWS consecutive rows) and so is a superblock's E4M3
+    // byte, but divergence analysis cannot see through threadIdx.x / GQH_WARP -- and a
+    // pointer it thinks is divergent costs a 64-bit VALU address chain
+    // (v_add_co_u32 + v_add_co_ci_u32, each with an s_wait_alu depctr hazard behind it)
+    // on EVERY global load in the loop, where an SGPR base plus a 32-bit lane offset
+    // would do. The generic NCOLS_MAX == GQH_MAX_COLS instantiation is deliberately
+    // excluded: it is the same-binary A/B control (GGML_GQH_MULTICOL=0), so its codegen
+    // has to stay byte-for-byte what it was.
+    constexpr bool UNIFORM_ADDR = NCOLS_MAX == 1 || XSHARED;
     const int sb_bytes = IS_GQH3 ? GQH3_SB_BYTES : (IS_GQH4 ? GQH4_SB_BYTES : GQH2H_SB_BYTES);
     const int warps_per_block = blockDim.x / GQH_WARP;
-    // Batch-1 only: hand LLVM the uniformity it cannot prove, so `rowbase` and the
-    // activation base become SGPR pairs and every global load in the loop takes the
-    // SADDR form (scalar base + 32-bit lane offset). The generic instantiation keeps
-    // the divergent form so its codegen stays byte-for-byte what it was.
     const int row_raw = (blockIdx.x * warps_per_block + (threadIdx.x / GQH_WARP)) * ROWS;
-    const int row  = NCOLS_MAX == 1 ? gqh_uniform(row_raw) : row_raw;
+    const int row  = UNIFORM_ADDR ? gqh_uniform(row_raw) : row_raw;
     const int lane = threadIdx.x % GQH_WARP;
 
     // ratio/15 in LDS, not constant memory: the index is the lane's sub-block, so
@@ -602,6 +703,14 @@ static __global__ void gqh_matvec_kernel(
     }
     __syncthreads();
     if (row >= out) return;
+    // The exact-width instantiations write EVERY column they carry -- their `c >= ncols`
+    // guard is compile-time dead -- so a caller that reached one of them with a narrower
+    // ncols would store PAST THE END of `y`, which is the one way this arm can do worse
+    // than run slowly. gqh_matvec_launch's switch guarantees the match; this makes the
+    // contract self-enforcing instead of conventional. Compile-time dead on the generic
+    // and batch-1 arms (so their codegen does not move), one wave-uniform scalar compare
+    // outside the superblock loop on the others.
+    if (XSHARED && ncols != NCOLS_MAX) return;
 
     const int nsb = in / GQH_SUPERBLOCK;
     // Clamped, not branched: a tail warp whose second row runs past `out` re-reads the
@@ -617,6 +726,15 @@ static __global__ void gqh_matvec_kernel(
 
     const int j0  = lane * GQH_PER_LANE;   // this lane's first weight in the superblock
     const int sub = j0 >> 4;               // two lanes share a 16-weight sub-block
+    // Which nibble of `rb` this lane's sub-block ratio sits in, as a SHIFT rather than a
+    // select. `(rb >> ((sub & 1) << 2)) & 0x0f` is the same index as
+    // `(sub & 1) ? (rb >> 4) : (rb & 0x0f)` for every uint8_t rb -- the high branch's
+    // mask is a no-op and the low branch's shift is zero -- but `sub` is loop-invariant,
+    // so the shift amount leaves the superblock loop while the select cannot: LLVM keeps
+    // both nibbles live and picks between them per row per superblock (v_lshrrev_b16 +
+    // two v_and_b16 + v_cndmask_b16, in 16-bit halves so it can pack two rows per
+    // register). Same nibble, same float, ~2 VALU per row per superblock cheaper.
+    const int rb_shift = (sub & 1) << 2;
     const gqh_wire_offsets woff = {
         (uint32_t) (1 + (sub >> 1)),
         (uint32_t) (9 + lane * (IS_GQH4 ? 4 : 2)),
@@ -784,7 +902,79 @@ static __global__ void gqh_matvec_kernel(
         if (NCOLS_MAX == 1) {
             gqh_load_x(x, 0, j0, xnext);
         }
+        // The exact-width arm's per-column activation addressing, hoisted out of the
+        // superblock loop. The SPELLING is the whole point: written at the load site as
+        // `x + c * x_col_stride`, LLVM commons the divergent `x + lane_offset` part
+        // across the columns FIRST and then adds the (uniform) column strides to that
+        // VGPR pair -- so every column but the zeroth pays a v_add_co_u32 /
+        // v_add_co_ci_u32 pair per load, with an s_wait_alu depctr hazard behind each.
+        //
+        // Hoisting to one loop-invariant BASE POINTER per column was the first half of
+        // that fix and it only ever got TWO columns: LLVM hands this load group exactly
+        // GQH_MULTICOL_XBASES SGPR base pairs and addresses every column past the second
+        // in the VADDR form off a 64-bit chain rebuilt IN the loop, once per trip. Read
+        // straight off the gfx1201 dump, `<111,NCOLS,3>` trips:
+        //
+        //   NCOLS      2      3      4      5
+        //   x SADDR    4      4      4      4
+        //   x VADDR    0      2      4      6
+        //   carry      0      4      8     10     <- v_add_co_u32 / v_add_co_ci_u32
+        //
+        // So the second half is to stop handing out base pointers: columns at or past
+        // XBASES take base 0 plus a uniform 32-bit BYTE offset, which folds into the
+        // lane offset gqh_load_x already builds -- one v_add_nc_u32, no carry, no
+        // s_wait_alu depctr -- and every column's load keeps SADDR at every width.
+        //
+        // Only the columns that are broken move. Putting the first two on offsets as well
+        // (i.e. XBASES == 0, one base for everything) also zeroes the carry column, but it
+        // re-allocates registers the FMA block is packed against: v_dual_fmac 26 -> 21 at
+        // NCOLS 3 and 48 -> 40 at NCOLS 5, and the trip grows 248 -> 257 at NCOLS 2, which
+        // has nothing to fix. Measured on the bare rig it is a wash against this form on
+        // pp3/pp4 and ~1.1% worse on pp5, and it perturbs the NCOLS 2 arm for nothing --
+        // hence 2 and not 0. Both forms were built and measured; see the handoff.
+        //
+        // Do NOT "simplify" this into a reconstructed pointer. Round-tripping the base
+        // through readfirstlane + inttoptr to force it into an SGPR pair made LLVM drop
+        // all six activation loads from the trip while keeping all 72 FMAs -- silently
+        // wrong, caught on an ISA dump, never built.
+        //
+        // Zero and unused on the other arms, so it costs them nothing (NCOLS 1, 2 and the
+        // generic 8 are byte-identical across all three rungs, ISA-diffed). Pure
+        // addressing: the same bytes, read in the same order, so every output is
+        // bit-identical.
+        const float * __restrict__ xcol[NCOLS_MAX];
+        uint32_t xoff[NCOLS_MAX] = {};
+        if constexpr (XSHARED) {
+    #pragma unroll
+            for (int c = 0; c < NCOLS_MAX; ++c) {
+                const int b = c < GQH_MULTICOL_XBASES ? c : 0;
+                xcol[c] = x + (int64_t) b * x_col_stride;
+                xoff[c] = (uint32_t) ((int64_t) (c - b) * x_col_stride
+                                      * (int64_t) sizeof(float));
+            }
+        }
         for (int sb = 0; sb < nsb; ++sb) {
+            // The specialized multi-column arm's activation read: ONE grouped load per
+            // superblock, shared by every row this warp owns, issued BEFORE the wire
+            // prefetch below. Two things ride on that placement. (a) Sharing -- the
+            // generic instantiation loads x inside the row loop, so ROWS rows would
+            // re-read the same 1024 B per column; hoisting it is what turns ROWS into a
+            // 1/ROWS cut in activation traffic, which is the entire point of this arm.
+            // (b) Order -- loadcnt retires in issue order, so a load issued AFTER the
+            // wire prefetch cannot be waited on without draining the prefetch behind it
+            // (the trap the xnext note below describes); the fence stops the scheduler
+            // sinking these past it. Purely a load schedule and a load count: the values
+            // and the order they fold into acc[] are untouched, so every output stays
+            // bit-identical.
+            float xshared[NCOLS_MAX][GQH_PER_LANE];
+            if constexpr (XSHARED) {
+    #pragma unroll
+                for (int c = 0; c < NCOLS_MAX; ++c) {
+                    gqh_load_x(xcol[c], sb, j0, xshared[c], xoff[c]);
+                }
+                gqh_sched_fence();
+            }
+
             // same order as the reference: d_real = e4m3(d) * tensor_scale, then
             // s_b = d_real * (ratio/15). Do not reassociate.
             //
@@ -803,7 +993,7 @@ static __global__ void gqh_matvec_kernel(
     #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
                 const uint8_t d_raw = wire[r].d;
-                const int d = NCOLS_MAX == 1 ? gqh_uniform(d_raw) : d_raw;
+                const int d = UNIFORM_ADDR ? gqh_uniform(d_raw) : d_raw;
                 d_real[r] = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * t_scale;
 
                 codes[r] = wire[r].codes;
@@ -834,12 +1024,37 @@ static __global__ void gqh_matvec_kernel(
             }
             if (NCOLS_MAX == 1) {
                 gqh_load_x(x, sbn, j0, xnext);
+            }
+            // Pin the wire prefetch, on the exact-width arm as well as batch-1.
+            //
+            // Without a fence HERE, nothing structural stops LLVM sinking these loads
+            // across the back-edge onto their uses at the top of the next trip -- and on
+            // this arm it does exactly that for `codes`, which is 128 of the 137 wire
+            // bytes a warp reads per superblock. The result reads as a pipeline but the
+            // biggest load in it is issued in the trip that consumes it, i.e. one DRAM
+            // latency exposed per superblock instead of none. batch-1 already got this
+            // fence (it sits after its own xnext load); the exact-width arm inherited the
+            // generic instantiation's fence-free tail when it was split off. The generic
+            // instantiation is deliberately still excluded -- it is the same-binary A/B
+            // control, so its codegen has to stay put.
+            if (NCOLS_MAX == 1 || XSHARED) {
                 gqh_sched_fence();
             }
 
     #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
-                const float s_b = d_real[r] * s_ratio[(sub & 1) ? (rb[r] >> 4) : (rb[r] & 0x0f)];
+                // The shift spelling is confined to UNIFORM_ADDR. It is a win on the
+                // exact-width and batch-1 arms (pp3 -1.6%, pp1 and greedy tg -2.5%) and a
+                // LOSS on the generic one, which is the only arm that reaches ncols 5..8:
+                // measured pp5 74.82 -> 78.61 and the same-binary control pp3 59.38 ->
+                // 63.16 when it was applied everywhere, on a hot loop the ISA says is
+                // unchanged (326 instrs / 144 VALU either way) -- so it is the generic
+                // arm's eight predicated blocks reacting to it, not its inner loop. Same
+                // nibble, same float, either spelling.
+                const int ratio_idx = XSHARED
+                    ? ((rb[r] >> rb_shift) & 0x0f)
+                    : ((sub & 1) ? (rb[r] >> 4) : (rb[r] & 0x0f));
+                const float s_b = d_real[r] * s_ratio[ratio_idx];
 
                 // Decode this lane's 8 weights ONCE, then reuse them for every column.
                 float w[GQH_PER_LANE];
@@ -861,7 +1076,7 @@ static __global__ void gqh_matvec_kernel(
                 // row r changes nothing about either row's term order.
     #pragma unroll
                 for (int c = 0; c < NCOLS_MAX; ++c) {
-                    if (NCOLS_MAX > 1 && c >= ncols) {
+                    if (NCOLS_MAX == GQH_MAX_COLS && c >= ncols) {
                         continue;
                     }
                     float xs[GQH_PER_LANE];
@@ -869,6 +1084,11 @@ static __global__ void gqh_matvec_kernel(
     #pragma unroll
                         for (int t = 0; t < GQH_PER_LANE; ++t) {
                             xs[t] = xcur[t];
+                        }
+                    } else if (XSHARED) {
+    #pragma unroll
+                        for (int t = 0; t < GQH_PER_LANE; ++t) {
+                            xs[t] = xshared[c][t];
                         }
                     } else {
                         gqh_load_x(x + (int64_t) c * x_col_stride, sb, j0, xs);
@@ -889,7 +1109,9 @@ static __global__ void gqh_matvec_kernel(
         const bool store = r == 0 || row + r < out;
 #pragma unroll
         for (int c = 0; c < NCOLS_MAX; ++c) {
-            if (NCOLS_MAX > 1 && c >= ncols) {
+            // Only the generic instantiation can be dispatched with ncols < NCOLS_MAX;
+            // the exact-width ones write every column they carry.
+            if (NCOLS_MAX == GQH_MAX_COLS && c >= ncols) {
                 continue;
             }
 #pragma unroll
@@ -1060,6 +1282,65 @@ static bool gqh_rows1_selected(int out) {
     return (int64_t) out >= (int64_t) rounds * resident;
 }
 
+// Env gate for the specialized multi-column arm. GGML_GQH_MULTICOL=0 sends every
+// ncols > 1 dispatch back to the generic runtime-guarded instantiation, so ONE binary
+// can be A/B'd against the exact pristine multi-column path -- the discipline the rest
+// of this file's constants are measured under.
+static bool gqh_multicol_on() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_GQH_MULTICOL");
+        return e ? atoi(e) != 0 : true;
+    }();
+    return on;
+}
+
+// One exact-width multi-column dispatch: NCOLS is the column count at compile time AND
+// the value passed as `ncols`, which is the contract the kernel's dead column guard
+// relies on. A block covers GQH_MATVEC_WARPS * GQH_MULTICOL_ROWS output rows -- getting
+// that divisor wrong launches ROWS times too many blocks, which still computes the right
+// answer (the `row >= out` return retires them) and reads exactly like "ROWS did not
+// help".
+//
+// ROWS is GQH_MULTICOL_ROWS for EVERY specialized width. It used to drop to 2 at NCOLS == 4
+// because both axes spend the same registers -- acc[ROWS][NCOLS] and xshared[NCOLS][8] each
+// scale with NCOLS -- and NCOLS == 4 at ROWS == 3 measured 98 VGPRs, two over the
+// 16-waves/SIMD cliff. The wave-uniform addressing (UNIFORM_ADDR in the kernel) took ~16
+// VGPRs of 64-bit address chain out of every cell, and the whole grid now fits. Measured
+// VGPRs, clang -Rpass-analysis=kernel-resource-usage on gfx1201, GQH4 / GQH3; 96 is the
+// cliff:
+//
+//   NCOLS   ROWS=1    ROWS=2    ROWS=3     ROWS=4
+//     2     32 / 40   46 / 62   60 /  82   73 /  93
+//     3     41 / 50   57 / 72   71 /  93   85 /  93
+//     4     51 / 60   67 / 82   82 /  93   97 / 108
+//
+// (The pre-UNIFORM_ADDR grid, for the record: 76/97 and 94/100 at NCOLS 2, 87/97 and
+// 102/122 at NCOLS 3, 98/111 and 118/124 at NCOLS 4 for ROWS 3 and 4.) The generic
+// instantiation is 37 VGPRs, so this arm is still spending headroom the multi-column path
+// never used -- ~10-11 VGPRs per extra column at ROWS == 3, which is the budget for
+// raising GQH_MULTICOL_SPEC_MAX.
+//
+// Dropping the NCOLS == 4 special case was MEASURED, not inferred from the table:
+// llama-bench pp4 per-forward ms, -r 24, one build each, against the same-binary generic
+// control at 66.59 ms -- ROWS == 2 47.69 (1.396x), ROWS == 3 42.99 (1.549x), i.e. 1.109x
+// for the switch. pp2 is unmoved (36.76 vs 36.81) as it must be, since NCOLS == 2 was
+// already on GQH_MULTICOL_ROWS. ncols == 2 and 4 are not what hot_ms scores (that is
+// pp3 = the MTP n-max=2 verify width); they are measured here directly because
+// llama-bench can dispatch them, not fitted from the VGPR rule.
+template <ggml_type RUNG, int NCOLS>
+static void gqh_multicol_dispatch(
+        const dim3 & threads, cudaStream_t stream,
+        const uint8_t * data, const float * x, float * y, int in, int out,
+        float tensor_scale, gqh_grid16 grid,
+        int64_t x_col_stride, int64_t y_col_stride) {
+    constexpr int ROWS = GQH_MULTICOL_ROWS;
+    const int rows_per_block = GQH_MATVEC_WARPS * ROWS;
+    const dim3 blocks((out + rows_per_block - 1) / rows_per_block, 1, 1);
+    gqh_matvec_kernel<RUNG, NCOLS, ROWS, false><<<blocks, threads, 0, stream>>>(
+        data, x, y, in, out, NCOLS, tensor_scale, grid,
+        x_col_stride, y_col_stride, data, y, tensor_scale, grid);
+}
+
 // Binds the runtime `ncols` to the kernel's compile-time NCOLS_MAX. Decode is
 // ncols == 1 and is where all the time goes, so it gets its own instantiation with
 // the column guards folded away and gqh_rows1_selected()'s choice of rows per warp;
@@ -1091,6 +1372,37 @@ static void gqh_matvec_launch(
                 data, x, y, in, out, ncols, tensor_scale, grid,
                 x_col_stride, y_col_stride, data, y, tensor_scale, grid);
     } else {
+        // Exact-width arm for the MTP verify widths (n-max=1..4 draft tokens verify at
+        // ncols 2..5). The switch is exhaustive over 2..GQH_MULTICOL_SPEC_MAX and the
+        // assert is what keeps it from drifting off that constant; anything wider keeps
+        // the generic instantiation below, unchanged.
+        static_assert(GQH_MULTICOL_SPEC_MAX == 5, "add or remove a case below to match");
+        if (gqh_multicol_on() && ncols <= GQH_MULTICOL_SPEC_MAX) {
+            switch (ncols) {
+                case 2:
+                    gqh_multicol_dispatch<RUNG, 2>(
+                        threads, stream, data, x, y, in, out, tensor_scale, grid,
+                        x_col_stride, y_col_stride);
+                    return;
+                case 3:
+                    gqh_multicol_dispatch<RUNG, 3>(
+                        threads, stream, data, x, y, in, out, tensor_scale, grid,
+                        x_col_stride, y_col_stride);
+                    return;
+                case 4:
+                    gqh_multicol_dispatch<RUNG, 4>(
+                        threads, stream, data, x, y, in, out, tensor_scale, grid,
+                        x_col_stride, y_col_stride);
+                    return;
+                case 5:
+                    gqh_multicol_dispatch<RUNG, 5>(
+                        threads, stream, data, x, y, in, out, tensor_scale, grid,
+                        x_col_stride, y_col_stride);
+                    return;
+                default:
+                    break;      // ncols == 1 is handled above; nothing else can land here
+            }
+        }
         const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 1, 1);
         gqh_matvec_kernel<RUNG, GQH_MAX_COLS, 1, false>
             <<<blocks, threads, 0, stream>>>(
