@@ -3224,6 +3224,95 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// ── GQH gate/up pair fusion ────────────────────────────────────────────────
+// This model's gated FFN is spelled { MUL_MAT, UNARY, MUL_MAT, MUL } -- an explicit
+// activation and an explicit product -- not GGML_OP_GLU, so none of the existing
+// mul_mat+GLU fusions above can see it. The two MUL_MATs are the two halves of the
+// same gate/up projection: identical GQH4 weight shapes, the same activation as src1,
+// and mutually independent, so they can be issued as ONE dispatch and the activation
+// and product run after. That is worth doing because gqh.cu's matvec is already at
+// 98% of this device's DRAM peak in steady state -- what is left is per-dispatch cost
+// and occupancy-round quantisation, and out == 17408 is the only fractional-round
+// bucket in the model (8.5 rounds; fused it is exactly 17.0).
+//
+// Every check here is a hard requirement: on any mismatch the caller keeps the
+// ordinary node-at-a-time path, so this can only ever be a no-op or a win.
+static bool ggml_cuda_gqh_can_fuse_gate_up(
+        const ggml_cgraph * cgraph, int i,
+        ggml_tensor ** out_gate, ggml_tensor ** out_act,
+        ggml_tensor ** out_up, ggml_tensor ** out_comb) {
+    static const bool on = []() {
+        const char * e = getenv("GGML_GQH_FUSE_PAIR");
+        return e ? atoi(e) != 0 : true;
+    }();
+    if (!on || i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * gate = cgraph->nodes[i];
+    ggml_tensor * act  = cgraph->nodes[i + 1];
+    ggml_tensor * up   = cgraph->nodes[i + 2];
+    ggml_tensor * comb = cgraph->nodes[i + 3];
+
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        act->op != GGML_OP_UNARY    || comb->op != GGML_OP_MUL) {
+        return false;
+    }
+    for (const ggml_tensor * n : { gate, act, up, comb }) {
+        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+    // Dataflow: act consumes gate, comb consumes act and up, and -- the load-bearing
+    // one -- up must NOT consume act, or reordering up ahead of act would be wrong.
+    if (act->src[0] != gate || act->src[1] != nullptr) {
+        return false;
+    }
+    if (!((comb->src[0] == act && comb->src[1] == up) ||
+          (comb->src[0] == up  && comb->src[1] == act))) {
+        return false;
+    }
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        if (up->src[k] == act || up->src[k] == gate) {
+            return false;
+        }
+    }
+    // Both halves must be the same batch-1 GQH4 matvec over one shared activation.
+    const ggml_tensor * w0 = gate->src[0];
+    const ggml_tensor * w1 = up->src[0];
+    const ggml_tensor * xt = gate->src[1];
+    if (w0->type != GGML_TYPE_GQH4 || w1->type != GGML_TYPE_GQH4) {
+        return false;
+    }
+    if (up->src[1] != xt || gate->src[2] || up->src[2]) {
+        return false;
+    }
+    if (!ggml_are_same_shape(w0, w1) || !ggml_are_same_stride(w0, w1)) {
+        return false;
+    }
+    if (!ggml_are_same_shape(gate, up) || !ggml_are_same_stride(gate, up)) {
+        return false;
+    }
+    if (xt->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        up->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(xt) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up)) {
+        return false;
+    }
+    if (xt->ne[1] != 1 || xt->ne[2] != 1 || xt->ne[3] != 1) {
+        return false;   // batch-1 decode only; wider batches keep the generic route
+    }
+    if (gate->data == up->data) {
+        return false;
+    }
+    if (ggml_backend_buft_is_cuda_split(w0->buffer->buft) ||
+        ggml_backend_buft_is_cuda_split(w1->buffer->buft)) {
+        return false;
+    }
+    *out_gate = gate; *out_act = act; *out_up = up; *out_comb = comb;
+    return true;
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -4671,6 +4760,35 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                     continue;
                                 }
                             }
+                        }
+                    }
+
+                    {
+                        ggml_tensor * gate = nullptr;
+                        ggml_tensor * act  = nullptr;
+                        ggml_tensor * up   = nullptr;
+                        ggml_tensor * comb = nullptr;
+                        if (ggml_cuda_gqh_can_fuse_gate_up(cgraph, i, &gate, &act, &up, &comb) &&
+                            ggml_cuda_gqh_mul_mat_vec_pair(
+                                gate->src[0]->data, (float *) gate->data,
+                                up->src[0]->data,   (float *) up->data,
+                                (const float *) gate->src[1]->data,
+                                (int) gate->src[0]->ne[0], (int) gate->src[0]->ne[1],
+                                (int) gate->src[1]->ne[1],
+                                (int64_t) (gate->src[1]->nb[1] / sizeof(float)),
+                                (int64_t) (gate->nb[1] / sizeof(float)),
+                                cuda_ctx->stream())) {
+                            // gate and up are both resident now; the activation and the
+                            // product follow in graph order.
+                            bool ok = ggml_cuda_compute_forward(*cuda_ctx, act)
+                                   && ggml_cuda_compute_forward(*cuda_ctx, comb);
+                            if (!ok) {
+                                GGML_LOG_ERROR("%s: op not supported in gqh gate/up fusion\n",
+                                               __func__);
+                                GGML_ABORT("fatal error");
+                            }
+                            i += 3;
+                            continue;
                         }
                     }
 
