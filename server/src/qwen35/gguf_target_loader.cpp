@@ -46,6 +46,7 @@
 #include "internal.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_inspect.h"
+#include "common/gqh_headers.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
@@ -952,10 +953,22 @@ bool load_target_gguf_partial(const std::string & path,
         tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
     set_last_error(summary);
 
+    // GQH per-tensor headers, after upload because the registry is keyed by the
+    // tensor's device pointer. No-op unless the artifact carries GQH tensors.
+    if (!dflash::common::register_gqh_headers(path, out.ctx)) {
+        set_last_error("GQH header registration failed for " + path);
+        free_target_weights(out);
+        return false;
+    }
+
     return true;
 }
 
 void free_target_weights(TargetWeights & w) {
+    // Drop GQH registry entries while the tensors are still valid, BEFORE ggml_free:
+    // the registry resolves by pointer range, so a stale entry would shadow a later
+    // load that reuses the address.
+    dflash::common::unregister_gqh_headers(w.ctx);
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     // CpuEmbedder destructor handles the mmap automatically.

@@ -429,6 +429,7 @@ add_library(dflash_common STATIC
     src/gemma4/gemma4_dflash_target.cpp
     src/gemma4/gemma4_layer_split_adapter.cpp
     # DeepSeek V4 Flash target arch
+    src/common/gqh_headers.cpp
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_roctx.cpp
@@ -1154,6 +1155,52 @@ if(DFLASH27B_TESTS)
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
     endif()
+    # GQH (108/109/110/111) decode bit-exactness against the geo-quant reference vectors.
+    # Deliberately PLAIN C++ targets: these use only the public ggml API, and marking a
+    # .cpp as LANGUAGE HIP is what leaves the rocmfp test targets below linking without
+    # libstdc++ (undefined operator new / __gxx_personality_v0).
+    set(GQH_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/tests")
+    if(EXISTS "${GQH_TEST_DIR}/test-gqh-cpu-decode.cpp")
+        foreach(GQH_SRC test-gqh-cpu-decode test-gqh-backend)
+            add_executable(${GQH_SRC} "${GQH_TEST_DIR}/${GQH_SRC}.cpp")
+            target_link_libraries(${GQH_SRC} PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+            target_include_directories(${GQH_SRC} PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include")
+        endforeach()
+        foreach(GQH_CASE "gqh3;1;256" "gqh3;4;512" "gqh3;64;1024"
+                         "gqh2_h;1;256" "gqh2_h;4;512" "gqh2_h;64;1024"
+                         "gqh2_c;1;256" "gqh2_c;4;512" "gqh2_c;64;1024"
+                         "gqh4;1;256" "gqh4;4;512" "gqh4;64;1024")
+            list(GET GQH_CASE 0 GQH_RUNG)
+            list(GET GQH_CASE 1 GQH_ROWS)
+            list(GET GQH_CASE 2 GQH_COLS)
+            set(GQH_STEM "${GQH_TEST_DIR}/gqh-vectors/${GQH_RUNG}_${GQH_ROWS}x${GQH_COLS}")
+            add_test(NAME test-gqh-cpu-decode-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                     COMMAND test-gqh-cpu-decode ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                             "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32")
+            # nvec=3 for the backend probe only: this tree caps the fused matvec at
+            # luce_mmvq_max_ncols (default 3), so a wider probe silently takes the
+            # dequant fallback and fails every fused comparison on fp16 rounding.
+            add_test(NAME test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                     COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                             "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 3)
+        endforeach()
+    endif()
+
+    # The GQH header-KV parser (common/gqh_headers.cpp), model-free. This is the only
+    # qtype-specific gate on the loader side, and it was previously reachable only
+    # through a real multi-GB model load. Plain C++ for the same reason as above.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gqh_headers.cpp")
+        add_executable(test_gqh_headers
+            test/test_gqh_headers.cpp
+            src/common/gqh_headers.cpp)
+        target_link_libraries(test_gqh_headers PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        target_include_directories(test_gqh_headers PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include")
+        add_test(NAME test_gqh_headers COMMAND test_gqh_headers)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
