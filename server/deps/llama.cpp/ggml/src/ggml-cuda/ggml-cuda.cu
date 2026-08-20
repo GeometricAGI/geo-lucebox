@@ -3844,6 +3844,27 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #endif
         }
 
+        // GQH batch-1 matvec: measured incompatible with graph capture. The 2x2 on
+        // the qwen38-gqh-mimic artifact (2026-08-19): fused+graphs faulted 3x with
+        // "illegal instruction" at a long-sequence slot release (~227k tokens);
+        // fused+GGML_CUDA_DISABLE_GRAPHS clean over the same items (244k tokens, all
+        // completed); unfused+graphs clean (251k); a GQH-free artifact at identical
+        // geometry clean (269k). Neither fusion nor graphs alone reproduces it.
+        // Root mechanism still open, so exclude capture for GQH nodes entirely --
+        // measured cost of losing graphs on this model: ~1.7% tg64, vs 3.48x for
+        // losing the fused kernel.
+        if (node->op == GGML_OP_MUL_MAT &&
+            node->src[0] && (node->src[0]->type == GGML_TYPE_GQH3   ||
+                             node->src[0]->type == GGML_TYPE_GQH2_H ||
+                             node->src[0]->type == GGML_TYPE_GQH2_C ||
+                             node->src[0]->type == GGML_TYPE_GQH4)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GQH mul_mat node
+", __func__);
+#endif
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
