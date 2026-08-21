@@ -86,6 +86,8 @@ static void print_usage(const char * prog) {
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
+        "  --draft-block-size <N>         Dense Qwen DFlash proposal/verify width\n"
+        "                                 (2..32; default: drafter metadata)\n"
         "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
         "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
@@ -303,6 +305,18 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--draft-swa") == 0 && i + 1 < argc) {
             bargs.draft_swa_window = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--draft-block-size") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(
+                value, end, bargs.draft_block_size);
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                bargs.draft_block_size < 2 || bargs.draft_block_size > 32) {
+                std::fprintf(stderr,
+                    "--draft-block-size expects an integer in [2, 32], got '%s'\n",
+                    value);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--draft-device") == 0 && i + 1 < argc) {
             if (!parse_placement_device(argv[++i], bargs.draft_device)) {
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");

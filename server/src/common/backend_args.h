@@ -74,6 +74,7 @@ struct BackendArgs {
     // block-rounded). 0 = derive capacity from available device memory.
     long long       kv_pool_tokens   = 0;
     int             kq_stride_pad    = 32;
+    int             draft_block_size = 0;  // 0 = drafter metadata
     int             draft_swa_window = 0;
     int             draft_ctx_max    = 4096;
     bool            fast_rollback    = true;

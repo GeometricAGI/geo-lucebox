@@ -76,6 +76,16 @@ struct TargetLayer {
     ggml_tensor * ssm_dt_bias    = nullptr;  // [dt_rank] per-head alpha bias
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
+    // Zero-copy stacked projections (set by the loader when the two source
+    // tensors share a type and were placed back to back in the weight buffer):
+    //   wqkv_z: rows [0, n_z) = wqkv_gate (z), rows [n_z, ...) = wqkv
+    //   ssm_ba: rows [0, dt_rank) = ssm_beta, rows [dt_rank, ...) = ssm_alpha
+    // One GEMV each instead of two; nullptr when stacking was not possible.
+    ggml_tensor * wqkv_z         = nullptr;
+    ggml_tensor * ssm_ba         = nullptr;
+    // Fused raw-gate GDN kernel parameters: f32 [2 * dt_rank] = [dt_bias | A],
+    // one small GPU tensor per DeltaNet layer (src[9] of the GDN op).
+    ggml_tensor * ssm_gate_ba    = nullptr;
 
     // MoE FFN (qwen35moe only; nullptr on dense qwen35)
     ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_expert] router
@@ -147,6 +157,9 @@ struct CpuEmbedder {
 
 struct TargetWeights {
     ggml_context *        ctx     = nullptr;
+    ggml_context *        stack_ctx = nullptr;  // owns the stacked alias tensors
+    ggml_context *        gate_ctx  = nullptr;  // owns the [dt_bias | A] gate tensors
+    ggml_backend_buffer_t gate_buf  = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 
@@ -234,6 +247,18 @@ void free_target_weights(TargetWeights & w);
 
 // ─── Draft weights (z-lab DFlash, bf16) ───────────────────────────
 
+// DFlash 2 grouped dynamic causal conv (two taps over the draft block, one
+// instance before/after attention and one before/after the MLP):
+//   dyn      = proj @ x_norm                      [2*K*groups, q_len]
+//   prepare  = sum_k (base[0][k] + dyn[0][k]) * shift_k(x_norm)
+//   finish   = sum_k (base[1][k] + dyn[1][k]) * shift_k(sub_block_out)
+// base is per element, dyn per group of conv_group_size elements.
+struct DraftConvWeights {
+    ggml_tensor * base = nullptr;   // [hidden, K, 2] f32
+    ggml_tensor * proj = nullptr;   // [hidden, 2*K*groups]
+    bool present() const { return base != nullptr && proj != nullptr; }
+};
+
 struct DraftLayer {
     ggml_tensor * attn_norm;
     ggml_tensor * ffn_norm;
@@ -247,6 +272,8 @@ struct DraftLayer {
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
+    DraftConvWeights attn_conv;         // optional DFlash 2 conv around attention
+    DraftConvWeights mlp_conv;          // optional DFlash 2 conv around the MLP
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
     bool attn_gate_per_head = false;
 };
@@ -278,6 +305,18 @@ struct DraftDSparkWeights {
     ggml_tensor * markov_w2    = nullptr;  // [markov_rank, vocab_size]
     ggml_tensor * confidence_w = nullptr;  // [confidence_dim, 1]
     ggml_tensor * confidence_b = nullptr;  // [1] f32
+};
+
+// DFlash 2 candidate selector: top-k candidates per block position from the
+// target lm_head logits, then one path through them scored by a low-rank
+// bigram form  unary[c] + <pred[prev] * hproj(h), succ[c]>.
+struct DraftSelectorWeights {
+    bool enabled = false;
+    int  rank    = 0;
+    int  top_k   = 0;
+    ggml_tensor * hproj   = nullptr;   // [hidden, rank]
+    ggml_tensor * pred_cb = nullptr;   // [rank, vocab]  predecessor codebook
+    ggml_tensor * succ_cb = nullptr;   // [rank, vocab]  successor codebook
 };
 
 struct DraftWeights {
@@ -324,6 +363,12 @@ struct DraftWeights {
     // Optional DSpark/DeepSpec-style Markov correction head. When present,
     // greedy chain decode adds a low-rank previous-token bias before argmax.
     DraftDSparkWeights dspark;
+
+    // Optional DFlash 2 pieces: dynamic convs live in the layers, the
+    // selector replaces argmax/markov projection for the drafted chain.
+    int conv_kernel_size = 0;   // 0 = no dynamic convs
+    int conv_group_size  = 0;
+    DraftSelectorWeights selector;
 };
 
 bool load_draft_safetensors(const std::string & path,

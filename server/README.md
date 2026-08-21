@@ -521,6 +521,16 @@ Same DFlash + PFlash stack on AMD GPUs. PR #119 ports the Phase 2 rocWMMA flashp
 
 **RDNA4 — Radeon AI PRO R9700 (`gfx1201`, 32 GB).** First-class RDNA4 target as of this build. Qwen3.6-27B Q4_K_M + DFlash draft (`dflash-draft-3.6-q4_k_m.gguf`), `--ddtree-budget=22`: **54.65 tok/s mean DFlash decode** across the 10-prompt HumanEval suite (`bench_he.py --n-gen 256`, AL 7.14, range 36.9–93.0 tok/s) on ROCm 7.1.1. The rocWMMA Phase 2 flashprefill kernels are numerically correct on RDNA4 — ROCm 7.1's rocWMMA handles the gfx12 WMMA operand-format change internally, so no kernel changes are needed (`test_flashprefill_kernels` PASS on `gfx1201`: max diff 5e-4, e2e `flash_prefill_forward_bf16` at S=8192 in 10.7 ms/iter). Note `gfx1200` (RX 9060) and `gfx1201` (RX 9070 / R9700) are **not** code-object compatible — build for `gfx1201` explicitly for the R9700.
 
+For Qwen3.8-27B IQ4_XS with the Q8_0 DFlash2 drafter, the drafter's metadata
+block size is conservative on the R9700. `--draft-block-size 12` is the
+general-purpose setting measured on `gfx1201`: 230.2 versus 159.8 aggregate
+decode tok/s on the ten-prompt HumanEval benchmark (+44%), 178.5 versus 139.6
+tok/s across all 164 HumanEval+ tasks (+28%), and 145/164 versus 143/164
+pass@1. A code-heavy deployment can use `--draft-block-size 16` for 279.1
+tok/s (+75%) on the short HumanEval benchmark, at the cost of small regressions
+on some low-acceptance prose prompts. Values are intentionally explicit rather
+than GPU defaults because the optimum depends on the drafter and workload.
+
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
 
