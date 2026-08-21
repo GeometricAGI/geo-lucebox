@@ -221,7 +221,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            10
+#define GGML_MAX_SRC            12
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -2502,6 +2502,18 @@ extern "C" {
     // prefill chunks can attend the paged pool causally. A negative position
     // marks a padding row. NULL keeps the decode semantics (full cached
     // length per row).
+    //
+    // parent_ids/tree_sizes optionally enable packed tree verification.
+    // Queries are flattened sequence-major: tree sequence s occupies rows
+    // [s*tree_width, (s+1)*tree_width). parent_ids is contiguous I32
+    // [tree_width, n_tree_seq] (root parent -1), and tree_sizes is contiguous
+    // I32 [n_tree_seq]. active_slot_ids is required and remains per query row;
+    // it selects the physical block-table column and scratch slab. Each live
+    // query attends its complete committed prefix from the block table plus
+    // its own candidate node and ancestors from physical K/V rows
+    // tree_scratch_base + slot*tree_scratch_stride + node. Siblings and rows
+    // at or beyond tree_sizes[s] are excluded. query_positions must be NULL
+    // in tree mode. Pass NULL/NULL/0/0/0 to retain standard paged attention.
     GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2513,7 +2525,32 @@ extern "C" {
             struct ggml_tensor  * query_positions,
             float                 scale,
             int                   block_size,
-            int                   max_kv_seq_len);
+            int                   max_kv_seq_len,
+            struct ggml_tensor  * parent_ids
+#ifdef __cplusplus
+                = nullptr
+#endif
+            ,
+            struct ggml_tensor  * tree_sizes
+#ifdef __cplusplus
+                = nullptr
+#endif
+            ,
+            int                   tree_width
+#ifdef __cplusplus
+                = 0
+#endif
+            ,
+            int                   tree_scratch_base
+#ifdef __cplusplus
+                = 0
+#endif
+            ,
+            int                   tree_scratch_stride
+#ifdef __cplusplus
+                = 0
+#endif
+            );
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
@@ -2937,6 +2974,15 @@ extern "C" {
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
+
+    // CUDA/HIP fixed-chain journal in compact F32 [J,H,T,B] layout:
+    // scalar gate J=2*S_v+1 stores [g | k | delta], while KDA J=3*S_v
+    // stores [g[S_v] | k | delta]. Delta is captured after the
+    // state-dependent reduction. A tree-form op may attach the journal when
+    // its parent table describes one root-inclusive chain.
+    GGML_API void ggml_gated_delta_net_set_transition_journal(
+            struct ggml_tensor * tensor,
+            struct ggml_tensor * journal);
 
     // dflash extension: let the kernel derive the gates from the raw
     // projections instead of graph-side sigmoid/softplus ops:

@@ -25,6 +25,7 @@
 //   blk.<i>.ffn_down.weight                 [hidden, intermediate]  Q8_0 / F16
 
 #include "internal.h"
+#include "common/dflash2_selector_validation.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
@@ -554,6 +555,25 @@ bool load_draft_gguf(const std::string & path,
                 !check_shape_2d(out.selector.pred_cb, R, out.selector.pred_cb->ne[1], "selector.pred_cb", shape_err, sizeof(shape_err)) ||
                 !check_shape_2d(out.selector.succ_cb, R, out.selector.pred_cb->ne[1], "selector.succ_cb", shape_err, sizeof(shape_err))) {
                 set_last_error(shape_err);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            DFlash2SelectorLayout selector_layout;
+            selector_layout.rank = out.selector.rank;
+            selector_layout.top_k = out.selector.top_k;
+            selector_layout.hproj_rank = out.selector.hproj->ne[1];
+            selector_layout.pred_rank = out.selector.pred_cb->ne[0];
+            selector_layout.pred_vocab = out.selector.pred_cb->ne[1];
+            selector_layout.succ_rank = out.selector.succ_cb->ne[0];
+            selector_layout.succ_vocab = out.selector.succ_cb->ne[1];
+            selector_layout.target_output_vocab =
+                target && target->output ? target->output->ne[1] : 0;
+            selector_layout.target_declared_vocab =
+                target ? target->n_vocab : 0;
+            std::string selector_error;
+            if (!validate_dflash2_selector_layout(
+                    selector_layout, selector_error)) {
+                set_last_error("draft GGUF: " + selector_error);
                 ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
                 return false;
             }

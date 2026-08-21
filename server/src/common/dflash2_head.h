@@ -33,6 +33,19 @@ bool dflash2_select_chain(const DraftWeights & dw,
                           int32_t last_tok,
                           std::vector<int32_t> & draft_tok);
 
+// Same selector, batched over host-resident drafter hidden blocks and using a
+// local target lm_head tensor. The expensive lm_head projection covers every
+// (lane, depth) in one graph, GPU top-K is invoked once, and selector
+// projections/readback are shared across the cohort.
+bool dflash2_select_chains_batched(
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    ggml_tensor * lm_head,
+    const std::vector<const float *> & hidden_by_lane,
+    int q_len,
+    const std::vector<int32_t> & last_tokens,
+    std::vector<std::vector<int32_t>> & draft_tokens);
+
 // Selector-scored candidates for DDTree construction (DARTree-style): the
 // same per-position top-k + selector projections as the chain path, kept on
 // the host so the tree builder can ask for branch-conditioned scores.

@@ -85,7 +85,6 @@ int main() {
         mgr.commit_prefill(0);
         CHECK(mgr.slot(0).cur_pos == 20);
 
-        // Decode rows stage until the target compute succeeds.
         auto st = mgr.append_token(0, /*fed_token=*/42);
         CHECK(st.ok);
         CHECK(st.position == 20);
@@ -336,7 +335,6 @@ int main() {
         CHECK(pool.free_block_count() == 0);
     }
 
-    // A multi-token stage owns its rows until one atomic commit.
     {
         PagedKvPool pool(8, 1, /*block_size=*/4);
         Qwen35SlotManager mgr(pool, /*max_ctx=*/32);

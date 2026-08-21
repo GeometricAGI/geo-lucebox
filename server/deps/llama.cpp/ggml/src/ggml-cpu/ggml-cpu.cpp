@@ -480,7 +480,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GATED_DELTA_NET:
             // The Specla GDN variant (op param 2 == 1) is stateful via HLD and is
             // only supported by the CUDA kernel.
-            return ggml_get_op_params_i32(op, 2) != 1;
+            return ggml_get_op_params_i32(op, 2) != 1 &&
+                   ggml_get_op_params_i32(op, 10) != 1 &&
+                   op->src[11] == nullptr;
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

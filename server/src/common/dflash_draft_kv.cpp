@@ -318,4 +318,144 @@ bool draft_kv_begin_step(DraftKvState & st,
     return true;
 }
 
+void draft_kv_batch_free(DraftKvBatchGraph & batch) {
+    if (batch.galloc) {
+        ggml_gallocr_free(batch.galloc);
+        batch.galloc = nullptr;
+    }
+    if (batch.g_ctx) {
+        ggml_free(batch.g_ctx);
+        batch.g_ctx = nullptr;
+    }
+    batch.gf = nullptr;
+    batch.hidden_by_lane.clear();
+    batch.lane_states.clear();
+    batch.meta_arena.clear();
+    batch.n_lanes = 0;
+    batch.q_len = 0;
+    batch.built_for = nullptr;
+}
+
+static bool draft_kv_batch_build(
+        DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states) {
+    if (!backend || lane_states.empty() || dw.block_size <= 1) {
+        return false;
+    }
+    for (DraftKvState * state : lane_states) {
+        if (!state || !state->mem_buf || state->q_len != dw.block_size ||
+            state->built_for != static_cast<const void *>(&dw)) {
+            return false;
+        }
+    }
+
+    draft_kv_batch_free(batch);
+    const int n_lanes = static_cast<int>(lane_states.size());
+    const size_t arena_size =
+        (32u + 16u * static_cast<size_t>(n_lanes)) * 1024u * 1024u;
+    batch.meta_arena.resize(arena_size);
+    ggml_init_params params{};
+    params.mem_size = batch.meta_arena.size();
+    params.mem_buffer = batch.meta_arena.data();
+    params.no_alloc = true;
+    batch.g_ctx = ggml_init(params);
+    if (!batch.g_ctx) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
+    batch.gf = ggml_new_graph_custom(
+        batch.g_ctx, 4096 * n_lanes + 2048, false);
+
+    batch.hidden_by_lane.reserve(static_cast<size_t>(n_lanes));
+    for (DraftKvState * state : lane_states) {
+        DraftKvAppendInputs append{};
+        append.n_rows = state->a_step;
+        append.feat = state->ap_feat;
+        append.positions = state->ap_pos;
+        append.rows = state->ap_rows;
+        if (!build_draft_kv_append(
+                batch.g_ctx, batch.gf, dw, state->cache, append)) {
+            draft_kv_batch_free(batch);
+            return false;
+        }
+
+        DraftKvStepInputs step{};
+        step.noise_embed = state->inp_embed;
+        step.positions_q = state->pos_q;
+        step.noise_rows = state->noise_rows;
+        step.mask_full = state->mask_full;
+        step.mask_swa = state->mask_swa;
+        DraftGraphOutputs output = build_draft_kv_step(
+            batch.g_ctx, batch.gf, dw, state->cache, step);
+        if (!output.hidden_states) {
+            draft_kv_batch_free(batch);
+            return false;
+        }
+        ggml_set_output(output.hidden_states);
+        ggml_build_forward_expand(batch.gf, output.hidden_states);
+        batch.hidden_by_lane.push_back(output.hidden_states);
+    }
+
+    batch.galloc =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!batch.galloc ||
+        !ggml_gallocr_alloc_graph(batch.galloc, batch.gf)) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph alloc failed lanes=%d\n", n_lanes);
+        draft_kv_batch_free(batch);
+        return false;
+    }
+
+    batch.n_lanes = n_lanes;
+    batch.q_len = dw.block_size;
+    batch.built_for = &dw;
+    batch.lane_states = lane_states;
+    std::fprintf(stderr,
+        "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d\n",
+        n_lanes, dw.block_size);
+    return true;
+}
+
+bool draft_kv_batch_compute(
+        DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states,
+        std::vector<std::vector<float>> & hidden_by_lane) {
+    hidden_by_lane.clear();
+    if (lane_states.empty()) return false;
+
+    const bool reusable =
+        batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
+        batch.lane_states == lane_states;
+    if (!reusable &&
+        !draft_kv_batch_build(
+            batch, dw, backend, lane_states)) {
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend, batch.gf) !=
+        GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph compute failed lanes=%d\n",
+            batch.n_lanes);
+        return false;
+    }
+
+    const size_t elements =
+        static_cast<size_t>(dw.n_embd) * static_cast<size_t>(batch.q_len);
+    hidden_by_lane.assign(
+        static_cast<size_t>(batch.n_lanes),
+        std::vector<float>(elements));
+    for (int lane = 0; lane < batch.n_lanes; ++lane) {
+        ggml_backend_tensor_get_async(
+            backend, batch.hidden_by_lane[static_cast<size_t>(lane)],
+            hidden_by_lane[static_cast<size_t>(lane)].data(), 0,
+            sizeof(float) * elements);
+    }
+    ggml_backend_synchronize(backend);
+    return true;
+}
+
 }  // namespace dflash::common

@@ -99,6 +99,30 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * logits, int k,
                                                   float * probs_out, int32_t * ids_out);
 
+// Batched concurrent-tree commit. Validation is fail-closed before any kernel
+// launches; all layer journals and convolution windows commit on one device
+// synchronization.
+GGML_BACKEND_API bool ggml_backend_cuda_gdn_transition_journal_commit_many(
+        const struct ggml_tensor * const * journals,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        const struct ggml_tensor * accepted_prefixes,
+        const struct ggml_tensor * active_slot_ids);
+
+// Promote accepted packed-tree K/V scratch rows into pager-owned rows.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_cache_commit_many(
+        struct ggml_tensor * const * caches, int n_caches,
+        const struct ggml_tensor * commit_rows,
+        const struct ggml_tensor * active_slot_ids,
+        int tree_scratch_base, int tree_scratch_stride);
+
+// Promote accepted BF16 tree feature rows into slot-local feature rings.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_feature_commit(
+        const struct ggml_tensor * source, struct ggml_tensor * destination,
+        const struct ggml_tensor * destination_rows);
+
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the
 // matching unregister function before releasing the tensor's backing buffer.
