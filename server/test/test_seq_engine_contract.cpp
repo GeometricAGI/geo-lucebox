@@ -23,6 +23,7 @@ struct Faults {
     bool overconsume_prefill = false;
     bool drop_second_completion = false;
     bool retire_leaks = false;
+    bool burst_when_speculation_disabled = false;
 };
 
 struct FakeCapabilities {
@@ -111,6 +112,10 @@ public:
                 100 + input.slot + (int32_t)slot.fed.size(),
                 false, {},
             });
+            if (faults_.burst_when_speculation_disabled &&
+                !input.allow_speculation) {
+                result.decode.back().committed_tokens.push_back(91);
+            }
         }
 
         std::vector<int> completed_this_step;
@@ -316,6 +321,18 @@ int main() {
             print_violations(test.label, violations);
         }
         CHECK(mentions(violations, test.expected));
+    }
+
+    {
+        SeqEngine::StepPlan plan;
+        plan.decode.push_back({0, 7, false});
+        SeqEngine::StepResult result;
+        SeqEngine::DecodeOutput output;
+        output.slot = 0;
+        output.token = 8;
+        output.committed_tokens = {9};
+        result.decode.push_back(output);
+        CHECK(!validate_step_result(plan, result, 1).empty());
     }
 
     std::printf("test_seq_engine_contract: %d checks passed\n", g_checks);
