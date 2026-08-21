@@ -211,7 +211,11 @@ void ggml_cuda_gqh2c_decode(const void * wire, float * dst,
 // DRAM cost of a decode matvec, so re-reading it per column makes an N-slot server
 // N times slower than it should be -- measured as 8 slots buying only 1.35x over
 // single-stream. Every column is accumulated against one load instead.
-#define GQH_MAX_COLS       8
+// Columns one fused dispatch can fold. 16 covers DFlash2 `--draft-block-size 12`
+// verify (and the default block-8) without the dequant->GEMM fallback; wider
+// batches still take that path. Exact-width arms stop at GQH_MULTICOL_SPEC_MAX;
+// 9..16 use the generic runtime-guarded instantiation.
+#define GQH_MAX_COLS       16
 // Output rows one warp owns on the batch-1 path. The kernel is memory-level-parallelism
 // bound, not issue bound (measured: a 14% instruction cut bought 2.5%, an 8-instruction
 // increase that kept two more requests in flight bought 4.4%), so the axis that pays is
@@ -378,10 +382,11 @@ void ggml_cuda_gqh2c_decode(const void * wire, float * dst,
 // So the wall is at 6-7, not at 5: the NCOLS axis costs ~11 VGPRs per column up to 4 and
 // then flattens as the allocator starts folding the column addressing, which is why 5
 // lands at 93-96 (GQH3 sits exactly ON the 96 cliff and keeps its 16 waves) instead of
-// the ~103 a linear extrapolation from NCOLS 4 predicts. 5 is the cap because it is the
-// widest an MTP verify batch reaches: --spec-draft-n-max 4 verifies 4 drafts + 1 = 5
-// columns. 6 would need a GQH2_H gate (97 VGPRs, 12 waves) and nothing dispatches it.
-#define GQH_MULTICOL_SPEC_MAX 5
+// the ~103 a linear extrapolation from NCOLS 4 predicts. Cap is 8 because that is the
+// DFlash2 default verify width (GGUF `dflash.block_size`); 6 stays 16 waves on GQH4/GQH3,
+// 7-8 drop to 12 waves on the measured VGPR grid (still far cheaper than dequant->GEMM).
+// 9..GQH_MAX_COLS stay on the generic ROWS==1 instantiation.
+#define GQH_MULTICOL_SPEC_MAX 8
 
 // Activation base POINTERS the exact-width arm carries; every further column is addressed
 // as base 0 plus a uniform 32-bit byte offset. This is a statement about how many SGPR
@@ -474,7 +479,7 @@ static __device__ __forceinline__ gqh_wire gqh_wire_load(
 // baked it into `xc` would get a fourth, fifth, ... base pointer, which is the thing the
 // xcol hoist in gqh_matvec_kernel could not make LLVM keep in SGPRs. It does not change
 // the overflow bound in any way that matters: the widest x on this arm is
-// GQH_MULTICOL_SPEC_MAX columns of `in` floats (5 x 17408 x 4 B = 348 KB), so
+// GQH_MULTICOL_SPEC_MAX columns of `in` floats (8 x 17408 x 4 B = 557 KB), so
 // `sb*1024 + j0*4 + col_off` still cannot reach 32 bits, and col_off is a multiple of
 // `in`*4 (>= 20 KB), so the 32-byte alignment the 128-bit loads need is unchanged.
 static __device__ __forceinline__ void gqh_load_x(
@@ -1076,7 +1081,7 @@ static __global__ void gqh_matvec_kernel(
                 // row r changes nothing about either row's term order.
     #pragma unroll
                 for (int c = 0; c < NCOLS_MAX; ++c) {
-                    if (NCOLS_MAX == GQH_MAX_COLS && c >= ncols) {
+                    if (!XSHARED && c >= ncols) {
                         continue;
                     }
                     float xs[GQH_PER_LANE];
@@ -1111,7 +1116,7 @@ static __global__ void gqh_matvec_kernel(
         for (int c = 0; c < NCOLS_MAX; ++c) {
             // Only the generic instantiation can be dispatched with ncols < NCOLS_MAX;
             // the exact-width ones write every column they carry.
-            if (NCOLS_MAX == GQH_MAX_COLS && c >= ncols) {
+            if (!XSHARED && c >= ncols) {
                 continue;
             }
 #pragma unroll
@@ -1372,11 +1377,10 @@ static void gqh_matvec_launch(
                 data, x, y, in, out, ncols, tensor_scale, grid,
                 x_col_stride, y_col_stride, data, y, tensor_scale, grid);
     } else {
-        // Exact-width arm for the MTP verify widths (n-max=1..4 draft tokens verify at
-        // ncols 2..5). The switch is exhaustive over 2..GQH_MULTICOL_SPEC_MAX and the
-        // assert is what keeps it from drifting off that constant; anything wider keeps
-        // the generic instantiation below, unchanged.
-        static_assert(GQH_MULTICOL_SPEC_MAX == 5, "add or remove a case below to match");
+        // Exact-width arm for spec-decode verify (DFlash2 block 8 => ncols 8).
+        // The switch is exhaustive over 2..GQH_MULTICOL_SPEC_MAX; anything wider
+        // keeps the generic instantiation below.
+        static_assert(GQH_MULTICOL_SPEC_MAX == 8, "add or remove a case below to match");
         if (gqh_multicol_on() && ncols <= GQH_MULTICOL_SPEC_MAX) {
             switch (ncols) {
                 case 2:
@@ -1396,6 +1400,21 @@ static void gqh_matvec_launch(
                     return;
                 case 5:
                     gqh_multicol_dispatch<RUNG, 5>(
+                        threads, stream, data, x, y, in, out, tensor_scale, grid,
+                        x_col_stride, y_col_stride);
+                    return;
+                case 6:
+                    gqh_multicol_dispatch<RUNG, 6>(
+                        threads, stream, data, x, y, in, out, tensor_scale, grid,
+                        x_col_stride, y_col_stride);
+                    return;
+                case 7:
+                    gqh_multicol_dispatch<RUNG, 7>(
+                        threads, stream, data, x, y, in, out, tensor_scale, grid,
+                        x_col_stride, y_col_stride);
+                    return;
+                case 8:
+                    gqh_multicol_dispatch<RUNG, 8>(
                         threads, stream, data, x, y, in, out, tensor_scale, grid,
                         x_col_stride, y_col_stride);
                     return;
