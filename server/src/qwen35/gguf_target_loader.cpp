@@ -177,6 +177,14 @@ static bool should_load_target_tensor(const char * name,
     return false;
 }
 
+// GQH headers (scale + grid) are per-tensor in GGUF KV. A stacked alias is one
+// ggml tensor spanning two payloads, so the fused matvec would decode the second
+// weight with the first tensor's header. q8_0 / K-quant pairs are safe to stack.
+static bool is_gqh_weight_type(ggml_type t) {
+    return t == GGML_TYPE_GQH3 || t == GGML_TYPE_GQH2_H ||
+           t == GGML_TYPE_GQH2_C || t == GGML_TYPE_GQH4;
+}
+
 static bool validate_embedded_nextn_blocks(const gguf_context * gctx,
                                            uint32_t target_layer_count,
                                            uint32_t block_count,
@@ -729,7 +737,9 @@ bool load_target_gguf_partial(const std::string & path,
                     if (first >= 0 || second >= 0) break;
                 }
             }
-            if (first >= 0 && second >= 0 && !taken[(size_t)first] && !taken[(size_t)second]) {
+            if (first >= 0 && second >= 0 && !taken[(size_t)first] && !taken[(size_t)second] &&
+                !is_gqh_weight_type(allocs[(size_t)first].tensor->type) &&
+                !is_gqh_weight_type(allocs[(size_t)second].tensor->type)) {
                 taken[(size_t)first] = taken[(size_t)second] = true;
                 ordered.push_back(allocs[(size_t)first]);
                 ordered.push_back(allocs[(size_t)second]);
@@ -861,6 +871,7 @@ bool load_target_gguf_partial(const std::string & path,
             auto make_stack = [&](ggml_tensor * first, ggml_tensor * second,
                                   const char * name) -> ggml_tensor * {
                 if (!first || !second || !out.stack_ctx) return nullptr;
+                if (is_gqh_weight_type(first->type) || is_gqh_weight_type(second->type)) return nullptr;
                 if (first->type != second->type || first->ne[0] != second->ne[0]) return nullptr;
                 if (!ggml_is_contiguous(first) || !ggml_is_contiguous(second)) return nullptr;
                 const char * f = (const char *)first->data;
