@@ -16,15 +16,15 @@
 //   1. dequant->cuBLAS: x is the full cols x cols identity, wider than the fused
 //      hook's batch cap, so dst[i,j] is fp16(decode(W[i,j])) widened to f32 and is
 //      compared BITWISE against the reference decode rounded to fp16.
-//   2. fused matvec: x is the first 8 basis vectors, inside the cap, so the kernel
+//   2. fused matvec: x is the first nvec basis vectors, inside the cap, so the kernel
 //      accumulates decode(W) * x in f32 and dst[i,j] IS the raw f32 decode,
 //      compared BITWISE against the f32 reference. gqh2_c has no fused kernel yet
 //      and falls back to path 1, so it skips this check.
 //
 // usage: test-gqh-backend <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> [nvec]
-//   nvec (default 8) must be <= the tree's fused-matvec column cap, or the hook declines
-//   and the fallback answers in fp16, failing every fused comparison. llama.cpp caps at
-//   MMVQ_MAX_BATCH_SIZE (8); lucebox caps at luce_mmvq_max_ncols (default 3).
+//   nvec (default 8) must be <= GQH_MAX_COLS (16), or the hook declines and the
+//   fallback answers in fp16, failing every fused comparison. GQH is not gated
+//   on luce_mmvq_max_ncols; 8 is the DFlash2 default verify width.
 // exit:  0 = bit-identical, 1 = mismatch/error, 77 = skipped (no GPU)
 
 #include "ggml.h"

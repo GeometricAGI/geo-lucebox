@@ -2915,6 +2915,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // GQH fused decode matvec, same shape of hook and same reason: the generic chain
     // would dequantize the whole weight matrix to f16 per token. Returns false for an
     // unregistered tensor, keeping the fallback. GGML_GQH_FUSED=0 forces the fallback.
+    //
+    // NOT gated on luce_mmvq_max_ncols. That cap is the MMVQ/MMQ crossover for types
+    // that have a vec_dot (default 3). GQH has no MMVQ and no MMQ: N > 3 used to fall
+    // through to dequant->GEMM, which is pathological (N=4 was 6x a fused N=5). The
+    // kernel itself declines anything past GQH_MAX_COLS (16), so DFlash2 verify
+    // (block 8, --draft-block-size 12) stays on the fused path.
     static const bool gqh_fused_on = []() {
         const char * e = getenv("GGML_GQH_FUSED");
         return e ? atoi(e) != 0 : true;
@@ -2925,7 +2931,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
             && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
             && src1->ne[2] == 1 && src1->ne[3] == 1
-            && src1->ne[1] <= luce_mmvq_max_ncols
             && ggml_cuda_gqh_mul_mat_vec(
                    src0->type, src0->data, (const float *) src1->data, (float *) dst->data,
                    (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],

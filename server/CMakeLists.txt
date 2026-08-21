@@ -1179,12 +1179,12 @@ if(DFLASH27B_TESTS)
             add_test(NAME test-gqh-cpu-decode-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                      COMMAND test-gqh-cpu-decode ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                              "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32")
-            # nvec=3 for the backend probe only: this tree caps the fused matvec at
-            # luce_mmvq_max_ncols (default 3), so a wider probe silently takes the
-            # dequant fallback and fails every fused comparison on fp16 rounding.
+            # nvec=8 exercises the DFlash2 default verify width on the fused path.
+            # GQH dispatch is no longer gated on luce_mmvq_max_ncols (default 3);
+            # a narrower probe would miss the N=8 exact-width arm.
             add_test(NAME test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                      COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
-                             "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 3)
+                             "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8)
         endforeach()
     endif()
 
