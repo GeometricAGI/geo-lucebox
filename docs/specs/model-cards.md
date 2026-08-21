@@ -67,6 +67,7 @@ Examples:
 |---|---|
 | `Qwen3.6-27B` | `qwen3.6-27b.json` |
 | `Qwen3.6 27B` | `qwen3.6-27b.json` |
+| `Qwen38 27b` | `qwen38-27b.json` |
 | `Foo_Bar` | `foo-bar.json` |
 | `Laguna-XS.2` | `laguna-xs.2.json` |
 | `DeepSeek-V4-Flash` | `deepseek-v4-flash.json` |
