@@ -34,5 +34,17 @@ bool register_gqh_headers(const std::string & gguf_path, ggml_context * ctx);
 // later load that reuses the address. Safe on a context that registered nothing.
 void unregister_gqh_headers(ggml_context * ctx);
 
+// True when `ctx` holds any GQH matvec qtype (108/109/110/111), including
+// gqh2_c which has no KV header. Used to keep SpecLA verify on the exact-width
+// ncols == native_block I8 kernel.
+bool ggml_context_has_gqh(ggml_context * ctx);
+
+// Tree verify is 1+n_nodes columns. The GQH I8/glu-fuse kernel is exact-width
+// ncols == native_block (8 for DFlash2), so a DDTree budget of native_block
+// lands on ncols=9 and misses it. Cap requested budget to native_block-1 when
+// the target is GQH; otherwise return `requested` unchanged. Logs once per
+// process when it actually clamps.
+int gqh_cap_spec_ddtree_budget(ggml_context * ctx, int requested, int native_block);
+
 }  // namespace common
 }  // namespace dflash

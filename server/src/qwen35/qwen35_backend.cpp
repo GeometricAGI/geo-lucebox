@@ -45,6 +45,7 @@
 #endif
 
 #include "kv_quant.h"
+#include "common/gqh_headers.h"
 
 namespace dflash::common {
 
@@ -381,6 +382,13 @@ bool Qwen35Backend::init() {
     }
 
     // Create KV cache
+    // GQH I8/glu-fuse is exact-width ncols == block_size. Tree verify is
+    // 1+n_nodes columns, so budget == block_size (the #625 default 8) would
+    // dispatch ncols=9 and miss that kernel (~25% HE). Cap first.
+    if (cfg_.ddtree_mode) {
+        cfg_.ddtree_budget = gqh_cap_spec_ddtree_budget(
+            w_.ctx, cfg_.ddtree_budget, dw_.block_size);
+    }
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;

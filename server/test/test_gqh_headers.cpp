@@ -135,6 +135,8 @@ struct model {
 int main() {
     using dflash::common::register_gqh_headers;
     using dflash::common::unregister_gqh_headers;
+    using dflash::common::ggml_context_has_gqh;
+    using dflash::common::gqh_cap_spec_ddtree_budget;
 
     // ---- 1. happy path: one tensor per header-bearing rung, plus a gqh2_c ----
     // The gqh2_c tensor is resident and has NO entry. This parser must ignore it.
@@ -254,6 +256,28 @@ int main() {
         check_refused(register_gqh_headers(p, m.ctx), "grid code 12 is out of range");
     }
 
+    // ---- 9. SpecLA budget cap: GQH stays on ncols == native_block ----------
+    {
+        check(gqh_cap_spec_ddtree_budget(nullptr, 8, 8) == 8,
+              "no ctx: budget 8 stays 8");
+        model gqh({ { "blk.0.ffn_gate.weight", GGML_TYPE_GQH3 } });
+        check(ggml_context_has_gqh(gqh.ctx), "GQH3 context is detected");
+        check(gqh_cap_spec_ddtree_budget(gqh.ctx, 8, 8) == 7,
+              "GQH budget 8 caps to 7 (ncols=8)");
+        check(gqh_cap_spec_ddtree_budget(gqh.ctx, 7, 8) == 7,
+              "GQH budget 7 is already at the cap");
+        check(gqh_cap_spec_ddtree_budget(gqh.ctx, 22, 8) == 7,
+              "GQH budget 22 caps to 7");
+        model q4({ { "blk.0.ffn_gate.weight", GGML_TYPE_Q4_K } });
+        check(!ggml_context_has_gqh(q4.ctx), "Q4_K context is not GQH");
+        check(gqh_cap_spec_ddtree_budget(q4.ctx, 8, 8) == 8,
+              "non-GQH budget 8 is unchanged");
+        model c2({ { "blk.0.attn_q.weight", GGML_TYPE_GQH2_C } });
+        check(ggml_context_has_gqh(c2.ctx), "gqh2_c (no KV header) still counts");
+        check(gqh_cap_spec_ddtree_budget(c2.ctx, 8, 8) == 7,
+              "gqh2_c budget 8 caps to 7");
+    }
+
     for (const std::string & f : tmp_files) {
         std::remove(f.c_str());
     }
@@ -263,6 +287,6 @@ int main() {
         return 1;
     }
     std::printf("OK   test_gqh_headers: KV parse, header values, cover rules, "
-                "gqh2_c ignored, 6 malformed inputs\n");
+                "gqh2_c ignored, 6 malformed inputs, SpecLA budget cap\n");
     return 0;
 }

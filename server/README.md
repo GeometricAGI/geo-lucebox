@@ -550,6 +550,9 @@ hf download Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF Qwen3.8-27B-GQH-Q3KXL.gguf \
 A DFlash2/DSpark drafter is optional; without `--draft` the server runs AR on
 the GQH target. Converted Qwen3.8 drafters: `z-lab/Qwen3.8-27B-DFlash2` and
 `RadixArk/Qwen3.8-27B-DSpark` via `scripts/convert_dflash_to_gguf.py`.
+On GQH, `--specla --ddtree-budget 8` is capped to budget 7 so tree verify stays
+on the ncols=8 I8 kernel (`1+n_nodes`); uncapped budget 8 is ncols=9 and misses
+that kernel.
 
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
