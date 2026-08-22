@@ -1185,6 +1185,9 @@ if(DFLASH27B_TESTS)
             add_test(NAME test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                      COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                              "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8)
+            # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
+            set_tests_properties(test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
         endforeach()
     endif()
 
@@ -1200,6 +1203,38 @@ if(DFLASH27B_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
             "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include")
         add_test(NAME test_gqh_headers COMMAND test_gqh_headers)
+    endif()
+
+    # Shipped GQH3 5120x17408 gate/up pair + SWIGLU graph (Qwen3.8-GQH-Q3KXL FFN).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gqh_pair_glu.cpp"
+            AND EXISTS "${GQH_TEST_DIR}/gqh-vectors/gqh3_64x1024.wire.bin")
+        add_executable(test_gqh_pair_glu test/test_gqh_pair_glu.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_gqh_pair_glu.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_gqh_pair_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_gqh_pair_glu PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_gqh_pair_glu.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_gqh_pair_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_gqh_pair_glu PRIVATE GGML_USE_CUDA)
+        endif()
+        target_include_directories(test_gqh_pair_glu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/test
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_gqh_pair_glu PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_gqh_pair_glu PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_gqh_pair_glu PRIVATE hip::host)
+        endif()
+        add_test(NAME test_gqh_pair_glu
+                 COMMAND test_gqh_pair_glu
+                         "${GQH_TEST_DIR}/gqh-vectors/gqh3_64x1024.wire.bin")
+        set_tests_properties(test_gqh_pair_glu PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
     endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")

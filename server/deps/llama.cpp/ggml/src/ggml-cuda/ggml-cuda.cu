@@ -2753,6 +2753,96 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
     }
 
+    // GQH gate/up pair: two same-rung, same-shape GEMVs that share `x`, issued as
+    // one dispatch, then the existing SwiGLU. SuperSonic / lucebox_gqh measured this
+    // on GQH4 out==17408 (the only fractional occupancy-round bucket): folding the
+    // pair pays the per-dispatch cost once and turns 8.5 rounds into 17.0. Qwen3.8
+    // spells the FFN as {MUL_MAT, MUL_MAT, GLU} (ggml_swiglu_split), not the
+    // {MUL_MAT, UNARY, MUL_MAT, MUL} pattern that fusion originally matched, so the
+    // pair kernel was dead until this hook. GGML_GQH_FUSE_PAIR=0 is the same-binary
+    // control; GGML_GQH_FUSED=0 also declines so dequant A/B stays coherent.
+    if (direct_vector_layout && !ids &&
+            ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
+        static const bool gqh_fused_on = []() {
+            const char * e = getenv("GGML_GQH_FUSED");
+            return e ? atoi(e) != 0 : true;
+        }();
+        static const bool pair_on = []() {
+            const char * e = getenv("GGML_GQH_FUSE_PAIR");
+            return e ? atoi(e) != 0 : true;
+        }();
+        const ggml_tensor * w_gate = gate->src[0];
+        const ggml_tensor * w_up   = up->src[0];
+        const ggml_tensor * xt     = gate->src[1];
+        if (gqh_fused_on && pair_on && w_gate && w_up && xt &&
+                xt == up->src[1] && !gate->src[2] && !up->src[2] &&
+                w_gate->type == w_up->type &&
+                (w_gate->type == GGML_TYPE_GQH3 ||
+                 w_gate->type == GGML_TYPE_GQH4 ||
+                 w_gate->type == GGML_TYPE_GQH2_H) &&
+                ggml_are_same_shape(w_gate, w_up) &&
+                ggml_are_same_stride(w_gate, w_up) &&
+                ggml_are_same_shape(gate, up) &&
+                ggml_are_same_stride(gate, up) &&
+                xt->type == GGML_TYPE_F32 &&
+                gate->type == GGML_TYPE_F32 &&
+                up->type == GGML_TYPE_F32 &&
+                glu->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(xt) &&
+                ggml_is_contiguous(gate) &&
+                ggml_is_contiguous(up) &&
+                xt->ne[1] >= 1 && xt->ne[1] <= 16 &&
+                xt->ne[2] == 1 && xt->ne[3] == 1 &&
+                gate->data != up->data &&
+                w_gate->buffer && w_up->buffer &&
+                !ggml_backend_buft_is_cuda_split(w_gate->buffer->buft) &&
+                !ggml_backend_buft_is_cuda_split(w_up->buffer->buft) &&
+                ggml_cuda_gqh_mul_mat_vec_pair(
+                    w_gate->type,
+                    w_gate->data, (float *) gate->data,
+                    w_up->data,   (float *) up->data,
+                    (const float *) xt->data,
+                    (int) w_gate->ne[0], (int) w_gate->ne[1],
+                    (int) xt->ne[1],
+                    (int64_t) (xt->nb[1] / sizeof(float)),
+                    (int64_t) (gate->nb[1] / sizeof(float)),
+                    ctx.stream())) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: gqh pair-fused gate/up %s %dx%d ncols=%d\n", __func__,
+                              ggml_type_name(w_gate->type),
+                              (int) w_gate->ne[0], (int) w_gate->ne[1],
+                              (int) xt->ne[1]);
+            }
+            // ...and the SwiGLU itself folds into the pre-pass the DOWN projection would
+            // have launched separately: same tensor, two 68-block dispatches over 0.56 MB,
+            // one of which only re-reads what the other just wrote. Bit-identical output
+            // (see ggml_cuda_gqh_glu_quant), so this is a dispatch merge and not a numeric
+            // change; GGML_GQH_FUSE_GLU=0 keeps the unfused pair for the same-binary A/B.
+            // `swapped` needs no handling here: src1 is a separate tensor, which is the
+            // branch of ggml_cuda_op_unary_gated that ignores it.
+            // Logged once, for the same reason the pair fusion is: a fusion that silently
+            // declines is indistinguishable from a fusion that bought nothing, and
+            // iteration 10 lost eight HE runs to exactly that class of mistake.
+            static bool glu_logged = false;
+            if (!ggml_cuda_gqh_glu_quant(
+                        (const float *) gate->data, (const float *) up->data,
+                        (float *) glu->data, (int) glu->ne[0], (int) xt->ne[1],
+                        (int64_t) (gate->nb[1] / sizeof(float)),
+                        (int64_t) (up->nb[1]   / sizeof(float)),
+                        (int64_t) (glu->nb[1]  / sizeof(float)),
+                        ctx.stream())) {
+                ggml_cuda_op_swiglu(ctx, glu);
+            } else if (!glu_logged) {
+                glu_logged = true;
+                GGML_LOG_INFO("%s: gqh glu-fused swiglu+prepass %dx%d\n", __func__,
+                              (int) glu->ne[0], (int) xt->ne[1]);
+            }
+            return true;
+        }
+    }
+
     if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.gate = gate->src[0];
