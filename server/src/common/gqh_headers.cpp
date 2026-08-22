@@ -44,6 +44,43 @@ static bool gqh_qtype_has_header(int32_t q) {
     return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H || q == GGML_TYPE_GQH4;
 }
 
+static bool gqh_qtype_is_matvec(int32_t q) {
+    return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H ||
+           q == GGML_TYPE_GQH2_C || q == GGML_TYPE_GQH4;
+}
+
+bool ggml_context_has_gqh(ggml_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+         t = ggml_get_next_tensor(ctx, t)) {
+        if (gqh_qtype_is_matvec((int32_t) t->type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int gqh_cap_spec_ddtree_budget(ggml_context * ctx, int requested, int native_block) {
+    if (requested < 1 || native_block < 2 || !ggml_context_has_gqh(ctx)) {
+        return requested;
+    }
+    const int cap = native_block - 1;
+    if (requested <= cap) {
+        return requested;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::fprintf(stderr,
+            "[qwen35-spec] GQH I8/glu-fuse verify is ncols=%d; "
+            "capping --ddtree-budget %d -> %d so 1+n_nodes stays on that kernel\n",
+            native_block, requested, cap);
+    }
+    return cap;
+}
+
 bool register_gqh_headers(const std::string & gguf_path, ggml_context * ctx) {
     // Collect the resident header-bearing GQH tensors. Walk the context rather than
     // the named members: GQH is not tied to a surface the way the mix qtypes are.
