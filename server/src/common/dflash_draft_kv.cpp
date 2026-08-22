@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace dflash::common {
 
@@ -352,9 +353,36 @@ static bool draft_kv_batch_build(
     }
 
     draft_kv_batch_free(batch);
-    const int n_lanes = static_cast<int>(lane_states.size());
-    const size_t arena_size =
-        (32u + 16u * static_cast<size_t>(n_lanes)) * 1024u * 1024u;
+    constexpr size_t graph_nodes_per_lane = 4096;
+    constexpr size_t shared_graph_nodes = 2048;
+    const size_t n_lanes_size = lane_states.size();
+    if (n_lanes_size >
+        (static_cast<size_t>(std::numeric_limits<int>::max()) -
+            shared_graph_nodes) /
+            graph_nodes_per_lane) {
+        return false;
+    }
+    const int n_lanes = static_cast<int>(n_lanes_size);
+    const size_t graph_capacity =
+        graph_nodes_per_lane * n_lanes_size + shared_graph_nodes;
+    if (graph_capacity > std::numeric_limits<size_t>::max() / 2) {
+        return false;
+    }
+    const size_t tensor_capacity = 2 * graph_capacity;
+    const size_t tensor_overhead = ggml_tensor_overhead();
+    if (tensor_overhead != 0 &&
+        tensor_capacity >
+            std::numeric_limits<size_t>::max() / tensor_overhead) {
+        return false;
+    }
+    const size_t tensor_bytes = tensor_capacity * tensor_overhead;
+    const size_t graph_bytes =
+        ggml_graph_overhead_custom(graph_capacity, false);
+    if (tensor_bytes >
+        std::numeric_limits<size_t>::max() - graph_bytes) {
+        return false;
+    }
+    const size_t arena_size = graph_bytes + tensor_bytes;
     batch.meta_arena.resize(arena_size);
     ggml_init_params params{};
     params.mem_size = batch.meta_arena.size();
@@ -366,7 +394,7 @@ static bool draft_kv_batch_build(
         return false;
     }
     batch.gf = ggml_new_graph_custom(
-        batch.g_ctx, 4096 * n_lanes + 2048, false);
+        batch.g_ctx, graph_capacity, false);
 
     batch.hidden_by_lane.reserve(static_cast<size_t>(n_lanes));
     for (DraftKvState * state : lane_states) {
@@ -413,8 +441,11 @@ static bool draft_kv_batch_build(
     batch.built_for = &dw;
     batch.lane_states = lane_states;
     std::fprintf(stderr,
-        "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d\n",
-        n_lanes, dw.block_size);
+        "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d "
+        "metadata=%.1f MiB\n",
+        n_lanes, dw.block_size,
+        static_cast<double>(batch.meta_arena.size()) /
+            (1024.0 * 1024.0));
     return true;
 }
 

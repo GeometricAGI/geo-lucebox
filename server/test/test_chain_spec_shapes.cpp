@@ -9,6 +9,17 @@ using namespace dflash::common;
 static int g_checks = 0;
 
 int main() {
+    const DDTree root_only = make_dspark_chain_tree({10});
+    CHECK(root_only.n_nodes == 0);
+    CHECK((root_only.parents == std::vector<int>{-1}));
+    CHECK(root_only.child_maps.size() == 1);
+    CHECK((root_only.visibility == std::vector<uint8_t>{1}));
+    int root_pending = -1;
+    const int32_t root_posterior[] = {11};
+    CHECK((follow_verified_tree(
+        root_only, root_posterior, root_pending) == std::vector<int>{0}));
+    CHECK(root_pending == 11);
+
     const std::vector<int32_t> draft = {10, 11, 12, 13};
     const DDTree tree = make_chain_verify_tree(draft);
     CHECK(tree.n_nodes == 3);

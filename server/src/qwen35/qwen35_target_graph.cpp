@@ -1323,12 +1323,17 @@ static ggml_tensor * build_full_attn_block(
         const int64_t padded = ((requested + 255) / 256) * 256;
         const int launch_len =
             (int)std::min<int64_t>(padded, logical_capacity);
-        ggml_tensor * out = ggml_paged_attn_ext(
-            ctx, q, cache_k, cache_v, paged_block_table,
-            paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
-            PAGED_BLOCK_SIZE, launch_len,
-            paged_tree_parent_ids, paged_tree_sizes,
-            tree_width, tree_scratch_base, tree_scratch_stride);
+        ggml_tensor * out = paged_tree
+            ? ggml_paged_attn_ext_tree(
+                ctx, q, cache_k, cache_v, paged_block_table,
+                paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
+                PAGED_BLOCK_SIZE, launch_len,
+                paged_tree_parent_ids, paged_tree_sizes,
+                tree_scratch_base, tree_scratch_stride)
+            : ggml_paged_attn_ext(
+                ctx, q, cache_k, cache_v, paged_block_table,
+                paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
+                PAGED_BLOCK_SIZE, launch_len);
         if (dense_token_layout) {
             out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
         }

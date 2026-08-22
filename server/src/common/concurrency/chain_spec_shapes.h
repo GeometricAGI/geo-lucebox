@@ -24,7 +24,7 @@ inline int chain_decode_bucket_width(int lanes) {
 inline DDTree make_chain_verify_tree(
         const std::vector<int32_t> & draft_tokens) {
     DDTree tree;
-    if (draft_tokens.size() <= 1) return tree;
+    if (draft_tokens.empty()) return tree;
 
     tree.n_nodes = static_cast<int>(draft_tokens.size()) - 1;
     tree.token_ids.assign(draft_tokens.begin() + 1, draft_tokens.end());

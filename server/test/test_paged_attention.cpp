@@ -352,12 +352,14 @@ bool run_case(ggml_backend_t backend,
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int max_kv_seq_len = *std::max_element(
         test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
-    ggml_tensor * output = ggml_paged_attn_ext(
-        ctx, q, k, v, table, kv_seq_lens, active, positions,
-        scale, BLOCK_SIZE, max_kv_seq_len, parents, sizes,
-        tree ? tree->width : 0,
-        tree ? tree_scratch_base : 0,
-        tree ? tree->scratch_stride : 0);
+    ggml_tensor * output = tree
+        ? ggml_paged_attn_ext_tree(
+            ctx, q, k, v, table, kv_seq_lens, active,
+            positions, scale, BLOCK_SIZE, max_kv_seq_len, parents, sizes,
+            tree_scratch_base, tree->scratch_stride)
+        : ggml_paged_attn_ext(
+            ctx, q, k, v, table, kv_seq_lens, active, positions,
+            scale, BLOCK_SIZE, max_kv_seq_len);
     ggml_set_output(output);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -483,8 +485,7 @@ bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
         ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_tensor * output = ggml_paged_attn_ext(
         ctx, q, k, v, table, kv_seq_lens, nullptr, nullptr,
-        1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE, 1,
-        nullptr, nullptr, 0, 0, 0);
+        1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE, 1);
 
     const bool rejected = !ggml_backend_supports_op(backend, output);
     std::printf("paged attention unlaunchable GQA support %s\n",

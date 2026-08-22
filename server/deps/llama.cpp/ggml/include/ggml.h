@@ -2503,17 +2503,6 @@ extern "C" {
     // marks a padding row. NULL keeps the decode semantics (full cached
     // length per row).
     //
-    // parent_ids/tree_sizes optionally enable packed tree verification.
-    // Queries are flattened sequence-major: tree sequence s occupies rows
-    // [s*tree_width, (s+1)*tree_width). parent_ids is contiguous I32
-    // [tree_width, n_tree_seq] (root parent -1), and tree_sizes is contiguous
-    // I32 [n_tree_seq]. active_slot_ids is required and remains per query row;
-    // it selects the physical block-table column and scratch slab. Each live
-    // query attends its complete committed prefix from the block table plus
-    // its own candidate node and ancestors from physical K/V rows
-    // tree_scratch_base + slot*tree_scratch_stride + node. Siblings and rows
-    // at or beyond tree_sizes[s] are excluded. query_positions must be NULL
-    // in tree mode. Pass NULL/NULL/0/0/0 to retain standard paged attention.
     GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2525,32 +2514,37 @@ extern "C" {
             struct ggml_tensor  * query_positions,
             float                 scale,
             int                   block_size,
+            int                   max_kv_seq_len);
+
+    // Packed tree verification over the same paged K/V pool.
+    // Queries are flattened sequence-major: tree sequence s occupies rows
+    // [s*tree_width, (s+1)*tree_width). parent_ids is contiguous I32
+    // [tree_width, n_tree_seq] (root parent -1), and tree_sizes is contiguous
+    // I32 [n_tree_seq]. active_slot_ids is required and remains per query row;
+    // it selects the physical block-table column and scratch slab. Each live
+    // query attends its complete committed prefix from the block table plus
+    // its own candidate node and ancestors from physical K/V rows
+    // tree_scratch_base + slot*tree_scratch_stride + node. Siblings and rows
+    // at or beyond tree_sizes[s] are excluded. query_positions may describe
+    // compact autoregressive rows in a mixed AR/tree batch; tree rows ignore
+    // it and read the full committed prefix. Pure tree batches pass NULL.
+    // tree_width is derived from parent_ids.
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
+            float                 scale,
+            int                   block_size,
             int                   max_kv_seq_len,
-            struct ggml_tensor  * parent_ids
-#ifdef __cplusplus
-                = nullptr
-#endif
-            ,
-            struct ggml_tensor  * tree_sizes
-#ifdef __cplusplus
-                = nullptr
-#endif
-            ,
-            int                   tree_width
-#ifdef __cplusplus
-                = 0
-#endif
-            ,
-            int                   tree_scratch_base
-#ifdef __cplusplus
-                = 0
-#endif
-            ,
-            int                   tree_scratch_stride
-#ifdef __cplusplus
-                = 0
-#endif
-            );
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * tree_sizes,
+            int                   tree_scratch_base,
+            int                   tree_scratch_stride);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).

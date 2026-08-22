@@ -15780,10 +15780,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return true; // all inputs are contiguous, see ggml.c
         case GGML_OP_GATED_DELTA_NET:
             {
-                // The Vulkan kernel addresses state by compact sequence row
-                // and does not consume the active-slot, raw-gate, or journal inputs.
-                if (op->src[8] != nullptr || op->src[9] != nullptr ||
+                // The Vulkan kernel consumes only src[0..5] and writes final
+                // state into the result tensor. Reject tree, persistent,
+                // active-slot, raw-gate, journal, and in-place variants.
+                if (op->src[6] != nullptr || op->src[7] != nullptr ||
+                    op->src[8] != nullptr || op->src[9] != nullptr ||
                     op->src[11] != nullptr ||
+                    ggml_get_op_params_i32(op, 1) != 0 ||
+                    ggml_get_op_params_i32(op, 2) == 1 ||
                     ggml_get_op_params_i32(op, 10) == 1) {
                     return false;
                 }

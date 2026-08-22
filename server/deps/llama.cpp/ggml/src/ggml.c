@@ -5697,7 +5697,7 @@ struct ggml_tensor * ggml_flash_attn_sparse(
 
 // ggml_paged_attn
 
-struct ggml_tensor * ggml_paged_attn_ext(
+static struct ggml_tensor * ggml_paged_attn_ext_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -5821,6 +5821,50 @@ struct ggml_tensor * ggml_paged_attn_ext(
     result->src[8] = tree_sizes;
 
     return result;
+}
+
+struct ggml_tensor * ggml_paged_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens,
+        active_slot_ids, query_positions, scale, block_size,
+        max_kv_seq_len, NULL, NULL, 0, 0, 0);
+}
+
+struct ggml_tensor * ggml_paged_attn_ext_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * tree_sizes,
+        int                   tree_scratch_base,
+        int                   tree_scratch_stride) {
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->ne[0] > 0 && parent_ids->ne[0] <= INT_MAX);
+    const int tree_width = (int) parent_ids->ne[0];
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens,
+        active_slot_ids, query_positions, scale, block_size,
+        max_kv_seq_len, parent_ids, tree_sizes, tree_width,
+        tree_scratch_base, tree_scratch_stride);
 }
 
 // ggml_flash_attn_back
