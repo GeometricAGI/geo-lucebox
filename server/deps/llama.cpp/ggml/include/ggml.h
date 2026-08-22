@@ -221,7 +221,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            12
+#define GGML_MAX_SRC            10
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -2972,11 +2972,11 @@ extern "C" {
     // CUDA/HIP fixed-chain journal in compact F32 [J,H,T,B] layout:
     // scalar gate J=2*S_v+1 stores [g | k | delta], while KDA J=3*S_v
     // stores [g[S_v] | k | delta]. Delta is captured after the
-    // state-dependent reduction. A tree-form op may attach the journal when
-    // its parent table describes one root-inclusive chain.
-    GGML_API void ggml_gated_delta_net_set_transition_journal(
-            struct ggml_tensor * tensor,
-            struct ggml_tensor * journal);
+    // state-dependent reduction. The returned tensor is a view into the
+    // GDN result buffer, so no extra source slot is required.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_transition_journal(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * tensor);
 
     // dflash extension: let the kernel derive the gates from the raw
     // projections instead of graph-side sigmoid/softplus ops:

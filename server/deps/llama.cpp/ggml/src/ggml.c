@@ -6923,6 +6923,7 @@ void ggml_gated_delta_net_set_skip_intermediate(
         bool                 skip_intermediate) {
     GGML_ASSERT(tensor != NULL);
     GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 3) == 0);
     ggml_set_op_params_i32(tensor, 0, skip_intermediate ? 1 : 0);
 
     const struct ggml_tensor * v = tensor->src[2];
@@ -6950,13 +6951,15 @@ void ggml_gated_delta_net_set_skip_intermediate(
     tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
 }
 
-void ggml_gated_delta_net_set_transition_journal(
-        struct ggml_tensor * tensor,
-        struct ggml_tensor * journal) {
-    GGML_ASSERT(tensor != NULL && journal != NULL);
+struct ggml_tensor * ggml_gated_delta_net_capture_transition_journal(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tensor) {
+    GGML_ASSERT(ctx != NULL && tensor != NULL);
     GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
-    GGML_ASSERT(journal->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(journal));
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 3) == 0);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
 
     const struct ggml_tensor * v = tensor->src[2];
     const struct ggml_tensor * g = tensor->src[3];
@@ -6967,12 +6970,35 @@ void ggml_gated_delta_net_set_transition_journal(
     const int64_t n_seqs = v->ne[3];
     const bool kda = g->ne[0] == S_v;
     const int64_t journal_width = kda ? 3*S_v : 2*S_v + 1;
-    GGML_ASSERT(journal->ne[0] == journal_width &&
-                journal->ne[1] == H &&
-                journal->ne[2] == n_tokens &&
-                journal->ne[3] == n_seqs);
+    GGML_ASSERT(journal_width > 0 && H > 0 && n_tokens > 0 && n_seqs > 0);
+    GGML_ASSERT(journal_width <= INT64_MAX/H);
+    const int64_t journal_head = journal_width*H;
+    GGML_ASSERT(journal_head <= INT64_MAX/n_tokens);
+    const int64_t journal_token = journal_head*n_tokens;
+    GGML_ASSERT(journal_token <= INT64_MAX/n_seqs);
+    const int64_t journal_elements = journal_token*n_seqs;
+    GGML_ASSERT(tensor->ne[0] > 0);
+    GGML_ASSERT(journal_elements <= INT64_MAX - (tensor->ne[0] - 1));
+    const int64_t journal_rows =
+        (journal_elements + tensor->ne[0] - 1)/tensor->ne[0];
+    GGML_ASSERT(tensor->ne[1] > 0 && tensor->ne[1] <= INT32_MAX);
+    GGML_ASSERT(journal_rows <= INT64_MAX - tensor->ne[1]);
+    const int32_t journal_row_offset = (int32_t) tensor->ne[1];
+    GGML_ASSERT((size_t) journal_row_offset <= SIZE_MAX/tensor->nb[1]);
+    const size_t journal_byte_offset =
+        (size_t) journal_row_offset*tensor->nb[1];
 
-    tensor->src[11] = journal;
+    tensor->ne[1] += journal_rows;
+    tensor->nb[2] = tensor->nb[1]*tensor->ne[1];
+    tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
+    ggml_set_op_params_i32(tensor, 3, journal_row_offset);
+
+    return ggml_view_4d(
+        ctx, tensor, journal_width, H, n_tokens, n_seqs,
+        (size_t) journal_width*sizeof(float),
+        (size_t) journal_head*sizeof(float),
+        (size_t) journal_token*sizeof(float),
+        journal_byte_offset);
 }
 
 // dflash: raw-gate mode (see ggml.h). [dt_bias | A] -> src[9],

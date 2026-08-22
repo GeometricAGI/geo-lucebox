@@ -9,7 +9,7 @@ using namespace dflash::common;
 static int g_checks = 0;
 
 int main() {
-    const DDTree root_only = make_dspark_chain_tree({10});
+    const DDTree root_only = make_chain_verify_tree({10});
     CHECK(root_only.n_nodes == 0);
     CHECK((root_only.parents == std::vector<int>{-1}));
     CHECK(root_only.child_maps.size() == 1);

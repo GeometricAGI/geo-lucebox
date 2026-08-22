@@ -23,7 +23,6 @@ struct Faults {
     bool overconsume_prefill = false;
     bool drop_second_completion = false;
     bool retire_leaks = false;
-    bool burst_when_speculation_disabled = false;
 };
 
 struct FakeCapabilities {
@@ -112,10 +111,6 @@ public:
                 100 + input.slot + (int32_t)slot.fed.size(),
                 false, {},
             });
-            if (faults_.burst_when_speculation_disabled &&
-                !input.allow_speculation) {
-                result.decode.back().committed_tokens.push_back(91);
-            }
         }
 
         std::vector<int> completed_this_step;

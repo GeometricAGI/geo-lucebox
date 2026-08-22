@@ -169,14 +169,15 @@ bool same_device_pointer(const void * pointer, int expected_device) {
 
 } // namespace
 
-extern "C" bool ggml_backend_cuda_gdn_transition_journal_commit_many(
+static bool gdn_transition_journal_commit_many_impl(
         const ggml_tensor * const * journals,
         ggml_tensor * const * states,
         const ggml_tensor * const * conv_inputs,
         ggml_tensor * const * conv_states,
         int n_layers,
         const ggml_tensor * accepted_prefixes,
-        const ggml_tensor * active_slot_ids) {
+        const ggml_tensor * active_slot_ids,
+        bool commit) {
     if (!journals || !states || !conv_inputs || !conv_states ||
         n_layers <= 0 || !accepted_prefixes || !active_slot_ids ||
         accepted_prefixes->type != GGML_TYPE_I32 ||
@@ -250,6 +251,7 @@ extern "C" bool ggml_backend_cuda_gdn_transition_journal_commit_many(
         seen[(size_t) slot] = 1;
     }
 
+    if (!commit) return true;
     ggml_cuda_set_device(device);
     constexpr int threads = 256;
     (void) cudaGetLastError();
@@ -290,13 +292,35 @@ extern "C" bool ggml_backend_cuda_gdn_transition_journal_commit_many(
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
-extern "C" bool ggml_backend_cuda_tree_cache_commit_many(
+extern "C" bool ggml_backend_cuda_gdn_transition_journal_commit_many(
+        const ggml_tensor * const * journals,
+        ggml_tensor * const * states,
+        const ggml_tensor * const * conv_inputs,
+        ggml_tensor * const * conv_states,
+        int n_layers,
+        const ggml_tensor * accepted_prefixes,
+        const ggml_tensor * active_slot_ids) {
+    if (!gdn_transition_journal_commit_many_impl(
+            journals, states, conv_inputs, conv_states, n_layers,
+            accepted_prefixes, active_slot_ids, false)) {
+        return false;
+    }
+    if (!gdn_transition_journal_commit_many_impl(
+            journals, states, conv_inputs, conv_states, n_layers,
+            accepted_prefixes, active_slot_ids, true)) {
+        GGML_ABORT("recurrent commit failed after mutation began");
+    }
+    return true;
+}
+
+static bool tree_cache_commit_many_impl(
         ggml_tensor * const * caches,
         int n_caches,
         const ggml_tensor * commit_rows,
         const ggml_tensor * active_slot_ids,
         int tree_scratch_base,
-        int tree_scratch_stride) {
+        int tree_scratch_stride,
+        bool commit) {
     if (!caches || n_caches <= 0 || !commit_rows || !active_slot_ids ||
         commit_rows->type != GGML_TYPE_I64 ||
         active_slot_ids->type != GGML_TYPE_I32 ||
@@ -342,6 +366,7 @@ extern "C" bool ggml_backend_cuda_tree_cache_commit_many(
         }
     }
 
+    if (!commit) return true;
     ggml_cuda_set_device(device);
     constexpr int threads = 256;
     (void) cudaGetLastError();
@@ -362,10 +387,31 @@ extern "C" bool ggml_backend_cuda_tree_cache_commit_many(
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
-extern "C" bool ggml_backend_cuda_tree_feature_commit(
+extern "C" bool ggml_backend_cuda_tree_cache_commit_many(
+        ggml_tensor * const * caches,
+        int n_caches,
+        const ggml_tensor * commit_rows,
+        const ggml_tensor * active_slot_ids,
+        int tree_scratch_base,
+        int tree_scratch_stride) {
+    if (!tree_cache_commit_many_impl(
+            caches, n_caches, commit_rows, active_slot_ids,
+            tree_scratch_base, tree_scratch_stride, false)) {
+        return false;
+    }
+    if (!tree_cache_commit_many_impl(
+            caches, n_caches, commit_rows, active_slot_ids,
+            tree_scratch_base, tree_scratch_stride, true)) {
+        GGML_ABORT("K/V commit failed after mutation began");
+    }
+    return true;
+}
+
+static bool tree_feature_commit_impl(
         const ggml_tensor * source,
         ggml_tensor * destination,
-        const ggml_tensor * destination_rows) {
+        const ggml_tensor * destination_rows,
+        bool commit) {
     if (!source || !destination || !destination_rows ||
         source->type != destination->type || source->type != GGML_TYPE_BF16 ||
         destination_rows->type != GGML_TYPE_I32 ||
@@ -387,6 +433,7 @@ extern "C" bool ggml_backend_cuda_tree_feature_commit(
     for (int row : rows) {
         if (row < -1 || row >= destination->ne[1]) return false;
     }
+    if (!commit) return true;
     ggml_cuda_set_device(device);
     constexpr int threads = 256;
     const dim3 grid(
@@ -399,4 +446,68 @@ extern "C" bool ggml_backend_cuda_tree_feature_commit(
         source->nb[1], n_rows, (int) destination->ne[1]);
     if (cudaGetLastError() != cudaSuccess) return false;
     return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+extern "C" bool ggml_backend_cuda_tree_feature_commit(
+        const ggml_tensor * source,
+        ggml_tensor * destination,
+        const ggml_tensor * destination_rows) {
+    if (!tree_feature_commit_impl(
+            source, destination, destination_rows, false)) {
+        return false;
+    }
+    if (!tree_feature_commit_impl(
+            source, destination, destination_rows, true)) {
+        GGML_ABORT("feature commit failed after mutation began");
+    }
+    return true;
+}
+
+extern "C" bool ggml_backend_cuda_tree_commit_transaction(
+        ggml_tensor * const * caches,
+        int n_caches,
+        const ggml_tensor * feature_source,
+        ggml_tensor * feature_destination,
+        const ggml_tensor * feature_destination_rows,
+        const ggml_tensor * const * journals,
+        ggml_tensor * const * states,
+        const ggml_tensor * const * conv_inputs,
+        ggml_tensor * const * conv_states,
+        int n_layers,
+        const ggml_tensor * commit_rows,
+        const ggml_tensor * accepted_prefixes,
+        const ggml_tensor * active_slot_ids,
+        int tree_scratch_base,
+        int tree_scratch_stride) {
+    if (!tree_cache_commit_many_impl(
+            caches, n_caches, commit_rows, active_slot_ids,
+            tree_scratch_base, tree_scratch_stride, false) ||
+        !tree_feature_commit_impl(
+            feature_source, feature_destination,
+            feature_destination_rows, false) ||
+        !gdn_transition_journal_commit_many_impl(
+            journals, states, conv_inputs, conv_states, n_layers,
+            accepted_prefixes, active_slot_ids, false)) {
+        return false;
+    }
+
+    // No recoverable error may escape after the first destination changes.
+    // Returning false here would let the caller run fallback from a mixed
+    // pre-commit/post-commit state.
+    if (!tree_cache_commit_many_impl(
+            caches, n_caches, commit_rows, active_slot_ids,
+            tree_scratch_base, tree_scratch_stride, true)) {
+        GGML_ABORT("tree commit failed after K/V mutation began");
+    }
+    if (!tree_feature_commit_impl(
+            feature_source, feature_destination,
+            feature_destination_rows, true)) {
+        GGML_ABORT("tree commit failed after feature mutation began");
+    }
+    if (!gdn_transition_journal_commit_many_impl(
+            journals, states, conv_inputs, conv_states, n_layers,
+            accepted_prefixes, active_slot_ids, true)) {
+        GGML_ABORT("tree commit failed after recurrent mutation began");
+    }
+    return true;
 }

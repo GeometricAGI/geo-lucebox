@@ -2061,18 +2061,13 @@ static ggml_tensor * build_delta_net_block(
             ggml_gated_delta_net_set_raw_gates(result, L.ssm_gate_ba);
         }
     }
-    if (seg_cap && seg_tree) {
-        const int64_t journal_width =
-            g_tensor->ne[0] == head_v_dim ? 3*head_v_dim : 2*head_v_dim + 1;
-        seg_cap->transition_journal = ggml_new_tensor_4d(
-            ctx, GGML_TYPE_F32, journal_width, num_v_heads,
-            n_seq_tokens, seg_seqs);
-        ggml_set_output(seg_cap->transition_journal);
-        ggml_gated_delta_net_set_transition_journal(
-            result, seg_cap->transition_journal);
-    }
     if (can_skip_gdn_intermediate) {
         ggml_gated_delta_net_set_skip_intermediate(result, true);
+    }
+    if (seg_cap && seg_tree) {
+        seg_cap->transition_journal =
+            ggml_gated_delta_net_capture_transition_journal(ctx, result);
+        ggml_set_output(seg_cap->transition_journal);
     }
 
     // Slice output and new_state out of the packed result

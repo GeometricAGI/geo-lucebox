@@ -4962,7 +4962,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[6] == nullptr &&
                    op->src[7] == nullptr &&
                    op->src[8] == nullptr &&
-                   op->src[11] == nullptr &&
                    ggml_get_op_params_i32(op, 1) == 0 &&
                    ggml_get_op_params_i32(op, 2) != 1 &&
                    ggml_get_op_params_i32(op, 10) != 1;

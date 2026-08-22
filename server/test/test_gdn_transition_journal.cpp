@@ -44,15 +44,14 @@ bool test_raw_gate_protocol() {
     ggml_gated_delta_net_set_raw_gates(result, gate_ba);
     const int32_t * op_params =
         reinterpret_cast<const int32_t *>(result->op_params);
-    const bool ok = result->src[9] == gate_ba && result->src[10] == nullptr &&
+    const bool ok = result->src[9] == gate_ba &&
         ggml_nelements(result->src[9]) == 2*H && op_params[2] == 0 &&
         op_params[10] == 1;
     if (!ok) {
         std::fprintf(
             stderr,
-            "raw gate protocol: src9=%p src10=%p elements=%lld op2=%d op10=%d\n",
+            "raw gate protocol: src9=%p elements=%lld op2=%d op10=%d\n",
             static_cast<void *>(result->src[9]),
-            static_cast<void *>(result->src[10]),
             (long long) ggml_nelements(result->src[9]),
             op_params[2], op_params[10]);
     }
@@ -417,8 +416,6 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
         tensors.ctx, GGML_TYPE_F32, 1, H, T, B);
     ggml_tensor * capture_state = ggml_new_tensor_4d(
         tensors.ctx, GGML_TYPE_F32, S, S, H, B);
-    tensors.journal = ggml_new_tensor_4d(
-        tensors.ctx, GGML_TYPE_F32, width, H, T, B);
     tensors.identity_state = ggml_new_tensor_4d(
         tensors.ctx, GGML_TYPE_F32, S, S, H, B);
     tensors.mapped_state = ggml_new_tensor_4d(
@@ -447,7 +444,8 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
     if (raw_gates) {
         ggml_gated_delta_net_set_raw_gates(result, gate_ba);
     }
-    ggml_gated_delta_net_set_transition_journal(result, tensors.journal);
+    tensors.journal =
+        ggml_gated_delta_net_capture_transition_journal(tensors.ctx, result);
     ggml_set_output(result);
     ggml_cgraph * graph = ggml_new_graph(tensors.ctx);
     ggml_build_forward_expand(graph, result);
@@ -668,8 +666,6 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
         ctx, GGML_TYPE_F32, S, S, H, B);
     ggml_tensor * parents = ggml_new_tensor_2d(
         ctx, GGML_TYPE_I32, T, B);
-    ggml_tensor * journal = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_F32, width, H, T, B);
     ggml_tensor * committed_state = ggml_new_tensor_4d(
         ctx, GGML_TYPE_F32, S, S, H, B);
     ggml_tensor * accepted = ggml_new_tensor_1d(
@@ -683,7 +679,8 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
 
     ggml_tensor * result = ggml_gated_delta_net_tree(
         ctx, q, k, v, g, beta, base_state, parents);
-    ggml_gated_delta_net_set_transition_journal(result, journal);
+    ggml_tensor * journal =
+        ggml_gated_delta_net_capture_transition_journal(ctx, result);
     ggml_set_output(result);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
@@ -770,6 +767,140 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
     ggml_free(ctx);
     return ok;
 }
+
+bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
+    constexpr int state_size = 16;
+    constexpr int heads = 1;
+    constexpr int tokens = 2;
+    constexpr int sequences = 1;
+    constexpr int state_slots = 1;
+    constexpr int conv_window = 2;
+    constexpr int conv_channels = 3;
+
+    ggml_init_params params{};
+    params.mem_size = 256*1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * cache =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, 8, 1, 1);
+    ggml_tensor * commit_rows =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 1, sequences);
+    ggml_tensor * active_slots =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
+    ggml_tensor * feature_source =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4, sequences);
+    ggml_tensor * feature_destination =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4, 4);
+    ggml_tensor * feature_rows =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
+    ggml_tensor * journal = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 2*state_size + 1,
+        heads, tokens, sequences);
+    ggml_tensor * state = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, state_size, state_size,
+        heads, state_slots);
+    ggml_tensor * conv_input = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, conv_window + tokens,
+        conv_channels, sequences, 1);
+    ggml_tensor * conv_state = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, conv_window,
+        conv_channels, state_slots, 1);
+    ggml_tensor * accepted =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> cache_before(
+        (size_t) ggml_nelements(cache), 1.25f);
+    std::vector<uint16_t> feature_before(
+        (size_t) ggml_nelements(feature_destination), 0x3f80);
+    std::vector<float> state_before(
+        (size_t) ggml_nelements(state), -2.5f);
+    std::vector<float> conv_before(
+        (size_t) ggml_nelements(conv_state), 3.75f);
+    std::vector<float> zeros(
+        (size_t) std::max(
+            ggml_nelements(journal), ggml_nelements(conv_input)),
+        0.0f);
+    std::vector<uint16_t> feature_source_values(
+        (size_t) ggml_nelements(feature_source), 0x4000);
+    const int64_t destination_row = 0;
+    const int32_t active_slot = 0;
+    const int32_t feature_row = 0;
+    const int32_t invalid_accepted = tokens + 1;
+
+    ggml_backend_tensor_set(
+        cache, cache_before.data(), 0,
+        cache_before.size()*sizeof(float));
+    ggml_backend_tensor_set(
+        feature_destination, feature_before.data(), 0,
+        feature_before.size()*sizeof(uint16_t));
+    ggml_backend_tensor_set(
+        feature_source, feature_source_values.data(), 0,
+        feature_source_values.size()*sizeof(uint16_t));
+    ggml_backend_tensor_set(
+        state, state_before.data(), 0,
+        state_before.size()*sizeof(float));
+    ggml_backend_tensor_set(
+        conv_state, conv_before.data(), 0,
+        conv_before.size()*sizeof(float));
+    ggml_backend_tensor_set(
+        journal, zeros.data(), 0,
+        (size_t) ggml_nelements(journal)*sizeof(float));
+    ggml_backend_tensor_set(
+        conv_input, zeros.data(), 0,
+        (size_t) ggml_nelements(conv_input)*sizeof(float));
+    ggml_backend_tensor_set(
+        commit_rows, &destination_row, 0, sizeof(destination_row));
+    ggml_backend_tensor_set(
+        active_slots, &active_slot, 0, sizeof(active_slot));
+    ggml_backend_tensor_set(
+        feature_rows, &feature_row, 0, sizeof(feature_row));
+    ggml_backend_tensor_set(
+        accepted, &invalid_accepted, 0, sizeof(invalid_accepted));
+
+    ggml_tensor * caches[] = {cache};
+    const ggml_tensor * journals[] = {journal};
+    ggml_tensor * states[] = {state};
+    const ggml_tensor * conv_inputs[] = {conv_input};
+    ggml_tensor * conv_states[] = {conv_state};
+    const bool rejected = !ggml_backend_cuda_tree_commit_transaction(
+        caches, 1, feature_source, feature_destination, feature_rows,
+        journals, states, conv_inputs, conv_states, 1,
+        commit_rows, accepted, active_slots,
+        /*tree_scratch_base=*/4, /*tree_scratch_stride=*/1);
+
+    std::vector<float> cache_after(cache_before.size());
+    std::vector<uint16_t> feature_after(feature_before.size());
+    std::vector<float> state_after(state_before.size());
+    std::vector<float> conv_after(conv_before.size());
+    ggml_backend_tensor_get(
+        cache, cache_after.data(), 0, cache_after.size()*sizeof(float));
+    ggml_backend_tensor_get(
+        feature_destination, feature_after.data(), 0,
+        feature_after.size()*sizeof(uint16_t));
+    ggml_backend_tensor_get(
+        state, state_after.data(), 0, state_after.size()*sizeof(float));
+    ggml_backend_tensor_get(
+        conv_state, conv_after.data(), 0, conv_after.size()*sizeof(float));
+
+    const bool ok = rejected &&
+        cache_after == cache_before &&
+        feature_after == feature_before &&
+        state_after == state_before &&
+        conv_after == conv_before;
+    std::printf("gdn tree commit preflight        : %s\n",
+                ok ? "PASS" : "FAIL");
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
 } // namespace
 
 int main() {
@@ -784,6 +915,7 @@ int main() {
     ok = run_case(backend, true, false) && ok;
     ok = run_case(backend, false, true) && ok;
     ok = run_grouped_tree_case(backend) && ok;
+    ok = test_tree_commit_preflight_is_non_mutating(backend) && ok;
     ggml_backend_free(backend);
     return ok ? 0 : 1;
 }

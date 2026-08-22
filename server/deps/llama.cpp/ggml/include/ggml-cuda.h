@@ -123,6 +123,26 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_feature_commit(
         const struct ggml_tensor * source, struct ggml_tensor * destination,
         const struct ggml_tensor * destination_rows);
 
+// Validate every packed-tree destination before changing any cache. Once the
+// first kernel launches, a device failure is fatal because fallback cannot
+// recover from a partially committed state.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
+        struct ggml_tensor * const * caches,
+        int n_caches,
+        const struct ggml_tensor * feature_source,
+        struct ggml_tensor * feature_destination,
+        const struct ggml_tensor * feature_destination_rows,
+        const struct ggml_tensor * const * journals,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        const struct ggml_tensor * commit_rows,
+        const struct ggml_tensor * accepted_prefixes,
+        const struct ggml_tensor * active_slot_ids,
+        int tree_scratch_base,
+        int tree_scratch_stride);
+
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the
 // matching unregister function before releasing the tensor's backing buffer.

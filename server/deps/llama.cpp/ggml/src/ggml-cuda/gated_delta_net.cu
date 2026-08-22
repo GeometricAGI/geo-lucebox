@@ -931,10 +931,6 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     // Optional 9th source maps compact sequence rows to physical recurrent
     // state slabs. Negative ids are graph-bucket padding rows.
     ggml_tensor * src_active_slots = dst->src[8];
-    // Optional compact transition journal [J,H,T,B]. The packed tree caller
-    // uses it only with a root-inclusive linear parent chain.
-    ggml_tensor * src_transition_journal = dst->src[11];
-
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
     GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
@@ -976,8 +972,9 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     void *        persist_inter_d = src_persist_inter
         ? src_persist_inter->data
         : nullptr;
-    float * transition_journal_d = src_transition_journal
-        ? (float *) src_transition_journal->data
+    const int journal_row_offset = ggml_get_op_params_i32(dst, 3);
+    float * transition_journal_d = journal_row_offset > 0
+        ? dst_d + (int64_t) journal_row_offset*dst->ne[0]
         : nullptr;
     const bool    persist_is_f16 =
         src_persist_inter && src_persist_inter->type == GGML_TYPE_F16;
@@ -1007,14 +1004,13 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
         GGML_ASSERT(ggml_is_contiguous(src_active_slots));
         GGML_ASSERT(ggml_nelements(src_active_slots) == n_seqs);
     }
-    if (src_transition_journal) {
+    if (transition_journal_d) {
         const int64_t journal_width = kda ? 3*S_v : 2*S_v + 1;
-        GGML_ASSERT(src_transition_journal->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_is_contiguous(src_transition_journal));
-        GGML_ASSERT(src_transition_journal->ne[0] == journal_width);
-        GGML_ASSERT(src_transition_journal->ne[1] == H);
-        GGML_ASSERT(src_transition_journal->ne[2] == n_tokens);
-        GGML_ASSERT(src_transition_journal->ne[3] == n_seqs);
+        const int64_t journal_elements =
+            journal_width*H*n_tokens*n_seqs;
+        GGML_ASSERT(
+            (int64_t) journal_row_offset*dst->ne[0] +
+                journal_elements <= ggml_nelements(dst));
     }
 
     // strides in floats (beta strides used for both g and beta offset computation)

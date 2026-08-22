@@ -28,23 +28,16 @@ int main() {
     CHECK(validate_dflash2_selector_layout(layout, error));
     CHECK(error.empty());
 
-    for (int K = 1; K <= 8; ++K) {
+    for (int K : {1, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}) {
         layout = valid_layout();
         layout.top_k = K;
         CHECK(validate_dflash2_selector_layout(layout, error));
     }
-    for (int K : {12, 16}) {
-        layout = valid_layout();
-        layout.top_k = K;
-        CHECK(validate_dflash2_selector_layout(layout, error));
-    }
-    for (int K : {0, 9, 10, 11, 13, 14, 15, 17}) {
-        layout = valid_layout();
-        layout.top_k = K;
-        CHECK(!validate_dflash2_selector_layout(layout, error));
-        CHECK(error.find("top_k=") != std::string::npos);
-        CHECK(error.find("unsupported") != std::string::npos);
-    }
+
+    layout = valid_layout();
+    layout.top_k = 0;
+    CHECK(!validate_dflash2_selector_layout(layout, error));
+    CHECK(error.find("top_k must be positive") != std::string::npos);
 
     layout = valid_layout();
     layout.succ_vocab--;
@@ -73,6 +66,7 @@ int main() {
     layout.succ_vocab = 8;
     layout.target_output_vocab = 0;
     layout.target_declared_vocab = 0;
+    layout.top_k = 9;
     CHECK(!validate_dflash2_selector_layout(layout, error));
     CHECK(error.find("exceeds codebook vocab") != std::string::npos);
 

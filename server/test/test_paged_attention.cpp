@@ -188,11 +188,13 @@ std::vector<float> reference_attention(
             ? (seq - tree->ar_rows) % tree->width : -1;
         int kv_seq_len = clamped_seq_len(test_case, physical_seq);
         if (query_positions && !tree_query) {
-            if ((*query_positions)[seq] < 0) continue;
+            const int32_t query_position = (*query_positions)[seq];
+            if (query_position < 0) continue;
             // The inclusive causal clamp: row seq attends its sequence's
             // cached tokens [0, position].
-            kv_seq_len = std::min(
-                kv_seq_len, (*query_positions)[seq] + 1);
+            if (query_position < kv_seq_len) {
+                kv_seq_len = query_position + 1;
+            }
         }
         const int tree_size = tree_query ? tree->tree_sizes[tree_seq] : 0;
         if (tree_query &&

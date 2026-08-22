@@ -1,7 +1,5 @@
 #pragma once
 
-#include "geometric_draft_topk_cuda.h"
-
 #include <cstdint>
 #include <string>
 
@@ -33,9 +31,9 @@ inline bool validate_dflash2_selector_layout(
             std::to_string(layout.rank) + ")";
         return false;
     }
-    if (!geometric_draft_topk_cuda_supports_k(layout.top_k)) {
-        error = "DFlash 2 selector top_k=" + std::to_string(layout.top_k) +
-            " is unsupported; expected one of 1..8, 12, or 16";
+    if (layout.top_k <= 0) {
+        error = "DFlash 2 selector top_k must be positive (got " +
+            std::to_string(layout.top_k) + ")";
         return false;
     }
     if (layout.hproj_rank != layout.rank ||

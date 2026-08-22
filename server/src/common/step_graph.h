@@ -78,7 +78,7 @@ struct StepGraph {
     ggml_tensor *   accepted_prefixes = nullptr;   // [n_tree_seqs] i32
     ggml_tensor *   commit_slot_ids = nullptr;      // [n_tree_seqs] i32
     ggml_tensor *   commit_rows = nullptr;         // [tree_width,n_tree_seqs] i64
-    ggml_tensor *   feature_commit_rows = nullptr; // same shape, i32
+    ggml_tensor *   feature_commit_rows = nullptr; // [n_tokens] i32
     // Multi-prompt steps: i32 row indices gathered from the final norm
     // before the LM head (committing rows + decode rows).
     ggml_tensor *   logits_row_indices = nullptr;

@@ -871,24 +871,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         return result;
     }
 
-    if (!ggml_backend_cuda_tree_cache_commit_many(
+    if (!ggml_backend_cuda_tree_commit_transaction(
             caches.data(), static_cast<int>(caches.size()),
-            graph.commit_rows, graph.commit_slot_ids,
-            tree_scratch_base_, tree_scratch_stride_)) {
-        result.error = "fixed chain K/V promotion failed";
-        return result;
-    }
-    if (!ggml_backend_cuda_tree_feature_commit(
             graph.tree_features, b_.cache_.target_feat,
-            graph.feature_commit_rows)) {
-        result.error = "fixed chain feature promotion failed";
-        return result;
-    }
-    if (!ggml_backend_cuda_gdn_transition_journal_commit_many(
+            graph.feature_commit_rows,
             journals.data(), states.data(), conv_inputs.data(),
             conv_states.data(), static_cast<int>(n_delta),
-            graph.accepted_prefixes, graph.commit_slot_ids)) {
-        result.error = "fixed chain recurrent promotion failed";
+            graph.commit_rows, graph.accepted_prefixes,
+            graph.commit_slot_ids,
+            tree_scratch_base_, tree_scratch_stride_)) {
+        result.error = "fixed chain commit preflight failed";
         return result;
     }
     ggml_backend_tensor_set(
