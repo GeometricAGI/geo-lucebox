@@ -904,7 +904,8 @@ static ggml_tensor * build_delta_net_block(
     int n_tokens,
     DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
     ggml_tensor * parent_ids,     // optional [n_tokens] i32; tree mode when non-null
-    bool skip_gdn_intermediate
+    bool skip_gdn_intermediate,
+    QwenL0LinearDump * dump = nullptr
 ) {
     const int head_k_dim   = w.ssm_d_state;
     const int num_k_heads  = w.ssm_n_group;
@@ -917,13 +918,28 @@ static ggml_tensor * build_delta_net_block(
 
     // ── qkv_mixed = wqkv @ cur         [10240, n_tokens]
     ggml_tensor * qkv_mixed = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
+    if (dump) {
+        dump->qkv = qkv_mixed;
+        ggml_set_output(qkv_mixed);
+        ggml_set_name(qkv_mixed, "l0_qkv");
+    }
     qkv_mixed = ggml_reshape_3d(ctx, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
 
     // ── z = wqkv_gate @ cur            [inner, n_tokens]
     ggml_tensor * z = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv_gate, cur), L.wqkv_gate_s);
+    if (dump) {
+        dump->z = z;
+        ggml_set_output(z);
+        ggml_set_name(z, "l0_z");
+    }
 
     // ── beta = ssm_beta @ cur          [dt_rank, n_tokens]
     ggml_tensor * beta = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_beta, cur), L.ssm_beta_s);
+    if (dump) {
+        dump->b = beta;
+        ggml_set_output(beta);
+        ggml_set_name(beta, "l0_b");
+    }
     beta = ggml_reshape_4d(ctx, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     beta = ggml_sigmoid(ctx, beta);
 
@@ -932,6 +948,11 @@ static ggml_tensor * build_delta_net_block(
     //    alpha = softplus(alpha)
     //    g     = alpha * ssm_a                (-A_log.exp() * softplus)
     ggml_tensor * alpha = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
+    if (dump) {
+        dump->a = alpha;
+        ggml_set_output(alpha);
+        ggml_set_name(alpha, "l0_a");
+    }
     alpha = ggml_reshape_3d(ctx, alpha, num_v_heads, n_seq_tokens, n_seqs);
     alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
     alpha = ggml_softplus(ctx, alpha);
@@ -991,6 +1012,12 @@ static ggml_tensor * build_delta_net_block(
         ? ggml_ssm_conv_tree(ctx, conv_input, L.ssm_conv1d, parent_ids)
         : ggml_ssm_conv     (ctx, conv_input, L.ssm_conv1d);
     conv_out = ggml_silu(ctx, conv_out);
+    if (dump) {
+        dump->conv = ggml_cont(ctx, conv_out);
+        ggml_set_output(dump->conv);
+        ggml_set_name(dump->conv, "l0_conv");
+        ggml_build_forward_expand(gf, dump->conv);
+    }
 
     // conv_out: [conv_channels, n_tokens, n_seqs]
     const int64_t q_offset = 0;
@@ -1163,6 +1190,13 @@ after_delta_net:
         ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, s));
     }
 
+    if (dump) {
+        dump->rec = ggml_cont(ctx, output);
+        ggml_set_output(dump->rec);
+        ggml_set_name(dump->rec, "l0_rec");
+        ggml_build_forward_expand(gf, dump->rec);
+    }
+
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
     ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
     ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
@@ -1175,8 +1209,22 @@ after_delta_net:
         head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
 
     // Output projection
+    if (dump) {
+        dump->gated = ggml_cont(ctx, flat);
+        ggml_set_output(dump->gated);
+        ggml_set_name(dump->gated, "l0_gated");
+        ggml_build_forward_expand(gf, dump->gated);
+    }
+
+    // Output projection
     ggml_tensor * out = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_out, flat), L.ssm_out_s);
     out = ggml_reshape_2d(ctx, out, w.n_embd, n_seq_tokens * n_seqs);
+    if (dump) {
+        dump->proj = ggml_cont(ctx, out);
+        ggml_set_output(dump->proj);
+        ggml_set_name(dump->proj, "l0_proj");
+        ggml_build_forward_expand(gf, dump->proj);
+    }
     return out;
 }
 
@@ -1344,6 +1392,11 @@ QwenGraphOutputs build_qwen35_graph(
 
         // Pre-attention norm
         ggml_tensor * cur = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
+        if (il == 0) {
+            ggml_set_output(cur);
+            ggml_set_name(cur, "l0_normed");
+            og_early.l0.normed = cur;
+        }
 
         if (is_attn) {
             const bool want_q_cap = in.q_capture && cache.q_cap;
@@ -1391,12 +1444,18 @@ QwenGraphOutputs build_qwen35_graph(
             cur = build_delta_net_block(ctx, gf, w, L, cur,
                                         cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                         n_tokens, cap_ptr, in.parent_ids,
-                                        /*skip_gdn_intermediate=*/true);
+                                        /*skip_gdn_intermediate=*/true,
+                                        il == 0 ? &og_early.l0 : nullptr);
             dn_idx++;
         }
 
         // Residual
         cur = ggml_add(ctx, cur, inpSA);
+        if (il == 0) {
+            ggml_set_output(cur);
+            ggml_set_name(cur, "l0_attn_resid");
+            og_early.l0.attn_resid = cur;
+        }
 
         // Post-attention norm (before FFN)
         ggml_tensor * ffn_residual = cur;
@@ -1412,6 +1471,11 @@ QwenGraphOutputs build_qwen35_graph(
             og_early.moe_selected[(size_t)il] = moe_selected;
         }
         cur = ggml_add(ctx, ffn, ffn_residual);
+        if (il == 0) {
+            ggml_set_output(cur);
+            ggml_set_name(cur, "layer0_out");
+            og_early.layer0_out = cur;
+        }
 
         // ── DFlash layer feature capture ──
         // Write `cur` into the rolling target_feat buffer. The buffer is a
@@ -1463,6 +1527,8 @@ QwenGraphOutputs build_qwen35_graph(
     }
 
     // 2. Final norm
+    ggml_set_output(inpL);
+    ggml_set_name(inpL, "last_hidden");
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
 
     // 3. LM head — optionally only for the last token (prefill optimization:
@@ -1484,6 +1550,7 @@ QwenGraphOutputs build_qwen35_graph(
 
     QwenGraphOutputs og = std::move(og_early);
     og.logits = logits;
+    og.last_hidden = inpL;
     return og;
 }
 

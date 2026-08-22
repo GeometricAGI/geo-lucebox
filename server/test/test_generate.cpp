@@ -55,6 +55,9 @@ struct StepGraph {
     ggml_tensor *     inp_embed = nullptr;
     ggml_tensor *     positions = nullptr;
     ggml_tensor *     logits    = nullptr;
+    ggml_tensor *     hidden    = nullptr;
+    ggml_tensor *     layer0    = nullptr;
+    QwenL0LinearDump  l0{};
 };
 
 // Build a fresh single-token forward graph. We rebuild per step so that
@@ -97,8 +100,17 @@ static bool build_step_graph(
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     ggml_set_output(go.logits);
+    if (go.last_hidden) {
+        ggml_set_output(go.last_hidden);
+    }
     ggml_build_forward_expand(sg.gf, go.logits);
     sg.logits = go.logits;
+    sg.hidden = go.last_hidden;
+    sg.layer0 = go.layer0_out;
+    sg.l0 = go.l0;
+    if (go.layer0_out) {
+        ggml_set_output(go.layer0_out);
+    }
 
     sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
@@ -180,7 +192,7 @@ int main(int argc, char ** argv) {
     }
     std::printf("[target] %s\n", dflash27b_last_error());
 
-    const int max_ctx = 4096;
+    const int max_ctx = 16384;
     TargetCache cache;
     if (!create_target_cache(w, max_ctx, /*max_verify_tokens=*/0, backend, cache)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
@@ -221,6 +233,14 @@ int main(int argc, char ** argv) {
         }
         ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * embed_buf.size());
+        if (const char * epath = std::getenv("LUCEBOX_DUMP_EMBED")) {
+            if (pos == 0) {
+                if (FILE * ef = std::fopen(epath, "wb")) {
+                    std::fwrite(embed_buf.data(), sizeof(float), embed_buf.size(), ef);
+                    std::fclose(ef);
+                }
+            }
+        }
 
         // M-RoPE positions: 4 copies of pos
         int32_t p4[4] = { pos, pos, pos, pos };
@@ -240,6 +260,69 @@ int main(int argc, char ** argv) {
         float bv = logits[0];
         for (int i = 1; i < vocab; i++) {
             if (logits[i] > bv) { bv = logits[i]; best = i; }
+        }
+        if (std::getenv("LUCEBOX_DUMP_SPLIT_LOGITS")) {
+            const float v30 = (vocab > 30) ? logits[30] : 0.f;
+            const float v32 = (vocab > 32) ? logits[32] : 0.f;
+            const float v2014 = (vocab > 2014) ? logits[2014] : 0.f;
+            const float v3242 = (vocab > 3242) ? logits[3242] : 0.f;
+            std::printf(
+                "[logits] pos=%d argmax=%d v=%.6f tok30=%.6f tok32=%.6f tok2014=%.6f tok3242=%.6f delta_A_minus_An=%.6f delta_today_minus_q=%.6f\n",
+                pos, best, bv, v30, v32, v2014, v3242, v32 - v2014, v3242 - v30);
+        }
+        if (const char * hdir = std::getenv("LUCEBOX_DUMP_HIDDENS_DIR")) {
+            if (sg.hidden) {
+                std::vector<float> hid(hidden);
+                ggml_backend_tensor_get(sg.hidden, hid.data(), 0, sizeof(float) * hidden);
+                char path[768];
+                std::snprintf(path, sizeof(path), "%s/pos_%02d_last_hidden.f32", hdir, pos);
+                if (FILE * hf = std::fopen(path, "wb")) {
+                    std::fwrite(hid.data(), sizeof(float), hid.size(), hf);
+                    std::fclose(hf);
+                }
+            }
+            if (sg.layer0 && pos == 0) {
+                std::vector<float> hid(hidden);
+                ggml_backend_tensor_get(sg.layer0, hid.data(), 0, sizeof(float) * hidden);
+                char path[768];
+                std::snprintf(path, sizeof(path), "%s/layer0.f32", hdir);
+                if (FILE * hf = std::fopen(path, "wb")) {
+                    std::fwrite(hid.data(), sizeof(float), hid.size(), hf);
+                    std::fclose(hf);
+                }
+            }
+            if (pos == 0) {
+                auto dump_t = [&](ggml_tensor * t, const char * name) {
+                    if (!t) return;
+                    const int64_t n = ggml_nelements(t);
+                    if (n <= 0) return;
+                    std::vector<float> buf((size_t)n);
+                    if (t->type != GGML_TYPE_F32) {
+                        std::printf("[dump] skip %s type=%d n=%ld\n", name, (int)t->type, (long)n);
+                        return;
+                    }
+                    ggml_backend_tensor_get(t, buf.data(), 0, sizeof(float) * (size_t)n);
+                    char path[768];
+                    std::snprintf(path, sizeof(path), "%s/%s.f32", hdir, name);
+                    if (FILE * hf = std::fopen(path, "wb")) {
+                        std::fwrite(buf.data(), sizeof(float), (size_t)n, hf);
+                        std::fclose(hf);
+                    }
+                    std::printf("[dump] %s n=%ld type=%d dim3994=%g\n",
+                                name, (long)n, (int)t->type,
+                                n > 3994 ? buf[3994] : 0.f);
+                };
+                dump_t(sg.l0.normed, "l5_normed");
+                dump_t(sg.l0.qkv, "l5_qkv");
+                dump_t(sg.l0.z, "l5_z");
+                dump_t(sg.l0.b, "l5_b");
+                dump_t(sg.l0.a, "l5_a");
+                dump_t(sg.l0.conv, "l5_conv");
+                dump_t(sg.l0.rec, "l5_rec");
+                dump_t(sg.l0.gated, "l5_gated");
+                dump_t(sg.l0.proj, "l5_proj");
+                dump_t(sg.l0.attn_resid, "l5_resid");
+            }
         }
         return best;
     };

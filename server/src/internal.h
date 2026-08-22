@@ -634,8 +634,24 @@ struct QwenGraphInputs {
     bool q_capture = false;
 };
 
+struct QwenL0LinearDump {
+    ggml_tensor * normed = nullptr;     // input RMS * attn_norm
+    ggml_tensor * qkv = nullptr;        // attn_qkv @ normed
+    ggml_tensor * z = nullptr;          // attn_gate @ normed
+    ggml_tensor * b = nullptr;          // ssm_beta @ normed (pre-sigmoid)
+    ggml_tensor * a = nullptr;          // ssm_alpha @ normed (pre-softplus)
+    ggml_tensor * conv = nullptr;       // conv1d + silu
+    ggml_tensor * rec = nullptr;        // gated-delta-net attn out
+    ggml_tensor * gated = nullptr;      // rms(rec)*norm*silu(z)
+    ggml_tensor * proj = nullptr;       // ssm_out @ gated
+    ggml_tensor * attn_resid = nullptr; // proj + residual
+};
+
 struct QwenGraphOutputs {
     ggml_tensor * logits;      // [vocab, n_tokens] f32
+    ggml_tensor * last_hidden = nullptr; // residual after last layer, before final RMS
+    ggml_tensor * layer0_out = nullptr;  // residual after layer 0
+    QwenL0LinearDump l0;
     // One entry per delta-net layer (48 for qwen35-27b). Only populated when
     // QwenGraphInputs::capture_delta_intermediate is true. Tensors are graph
     // views marked as ggml_set_output() so their data persists after
