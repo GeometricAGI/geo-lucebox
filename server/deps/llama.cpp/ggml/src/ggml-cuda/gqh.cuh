@@ -57,6 +57,29 @@ bool ggml_cuda_gqh_mul_mat_vec(
         int in, int out, int ncols, int64_t x_col_stride, int64_t y_col_stride,
         cudaStream_t stream);
 
+// One dispatch for two same-rung, same-shape GQH GEMVs that share `x`
+// (FFN gate/up). Writes both y buffers; the caller still runs SwiGLU.
+// ncols 1..12: batch-1 decode and DFlash2 verify (block 8, optional 12).
+// Launch geometry matches the unpaired arm (GQH3 N=1 uses GQH_MATVEC_ROWS;
+// N=2..8 uses GQH_MULTICOL_ROWS; N=9..12 uses ROWS=1).
+bool ggml_cuda_gqh_mul_mat_vec_pair(
+        ggml_type type,
+        const void * vx_a, float * y_a, const void * vx_b, float * y_b,
+        const float * x, int in, int out, int ncols,
+        int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream);
+
+// FFN SwiGLU fused with the down-projection's int8 activation pre-pass: writes the glu
+// tensor (silu(gate) * up, bit-identical to unary_gated_op_kernel<op_silu>) and, from the
+// same registers, the q8 codes + group scales the NEXT ncols == 8 GQH matvec would have
+// launched a second kernel to produce. Two dispatches become one and the 0.56 MB glu
+// re-read disappears. Returns false unless GGML_GQH_FUSE_GLU and GGML_GQH_I8DOT are on and
+// the shape preconditions hold (ncols == 8, nc % 256 == 0, float4-aligned strides), so the
+// caller keeps ggml's own swiglu. Strides are in floats.
+bool ggml_cuda_gqh_glu_quant(
+        const float * gate, const float * up, float * glu, int nc, int ncols,
+        int64_t gate_col_stride, int64_t up_col_stride, int64_t glu_col_stride,
+        cudaStream_t stream);
+
 // Registry-aware converters for ggml_get_to_fp16_cuda / ggml_get_to_fp32_cuda.
 // The per-tensor header comes from the shared ggml-base registry (ggml_gqh_lookup),
 // the same one the CPU decoders use -- the loader registers once for both.
