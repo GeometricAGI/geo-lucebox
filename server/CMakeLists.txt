@@ -1971,6 +1971,12 @@ if(DFLASH27B_TESTS)
             test_gdn_transition_journal
             test/test_gdn_transition_journal.cpp)
         add_test(NAME gdn_transition_journal COMMAND test_gdn_transition_journal)
+        add_test(
+            NAME gdn_transition_journal_gallocr
+            COMMAND test_gdn_transition_journal --gallocr-only)
+        add_test(
+            NAME gdn_transition_journal_preflight
+            COMMAND test_gdn_transition_journal --preflight-only)
         if(TARGET check)
             add_dependencies(check test_gdn_transition_journal)
         endif()

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <limits>
 #include <cstdlib>
+#include <memory>
 #include <vector>
 
 namespace dflash::common {
@@ -437,9 +438,13 @@ bool build_target_step(
     // step-invariant set_rows KV write (kv_write_rows) below.
     ggml_init_params ip{};
     ip.mem_size   = 512 * 1024 * 1024;
-    static thread_local std::vector<uint8_t> g_step_arena;
-    if (g_step_arena.size() < ip.mem_size) g_step_arena.resize(ip.mem_size);
-    ip.mem_buffer = g_step_arena.data();
+    static thread_local std::unique_ptr<uint8_t[]> g_step_arena;
+    static thread_local size_t g_step_arena_size = 0;
+    if (g_step_arena_size < ip.mem_size) {
+        g_step_arena.reset(new uint8_t[ip.mem_size]);
+        g_step_arena_size = ip.mem_size;
+    }
+    ip.mem_buffer = g_step_arena.get();
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
@@ -833,9 +838,13 @@ bool build_target_step_paged_tree(
 
     ggml_init_params ip{};
     ip.mem_size = 512 * 1024 * 1024;
-    static thread_local std::vector<uint8_t> g_tree_arena;
-    if (g_tree_arena.size() < ip.mem_size) g_tree_arena.resize(ip.mem_size);
-    ip.mem_buffer = g_tree_arena.data();
+    static thread_local std::unique_ptr<uint8_t[]> g_tree_arena;
+    static thread_local size_t g_tree_arena_size = 0;
+    if (g_tree_arena_size < ip.mem_size) {
+        g_tree_arena.reset(new uint8_t[ip.mem_size]);
+        g_tree_arena_size = ip.mem_size;
+    }
+    ip.mem_buffer = g_tree_arena.get();
     ip.no_alloc = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;

@@ -58,6 +58,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
     prepared_chain_drafts_.resize(static_cast<size_t>(n_slots));
+    seq_lens_.assign(static_cast<size_t>(n_slots), 0);
 
     capture_features_ = tree_width_ > 1 && tree_width_ <= 16 &&
         tree_width_ == b_.dw_.block_size && b_.dw_.selector.enabled &&
@@ -97,6 +98,22 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         mirror.n_target_layers = b_.w_.n_capture_layers;
         mirror.hidden_size = b_.w_.n_embd;
         mirror.storage_type = b_.cache_.target_feat->type;
+    }
+
+    if (n_slots == 4 && tree_width_ == 8) {
+        bool draft_states_ready = true;
+        for (int slot = 0; slot < n_slots; ++slot) {
+            draft_states_ready =
+                ensure_slot_draft_kv(slot) && draft_states_ready;
+        }
+        if (draft_states_ready) {
+            std::fprintf(stderr,
+                "[parallel-chain] preallocated C=4/W8 draft states\n");
+        } else {
+            std::fprintf(stderr,
+                "[parallel-chain] C=4/W8 draft-state preallocation incomplete; "
+                "falling back to lazy setup\n");
+        }
     }
 }
 
@@ -482,6 +499,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         std::vector<int> accepted;
         std::vector<int32_t> path;
         int32_t pending = -1;
+        Qwen35SlotManager::StepAppend append;
+        int seq_len = -1;
     };
     struct ArLane {
         size_t input_index = 0;
@@ -548,6 +567,49 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         return result;
     }
 
+    struct StagedRound {
+        Qwen35SlotManager & slots;
+        std::vector<int32_t> & seq_lens;
+        ggml_tensor * device_seq_lens;
+        std::vector<int> staged_slots;
+        std::vector<int32_t> saved_seq_lens;
+        bool device_lengths_dirty = false;
+        bool committed = false;
+
+        StagedRound(
+                Qwen35SlotManager & slots,
+                std::vector<int32_t> & seq_lens,
+                ggml_tensor * device_seq_lens,
+                size_t lane_count)
+            : slots(slots), seq_lens(seq_lens),
+              device_seq_lens(device_seq_lens),
+              saved_seq_lens(seq_lens) {
+            staged_slots.reserve(lane_count);
+        }
+
+        ~StagedRound() {
+            if (committed) return;
+            for (auto it = staged_slots.rbegin();
+                 it != staged_slots.rend(); ++it) {
+                if (!slots.rollback_step(*it)) {
+                    std::fprintf(stderr,
+                        "[parallel] staged round rollback failed for slot %d\n",
+                        *it);
+                    std::abort();
+                }
+            }
+            seq_lens = saved_seq_lens;
+            if (!device_lengths_dirty) return;
+            ggml_backend_tensor_set(
+                device_seq_lens, seq_lens.data(), 0,
+                sizeof(int32_t) * seq_lens.size());
+        }
+
+        void track(int slot) { staged_slots.push_back(slot); }
+    } staged_round(
+        slots_, seq_lens_, b_.cache_.paged_kv_seq_lens,
+        inputs.size());
+
     // AR peers write their ordinary rows in the same target forward. Host
     // history and positions remain staged until every promotion succeeds.
     for (ArLane & lane : ar_lanes) {
@@ -559,6 +621,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 : "compact AR K/V staging failed";
             return result;
         }
+        staged_round.track(lane.slot);
         if (append.new_block >= 0 &&
             !upload_block_table_delta(
                 lane.slot, append.new_block_index,
@@ -711,6 +774,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     ggml_backend_tensor_set(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
         sizeof(int32_t) * seq_lens_.size());
+    staged_round.device_lengths_dirty = true;
     if (ggml_backend_graph_compute(b_.target_backend_, graph.gf) !=
         GGML_STATUS_SUCCESS) {
         result.error = "fixed chain target compute failed";
@@ -775,11 +839,22 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             lane.slot * feature_cap + lane.position % feature_cap;
     }
 
+    const auto block_table_delta_fits = [&](int slot, int first_block,
+                                             size_t count) {
+        if (count == 0) return true;
+        const ggml_tensor * table = b_.cache_.paged_block_table;
+        return table && slot >= 0 && slot < table->ne[1] &&
+            first_block >= 0 &&
+            static_cast<uint64_t>(first_block) + count <=
+                static_cast<uint64_t>(table->ne[0]);
+    };
+
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
-        const Qwen35SlotManager::StepAppend append = slots_.append_tokens(
+        proposal.append = slots_.append_tokens(
             proposal.slot, proposal.path.data(),
             static_cast<int>(proposal.path.size()));
+        const Qwen35SlotManager::StepAppend & append = proposal.append;
         if (!append.ok ||
             append.physical_rows.size() != proposal.path.size()) {
             result.error = append.busy
@@ -787,9 +862,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 : "accepted chain K/V staging failed";
             return result;
         }
-        if (!upload_block_table_delta(
+        staged_round.track(proposal.slot);
+        if (!block_table_delta_fits(
                 proposal.slot, append.first_new_block,
-                append.new_blocks.data(), append.new_blocks.size())) {
+                append.new_blocks.size())) {
             result.error = "accepted chain block-table update failed";
             return result;
         }
@@ -811,9 +887,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 proposal.slot * feature_cap +
                 (append.position + static_cast<int>(depth)) % feature_cap;
         }
-        const int seq_len =
+        proposal.seq_len =
             append.position + static_cast<int>(proposal.path.size());
-        seq_lens_[static_cast<size_t>(proposal.slot)] = seq_len;
     }
 
     ggml_backend_tensor_set(
@@ -883,6 +958,18 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         result.error = "fixed chain commit preflight failed";
         return result;
     }
+
+    for (const Proposal & proposal : proposals) {
+        if (!upload_block_table_delta(
+                proposal.slot, proposal.append.first_new_block,
+                proposal.append.new_blocks.data(),
+                proposal.append.new_blocks.size())) {
+            std::fprintf(stderr,
+                "[parallel] validated chain block-table upload failed\n");
+            std::abort();
+        }
+        seq_lens_[static_cast<size_t>(proposal.slot)] = proposal.seq_len;
+    }
     ggml_backend_tensor_set(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
         sizeof(int32_t) * seq_lens_.size());
@@ -890,6 +977,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (const StepInput & input : inputs) {
         slots_.commit_step(input.slot);
     }
+    staged_round.committed = true;
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
         const int graph_row = ar_count + lane_index * tree_width +
@@ -981,6 +1069,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         }
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
+
+    const Qwen35RoctxMetadata service_round_metadata{
+        static_cast<int>(inputs.size()),
+        -1,
+        planned_prefill_tokens,
+        static_cast<int>(plan.prefills.size()),
+        -1,
+        -1,
+    };
+    const Qwen35RoctxRange roctx_service_round(
+        "qwen35.service_round", service_round_metadata);
 
     FixedServiceRound service_round = make_fixed_service_round(plan);
     if (auto * decode_round =

@@ -2,6 +2,7 @@
 #include "ggml-cuda.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <vector>
 
 #if defined(GGML_USE_HIP)
@@ -169,6 +170,12 @@ bool same_device_pointer(const void * pointer, int expected_device) {
 
 } // namespace
 
+enum class commit_mode {
+    VALIDATE,
+    COMMIT,
+    COMMIT_PREVALIDATED,
+};
+
 static bool gdn_transition_journal_commit_many_impl(
         const ggml_tensor * const * journals,
         ggml_tensor * const * states,
@@ -177,78 +184,85 @@ static bool gdn_transition_journal_commit_many_impl(
         int n_layers,
         const ggml_tensor * accepted_prefixes,
         const ggml_tensor * active_slot_ids,
-        bool commit) {
-    if (!journals || !states || !conv_inputs || !conv_states ||
-        n_layers <= 0 || !accepted_prefixes || !active_slot_ids ||
-        accepted_prefixes->type != GGML_TYPE_I32 ||
-        active_slot_ids->type != GGML_TYPE_I32 ||
-        !ggml_is_contiguous(accepted_prefixes) ||
-        !ggml_is_contiguous(active_slot_ids)) return false;
+        commit_mode mode) {
+    const bool prevalidated = mode == commit_mode::COMMIT_PREVALIDATED;
+    const bool commit = mode != commit_mode::VALIDATE;
+    const bool synchronize = mode == commit_mode::COMMIT;
+    if (!prevalidated &&
+        (!journals || !states || !conv_inputs || !conv_states ||
+         n_layers <= 0 || !accepted_prefixes || !active_slot_ids ||
+         accepted_prefixes->type != GGML_TYPE_I32 ||
+         active_slot_ids->type != GGML_TYPE_I32 ||
+         !ggml_is_contiguous(accepted_prefixes) ||
+         !ggml_is_contiguous(active_slot_ids))) return false;
 
     const int64_t n_seqs = ggml_nelements(accepted_prefixes);
-    if (n_seqs < 1 || ggml_nelements(active_slot_ids) != n_seqs) return false;
+    if (!prevalidated &&
+        (n_seqs < 1 || ggml_nelements(active_slot_ids) != n_seqs)) return false;
     int device = -1;
-    if (!device_pointer(accepted_prefixes->data, device) ||
-        !same_device_pointer(active_slot_ids->data, device)) return false;
+    if (!device_pointer(accepted_prefixes->data, device)) return false;
 
-    std::vector<int32_t> accepted((size_t) n_seqs);
-    std::vector<int32_t> slots((size_t) n_seqs);
-    const size_t map_bytes = (size_t) n_seqs*sizeof(int32_t);
-    if (cudaMemcpy(accepted.data(), accepted_prefixes->data, map_bytes,
-                   cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(slots.data(), active_slot_ids->data, map_bytes,
-                   cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    if (!prevalidated) {
+        if (!same_device_pointer(active_slot_ids->data, device)) return false;
+        std::vector<int32_t> accepted((size_t) n_seqs);
+        std::vector<int32_t> slots((size_t) n_seqs);
+        const size_t map_bytes = (size_t) n_seqs*sizeof(int32_t);
+        if (cudaMemcpy(accepted.data(), accepted_prefixes->data, map_bytes,
+                       cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(slots.data(), active_slot_ids->data, map_bytes,
+                       cudaMemcpyDeviceToHost) != cudaSuccess) return false;
 
-    int common_tokens = -1;
-    int common_state_slots = -1;
-    std::vector<uint8_t> seen;
-    for (int layer = 0; layer < n_layers; ++layer) {
-        const ggml_tensor * journal = journals[layer];
-        ggml_tensor * state = states[layer];
-        const ggml_tensor * conv_input = conv_inputs[layer];
-        ggml_tensor * conv_state = conv_states[layer];
-        if (!journal || !state || !conv_input || !conv_state ||
-            journal->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
-            conv_input->type != GGML_TYPE_F32 || conv_state->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguous(journal) || !ggml_is_contiguous(state) ||
-            !ggml_is_contiguous(conv_input) || !ggml_is_contiguous(conv_state)) return false;
-        const int64_t state_size = state->ne[0];
-        const int64_t heads = state->ne[2];
-        const int64_t tokens = journal->ne[2];
-        const int64_t state_slots = state->ne[3];
-        if ((state_size != 16 && state_size != 32 &&
-             state_size != 64 && state_size != 128) ||
-            state->ne[1] != state_size || heads < 1 ||
-            journal->ne[1] != heads || journal->ne[3] != n_seqs ||
-            (journal->ne[0] != 2*state_size + 1 &&
-             journal->ne[0] != 3*state_size) || tokens < 1 ||
-            conv_state->ne[0] < 1 || conv_state->ne[1] < 1 ||
-            conv_state->ne[2] != state_slots || conv_state->ne[3] != 1 ||
-            conv_input->ne[0] != conv_state->ne[0] + tokens ||
-            conv_input->ne[1] != conv_state->ne[1] ||
-            conv_input->ne[2] != n_seqs || conv_input->ne[3] != 1) return false;
-        if (common_tokens < 0) {
-            common_tokens = (int) tokens;
-            common_state_slots = (int) state_slots;
-            seen.assign((size_t) state_slots, 0);
-        } else if (tokens != common_tokens || state_slots != common_state_slots) {
-            return false;
+        int common_tokens = -1;
+        int common_state_slots = -1;
+        std::vector<uint8_t> seen;
+        for (int layer = 0; layer < n_layers; ++layer) {
+            const ggml_tensor * journal = journals[layer];
+            ggml_tensor * state = states[layer];
+            const ggml_tensor * conv_input = conv_inputs[layer];
+            ggml_tensor * conv_state = conv_states[layer];
+            if (!journal || !state || !conv_input || !conv_state ||
+                journal->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
+                conv_input->type != GGML_TYPE_F32 || conv_state->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(journal) || !ggml_is_contiguous(state) ||
+                !ggml_is_contiguous(conv_input) || !ggml_is_contiguous(conv_state)) return false;
+            const int64_t state_size = state->ne[0];
+            const int64_t heads = state->ne[2];
+            const int64_t tokens = journal->ne[2];
+            const int64_t state_slots = state->ne[3];
+            if ((state_size != 16 && state_size != 32 &&
+                 state_size != 64 && state_size != 128) ||
+                state->ne[1] != state_size || heads < 1 ||
+                journal->ne[1] != heads || journal->ne[3] != n_seqs ||
+                (journal->ne[0] != 2*state_size + 1 &&
+                 journal->ne[0] != 3*state_size) || tokens < 1 ||
+                conv_state->ne[0] < 1 || conv_state->ne[1] < 1 ||
+                conv_state->ne[2] != state_slots || conv_state->ne[3] != 1 ||
+                conv_input->ne[0] != conv_state->ne[0] + tokens ||
+                conv_input->ne[1] != conv_state->ne[1] ||
+                conv_input->ne[2] != n_seqs || conv_input->ne[3] != 1) return false;
+            if (common_tokens < 0) {
+                common_tokens = (int) tokens;
+                common_state_slots = (int) state_slots;
+                seen.assign((size_t) state_slots, 0);
+            } else if (tokens != common_tokens || state_slots != common_state_slots) {
+                return false;
+            }
+            const void * pointers[] = {
+                journal->data, state->data, conv_input->data, conv_state->data,
+            };
+            for (const void * pointer : pointers) {
+                if (!same_device_pointer(pointer, device)) return false;
+            }
         }
-        const void * pointers[] = {
-            journal->data, state->data, conv_input->data, conv_state->data,
-        };
-        for (const void * pointer : pointers) {
-            if (!same_device_pointer(pointer, device)) return false;
+        for (int64_t lane = 0; lane < n_seqs; ++lane) {
+            if (accepted[(size_t) lane] < 0 ||
+                accepted[(size_t) lane] > common_tokens) return false;
+            const int slot = slots[(size_t) lane];
+            if (slot == -1) continue;
+            if (slot < 0 || slot >= common_state_slots) return false;
+            if (seen[(size_t) slot]) return false;
+            seen[(size_t) slot] = 1;
         }
-    }
-    for (int64_t lane = 0; lane < n_seqs; ++lane) {
-        if (accepted[(size_t) lane] < 0 ||
-            accepted[(size_t) lane] > common_tokens) return false;
-        const int slot = slots[(size_t) lane];
-        if (slot == -1) continue;
-        if (slot < 0 || slot >= common_state_slots) return false;
-        if (seen[(size_t) slot]) return false;
-        seen[(size_t) slot] = 1;
     }
 
     if (!commit) return true;
@@ -289,7 +303,7 @@ static bool gdn_transition_journal_commit_many_impl(
             (int) n_seqs, (int) conv_state->ne[2]);
     }
     if (cudaGetLastError() != cudaSuccess) return false;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return !synchronize || cudaDeviceSynchronize() == cudaSuccess;
 }
 
 extern "C" bool ggml_backend_cuda_gdn_transition_journal_commit_many(
@@ -302,12 +316,12 @@ extern "C" bool ggml_backend_cuda_gdn_transition_journal_commit_many(
         const ggml_tensor * active_slot_ids) {
     if (!gdn_transition_journal_commit_many_impl(
             journals, states, conv_inputs, conv_states, n_layers,
-            accepted_prefixes, active_slot_ids, false)) {
+            accepted_prefixes, active_slot_ids, commit_mode::VALIDATE)) {
         return false;
     }
     if (!gdn_transition_journal_commit_many_impl(
             journals, states, conv_inputs, conv_states, n_layers,
-            accepted_prefixes, active_slot_ids, true)) {
+            accepted_prefixes, active_slot_ids, commit_mode::COMMIT)) {
         GGML_ABORT("recurrent commit failed after mutation began");
     }
     return true;
@@ -320,49 +334,58 @@ static bool tree_cache_commit_many_impl(
         const ggml_tensor * active_slot_ids,
         int tree_scratch_base,
         int tree_scratch_stride,
-        bool commit) {
-    if (!caches || n_caches <= 0 || !commit_rows || !active_slot_ids ||
-        commit_rows->type != GGML_TYPE_I64 ||
-        active_slot_ids->type != GGML_TYPE_I32 ||
-        !ggml_is_contiguous(commit_rows) ||
-        !ggml_is_contiguous(active_slot_ids) ||
-        commit_rows->ne[0] < 1 || commit_rows->ne[1] < 1 ||
-        ggml_nelements(active_slot_ids) != commit_rows->ne[1] ||
-        tree_scratch_base < 0 || tree_scratch_stride < commit_rows->ne[0]) return false;
+        commit_mode mode) {
+    const bool prevalidated = mode == commit_mode::COMMIT_PREVALIDATED;
+    const bool commit = mode != commit_mode::VALIDATE;
+    const bool synchronize = mode == commit_mode::COMMIT;
+    if (!prevalidated &&
+        (!caches || n_caches <= 0 || !commit_rows || !active_slot_ids ||
+         commit_rows->type != GGML_TYPE_I64 ||
+         active_slot_ids->type != GGML_TYPE_I32 ||
+         !ggml_is_contiguous(commit_rows) ||
+         !ggml_is_contiguous(active_slot_ids) ||
+         commit_rows->ne[0] < 1 || commit_rows->ne[1] < 1 ||
+         ggml_nelements(active_slot_ids) != commit_rows->ne[1] ||
+         tree_scratch_base < 0 ||
+         tree_scratch_stride < commit_rows->ne[0])) return false;
     const int tree_width = (int) commit_rows->ne[0];
     const int n_seqs = (int) commit_rows->ne[1];
     const int n_rows = tree_width*n_seqs;
     int device = -1;
-    if (!device_pointer(commit_rows->data, device) ||
-        !same_device_pointer(active_slot_ids->data, device)) return false;
+    if (!device_pointer(commit_rows->data, device)) return false;
 
-    std::vector<int64_t> destinations((size_t) n_rows);
-    std::vector<int32_t> slots((size_t) n_seqs);
-    if (cudaMemcpy(destinations.data(), commit_rows->data,
-                   destinations.size()*sizeof(int64_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(slots.data(), active_slot_ids->data,
-                   slots.size()*sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    int cache_rows = -1;
-    for (int index = 0; index < n_caches; ++index) {
-        ggml_tensor * cache = caches[index];
-        if (!cache || !ggml_is_contiguous(cache) || cache->ne[0] < 1 ||
-            cache->ne[1] < 1 || cache->ne[2] < 1 || cache->ne[3] != 1 ||
-            cache->nb[1] < ggml_row_size(cache->type, cache->ne[0]) ||
-            !same_device_pointer(cache->data, device)) return false;
-        if (cache_rows < 0) cache_rows = (int) cache->ne[1];
-        else if (cache->ne[1] != cache_rows) return false;
-    }
-    for (int lane = 0; lane < n_seqs; ++lane) {
-        const int slot = slots[(size_t) lane];
-        if (slot == -1) continue;
-        if (slot < 0) return false;
-        const int64_t source_end = (int64_t) tree_scratch_base +
-            (int64_t) slot*tree_scratch_stride + tree_width;
-        if (source_end > cache_rows) return false;
-        for (int node = 0; node < tree_width; ++node) {
-            const int64_t destination =
-                destinations[(size_t) lane*tree_width + node];
-            if (destination < -1 || destination >= cache_rows) return false;
+    int cache_rows = prevalidated ? (int) caches[0]->ne[1] : -1;
+    if (!prevalidated) {
+        if (!same_device_pointer(active_slot_ids->data, device)) return false;
+        std::vector<int64_t> destinations((size_t) n_rows);
+        std::vector<int32_t> slots((size_t) n_seqs);
+        if (cudaMemcpy(destinations.data(), commit_rows->data,
+                       destinations.size()*sizeof(int64_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(slots.data(), active_slot_ids->data,
+                       slots.size()*sizeof(int32_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+        for (int index = 0; index < n_caches; ++index) {
+            ggml_tensor * cache = caches[index];
+            if (!cache || !ggml_is_contiguous(cache) || cache->ne[0] < 1 ||
+                cache->ne[1] < 1 || cache->ne[2] < 1 || cache->ne[3] != 1 ||
+                cache->nb[1] < ggml_row_size(cache->type, cache->ne[0]) ||
+                !same_device_pointer(cache->data, device)) return false;
+            if (cache_rows < 0) cache_rows = (int) cache->ne[1];
+            else if (cache->ne[1] != cache_rows) return false;
+        }
+        for (int lane = 0; lane < n_seqs; ++lane) {
+            const int slot = slots[(size_t) lane];
+            if (slot == -1) continue;
+            if (slot < 0) return false;
+            const int64_t source_end = (int64_t) tree_scratch_base +
+                (int64_t) slot*tree_scratch_stride + tree_width;
+            if (source_end > cache_rows) return false;
+            for (int node = 0; node < tree_width; ++node) {
+                const int64_t destination =
+                    destinations[(size_t) lane*tree_width + node];
+                if (destination < -1 || destination >= cache_rows) return false;
+            }
         }
     }
 
@@ -384,7 +407,7 @@ static bool tree_cache_commit_many_impl(
             tree_scratch_base, tree_scratch_stride);
     }
     if (cudaGetLastError() != cudaSuccess) return false;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return !synchronize || cudaDeviceSynchronize() == cudaSuccess;
 }
 
 extern "C" bool ggml_backend_cuda_tree_cache_commit_many(
@@ -396,12 +419,12 @@ extern "C" bool ggml_backend_cuda_tree_cache_commit_many(
         int tree_scratch_stride) {
     if (!tree_cache_commit_many_impl(
             caches, n_caches, commit_rows, active_slot_ids,
-            tree_scratch_base, tree_scratch_stride, false)) {
+            tree_scratch_base, tree_scratch_stride, commit_mode::VALIDATE)) {
         return false;
     }
     if (!tree_cache_commit_many_impl(
             caches, n_caches, commit_rows, active_slot_ids,
-            tree_scratch_base, tree_scratch_stride, true)) {
+            tree_scratch_base, tree_scratch_stride, commit_mode::COMMIT)) {
         GGML_ABORT("K/V commit failed after mutation began");
     }
     return true;
@@ -411,27 +434,36 @@ static bool tree_feature_commit_impl(
         const ggml_tensor * source,
         ggml_tensor * destination,
         const ggml_tensor * destination_rows,
-        bool commit) {
-    if (!source || !destination || !destination_rows ||
-        source->type != destination->type || source->type != GGML_TYPE_BF16 ||
-        destination_rows->type != GGML_TYPE_I32 ||
-        !ggml_is_contiguous(source) || !ggml_is_contiguous(destination) ||
-        !ggml_is_contiguous(destination_rows) ||
-        source->ne[0] != destination->ne[0] || source->ne[2] != 1 ||
-        source->ne[3] != 1 || destination->ne[2] != 1 ||
-        destination->ne[3] != 1 ||
-        ggml_nelements(destination_rows) != source->ne[1] ||
-        source->nb[1] != destination->nb[1]) return false;
+        commit_mode mode) {
+    const bool prevalidated = mode == commit_mode::COMMIT_PREVALIDATED;
+    const bool commit = mode != commit_mode::VALIDATE;
+    const bool synchronize = mode == commit_mode::COMMIT;
+    if (!prevalidated &&
+        (!source || !destination || !destination_rows ||
+         source->type != destination->type ||
+         source->type != GGML_TYPE_BF16 ||
+         destination_rows->type != GGML_TYPE_I32 ||
+         !ggml_is_contiguous(source) ||
+         !ggml_is_contiguous(destination) ||
+         !ggml_is_contiguous(destination_rows) ||
+         source->ne[0] != destination->ne[0] || source->ne[2] != 1 ||
+         source->ne[3] != 1 || destination->ne[2] != 1 ||
+         destination->ne[3] != 1 ||
+         ggml_nelements(destination_rows) != source->ne[1] ||
+         source->nb[1] != destination->nb[1])) return false;
     int device = -1;
-    if (!device_pointer(source->data, device) ||
-        !same_device_pointer(destination->data, device) ||
-        !same_device_pointer(destination_rows->data, device)) return false;
+    if (!device_pointer(source->data, device)) return false;
     const int n_rows = (int) source->ne[1];
-    std::vector<int32_t> rows((size_t) n_rows);
-    if (cudaMemcpy(rows.data(), destination_rows->data,
-                   rows.size()*sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    for (int row : rows) {
-        if (row < -1 || row >= destination->ne[1]) return false;
+    if (!prevalidated) {
+        if (!same_device_pointer(destination->data, device) ||
+            !same_device_pointer(destination_rows->data, device)) return false;
+        std::vector<int32_t> rows((size_t) n_rows);
+        if (cudaMemcpy(rows.data(), destination_rows->data,
+                       rows.size()*sizeof(int32_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+        for (int row : rows) {
+            if (row < -1 || row >= destination->ne[1]) return false;
+        }
     }
     if (!commit) return true;
     ggml_cuda_set_device(device);
@@ -445,7 +477,7 @@ static bool tree_feature_commit_impl(
         (const int32_t *) destination_rows->data,
         source->nb[1], n_rows, (int) destination->ne[1]);
     if (cudaGetLastError() != cudaSuccess) return false;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return !synchronize || cudaDeviceSynchronize() == cudaSuccess;
 }
 
 extern "C" bool ggml_backend_cuda_tree_feature_commit(
@@ -453,11 +485,11 @@ extern "C" bool ggml_backend_cuda_tree_feature_commit(
         ggml_tensor * destination,
         const ggml_tensor * destination_rows) {
     if (!tree_feature_commit_impl(
-            source, destination, destination_rows, false)) {
+            source, destination, destination_rows, commit_mode::VALIDATE)) {
         return false;
     }
     if (!tree_feature_commit_impl(
-            source, destination, destination_rows, true)) {
+            source, destination, destination_rows, commit_mode::COMMIT)) {
         GGML_ABORT("feature commit failed after mutation began");
     }
     return true;
@@ -481,13 +513,21 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
         int tree_scratch_stride) {
     if (!tree_cache_commit_many_impl(
             caches, n_caches, commit_rows, active_slot_ids,
-            tree_scratch_base, tree_scratch_stride, false) ||
-        !tree_feature_commit_impl(
+            tree_scratch_base, tree_scratch_stride,
+            commit_mode::VALIDATE)) {
+        std::fprintf(stderr, "[gdn-transaction] K/V preflight failed\n");
+        return false;
+    }
+    if (!tree_feature_commit_impl(
             feature_source, feature_destination,
-            feature_destination_rows, false) ||
-        !gdn_transition_journal_commit_many_impl(
+            feature_destination_rows, commit_mode::VALIDATE)) {
+        std::fprintf(stderr, "[gdn-transaction] feature preflight failed\n");
+        return false;
+    }
+    if (!gdn_transition_journal_commit_many_impl(
             journals, states, conv_inputs, conv_states, n_layers,
-            accepted_prefixes, active_slot_ids, false)) {
+            accepted_prefixes, active_slot_ids, commit_mode::VALIDATE)) {
+        std::fprintf(stderr, "[gdn-transaction] recurrent preflight failed\n");
         return false;
     }
 
@@ -496,18 +536,24 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
     // pre-commit/post-commit state.
     if (!tree_cache_commit_many_impl(
             caches, n_caches, commit_rows, active_slot_ids,
-            tree_scratch_base, tree_scratch_stride, true)) {
+            tree_scratch_base, tree_scratch_stride,
+            commit_mode::COMMIT_PREVALIDATED)) {
         GGML_ABORT("tree commit failed after K/V mutation began");
     }
     if (!tree_feature_commit_impl(
             feature_source, feature_destination,
-            feature_destination_rows, true)) {
+            feature_destination_rows,
+            commit_mode::COMMIT_PREVALIDATED)) {
         GGML_ABORT("tree commit failed after feature mutation began");
     }
     if (!gdn_transition_journal_commit_many_impl(
             journals, states, conv_inputs, conv_states, n_layers,
-            accepted_prefixes, active_slot_ids, true)) {
+            accepted_prefixes, active_slot_ids,
+            commit_mode::COMMIT_PREVALIDATED)) {
         GGML_ABORT("tree commit failed after recurrent mutation began");
+    }
+    if (cudaStreamSynchronize(nullptr) != cudaSuccess) {
+        GGML_ABORT("tree commit failed during final synchronization");
     }
     return true;
 }

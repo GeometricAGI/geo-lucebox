@@ -275,6 +275,29 @@ TEST_CASE(PagedKvPoolFixture, first_last_slots_append) {
     CHECK(sequence(pool, handle).kv_seq_len == 34);
 }
 
+TEST_CASE(PagedKvPoolFixture, rollback_append_restores_visible_sequence) {
+    PagedKvPool pool(4, 1, 4);
+    PagedKvSequenceHandle handle;
+    CHECK(pool.acquire_reserved(123, 8, handle) == PagedKvStatus::Ok);
+    CHECK(pool.append(handle, 3));
+    const PagedKvSequenceSnapshot before = sequence(pool, handle);
+    const uint32_t free_before = pool.free_block_count();
+
+    CHECK(pool.append(handle, 5));
+    CHECK(sequence(pool, handle).kv_seq_len == 8);
+    CHECK(pool.rollback_append(handle, 5) == PagedKvStatus::Ok);
+
+    const PagedKvSequenceSnapshot after = sequence(pool, handle);
+    CHECK(after.kv_seq_len == before.kv_seq_len);
+    CHECK(after.block_table == before.block_table);
+    CHECK(after.reserved_block_count == before.reserved_block_count);
+    CHECK(pool.free_block_count() == free_before);
+    CHECK(state_unchanged(pool, handle, [&] {
+        CHECK(pool.rollback_append(handle, 4) ==
+              PagedKvStatus::InvalidArgument);
+    }));
+}
+
 TEST_CASE(PagedKvPoolFixture, noncontiguous_reuse_and_isolation) {
     PagedKvPool pool(6, 3, 16);
     const auto first = acquire(pool, 101);

@@ -251,7 +251,13 @@ Qwen35SlotManager::StepAppend Qwen35SlotManager::append_tokens(
             static_cast<uint32_t>(s.cur_pos) ||
         app.write_slots.back().logical_position !=
             static_cast<uint32_t>(s.cur_pos + n_tokens - 1)) {
-        s.staged_tokens.assign(fed_tokens, fed_tokens + n_tokens);
+        const PagedKvStatus rollback =
+            pool_.rollback_append(s.handle, static_cast<uint32_t>(n_tokens));
+        if (rollback != PagedKvStatus::Ok) {
+            std::fprintf(stderr,
+                "[parallel] slot %d failed to roll back invalid append: %s\n",
+                slot, paged_kv_status_string(rollback));
+        }
         return out;
     }
 
@@ -294,6 +300,22 @@ void Qwen35SlotManager::commit_step(int slot) {
         s.staged_tokens.end());
     s.cur_pos += static_cast<int>(s.staged_tokens.size());
     s.staged_tokens.clear();
+}
+
+bool Qwen35SlotManager::rollback_step(int slot) {
+    if (!is_active(slot)) return false;
+    Qwen35Slot & s = slots_[(size_t)slot];
+    if (s.staged_tokens.empty()) return false;
+    const PagedKvStatus status = pool_.rollback_append(
+        s.handle, static_cast<uint32_t>(s.staged_tokens.size()));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr,
+            "[parallel] slot %d staged append rollback failed: %s\n",
+            slot, paged_kv_status_string(status));
+        return false;
+    }
+    s.staged_tokens.clear();
+    return true;
 }
 
 void Qwen35SlotManager::retire(int slot) {

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -768,6 +769,52 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
     return ok;
 }
 
+bool test_journal_view_is_allocated_with_graph(ggml_backend_t backend) {
+    constexpr int state_size = 16;
+    constexpr int heads = 1;
+    constexpr int tokens = 8;
+    constexpr int sequences = 4;
+
+    ggml_init_params params{};
+    params.mem_size = 512*1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, state_size, heads, tokens, sequences);
+    ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, state_size, heads, tokens, sequences);
+    ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, state_size, heads, tokens, sequences);
+    ggml_tensor * g = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, heads, tokens, sequences);
+    ggml_tensor * beta = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, heads, tokens, sequences);
+    ggml_tensor * state = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, state_size, state_size, heads, sequences);
+    ggml_tensor * parents = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, tokens, sequences);
+    ggml_tensor * result = ggml_gated_delta_net_tree(
+        ctx, q, k, v, g, beta, state, parents);
+    ggml_tensor * journal =
+        ggml_gated_delta_net_capture_transition_journal(ctx, result);
+    ggml_set_output(journal);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    ggml_build_forward_expand(graph, journal);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = alloc && ggml_gallocr_alloc_graph(alloc, graph);
+    const bool ok = allocated && journal->buffer && journal->data;
+    std::printf("gdn journal gallocr C4/W8       : %s\n",
+                ok ? "PASS" : "FAIL");
+    if (alloc) ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return ok;
+}
+
 bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
     constexpr int state_size = 16;
     constexpr int heads = 1;
@@ -903,12 +950,27 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     if (!test_raw_gate_protocol()) return 1;
     setenv("DFLASH_GDN_FORCE_GROUPED_COLS", "1", 1);
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, "GPU backend unavailable\n");
+        return 1;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--preflight-only") == 0) {
+        const bool ok =
+            test_tree_commit_preflight_is_non_mutating(backend);
+        ggml_backend_free(backend);
+        return ok ? 0 : 1;
+    }
+    const bool gallocr_ok = test_journal_view_is_allocated_with_graph(backend);
+    if (argc == 2 && std::strcmp(argv[1], "--gallocr-only") == 0) {
+        ggml_backend_free(backend);
+        return gallocr_ok ? 0 : 1;
+    }
+    if (!gallocr_ok) {
+        ggml_backend_free(backend);
         return 1;
     }
     bool ok = run_case(backend, false, false);

@@ -374,6 +374,41 @@ int main() {
             mgr.slot(a.slot).sample_history.end() - 6));
     }
 
+    {
+        PagedKvPool pool(4, 1, 16);
+        Qwen35SlotManager mgr(pool, 64);
+        auto a = admit(mgr, 1, prompt_tokens(15), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 15).ok);
+        mgr.commit_prefill(a.slot);
+
+        PagedKvSequenceSnapshot before;
+        CHECK(pool.sequence(mgr.slot(a.slot).handle, before) ==
+              PagedKvStatus::Ok);
+        const uint32_t free_before = pool.free_block_count();
+        const int32_t accepted[] = {41, 42, 43, 44, 45, 46, 47, 48};
+        const auto staged = mgr.append_tokens(a.slot, accepted, 8);
+        CHECK(staged.ok && staged.new_blocks.size() == 1);
+        CHECK(mgr.rollback_step(a.slot));
+        CHECK(mgr.slot(a.slot).cur_pos == 15);
+        CHECK(mgr.slot(a.slot).sample_history == prompt_tokens(15));
+        CHECK(mgr.slot(a.slot).staged_tokens.empty());
+
+        PagedKvSequenceSnapshot after;
+        CHECK(pool.sequence(mgr.slot(a.slot).handle, after) ==
+              PagedKvStatus::Ok);
+        CHECK(after.kv_seq_len == before.kv_seq_len);
+        CHECK(after.block_table == before.block_table);
+        CHECK(after.reserved_block_count == before.reserved_block_count);
+        CHECK(pool.free_block_count() == free_before);
+
+        const auto restaged = mgr.append_tokens(a.slot, accepted, 8);
+        CHECK(restaged.ok);
+        CHECK(restaged.physical_rows == staged.physical_rows);
+        mgr.commit_step(a.slot);
+        CHECK(mgr.slot(a.slot).cur_pos == 23);
+    }
+
     // Context exhaustion: append_token refuses past max_ctx.
     {
         PagedKvPool pool(4, 1, /*block_size=*/16);

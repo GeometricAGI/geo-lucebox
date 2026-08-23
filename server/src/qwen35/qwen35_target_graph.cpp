@@ -2068,6 +2068,7 @@ static ggml_tensor * build_delta_net_block(
         seg_cap->transition_journal =
             ggml_gated_delta_net_capture_transition_journal(ctx, result);
         ggml_set_output(seg_cap->transition_journal);
+        ggml_build_forward_expand(gf, seg_cap->transition_journal);
     }
 
     // Slice output and new_state out of the packed result

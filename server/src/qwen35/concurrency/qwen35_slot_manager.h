@@ -116,6 +116,8 @@ public:
     // The batched step's compute succeeded: cur_pos++.
     void commit_step(int slot);
 
+    bool rollback_step(int slot);
+
     // Release the slot's blocks and clear its state. Safe on inactive slots
     // and after a failed admission/prefill.
     void retire(int slot);
