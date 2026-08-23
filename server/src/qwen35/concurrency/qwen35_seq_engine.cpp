@@ -100,19 +100,34 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         mirror.storage_type = b_.cache_.target_feat->type;
     }
 
-    if (n_slots == 4 && tree_width_ == 8) {
+    if (n_slots <= 6 && tree_width_ == 8) {
         bool draft_states_ready = true;
         for (int slot = 0; slot < n_slots; ++slot) {
             draft_states_ready =
                 ensure_slot_draft_kv(slot) && draft_states_ready;
         }
+        if (draft_states_ready && n_slots >= 5) {
+            auto dummy = std::make_unique<DraftKvState>();
+            const int draft_cap = std::min(
+                cap, std::max(1, b_.cfg_.draft_ctx_max));
+            if (draft_kv_init(
+                    *dummy, b_.dw_, b_.draft_backend_, draft_cap, nullptr)) {
+                dummy_draft_kv_.push_back(std::move(dummy));
+            } else {
+                draft_kv_free(*dummy);
+                draft_states_ready = false;
+            }
+        }
+
         if (draft_states_ready) {
             std::fprintf(stderr,
-                "[parallel-chain] preallocated C=4/W8 draft states\n");
+                "[parallel-chain] preallocated C=%d/W8 draft states\n",
+                n_slots);
         } else {
             std::fprintf(stderr,
-                "[parallel-chain] C=4/W8 draft-state preallocation incomplete; "
-                "falling back to lazy setup\n");
+                "[parallel-chain] C=%d/W8 draft-state preallocation incomplete; "
+                "falling back to lazy setup\n",
+                n_slots);
         }
     }
 }

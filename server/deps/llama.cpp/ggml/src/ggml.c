@@ -6993,12 +6993,12 @@ struct ggml_tensor * ggml_gated_delta_net_capture_transition_journal(
     tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
     ggml_set_op_params_i32(tensor, 3, journal_row_offset);
 
-    return ggml_view_4d(
+    return ggml_dup(ctx, ggml_view_4d(
         ctx, tensor, journal_width, H, n_tokens, n_seqs,
         (size_t) journal_width*sizeof(float),
         (size_t) journal_head*sizeof(float),
         (size_t) journal_token*sizeof(float),
-        journal_byte_offset);
+        journal_byte_offset));
 }
 
 // dflash: raw-gate mode (see ggml.h). [dt_bias | A] -> src[9],

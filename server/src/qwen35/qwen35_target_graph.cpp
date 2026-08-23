@@ -1682,7 +1682,8 @@ static ggml_tensor * build_delta_net_block(
     const bool seg_tree = seg.tree;
     DeltaNetCapture * seg_cap = mapped_tree
         ? (seg_tree ? cap : nullptr) : cap;
-    ggml_tensor * seg_parent_ids = seg_tree ? parent_ids : nullptr;
+    ggml_tensor * seg_parent_ids = mapped_tree
+        ? (seg_tree ? parent_ids : nullptr) : parent_ids;
     const bool can_skip_gdn_intermediate =
         skip_gdn_intermediate && !seg_parent_ids && !seg_cap;
     // Plain one-token decode has no in-graph consumer of the updated state:
@@ -2338,7 +2339,7 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.paged_query_positions,
                                         in.paged_max_kv_len,
                                         in.active_slot_ids,
-                                        in.parent_ids,
+                                        in.tree_sizes ? in.parent_ids : nullptr,
                                         in.tree_sizes,
                                         in.tree_width,
                                         in.tree_scratch_base,

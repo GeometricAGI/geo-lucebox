@@ -447,9 +447,9 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
     }
     tensors.journal =
         ggml_gated_delta_net_capture_transition_journal(tensors.ctx, result);
-    ggml_set_output(result);
+    ggml_set_output(tensors.journal);
     ggml_cgraph * graph = ggml_new_graph(tensors.ctx);
-    ggml_build_forward_expand(graph, result);
+    ggml_build_forward_expand(graph, tensors.journal);
 
     tensors.buffer = ggml_backend_alloc_ctx_tensors(tensors.ctx, backend);
     if (!tensors.buffer) {
@@ -682,9 +682,9 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
         ctx, q, k, v, g, beta, base_state, parents);
     ggml_tensor * journal =
         ggml_gated_delta_net_capture_transition_journal(ctx, result);
-    ggml_set_output(result);
+    ggml_set_output(journal);
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, result);
+    ggml_build_forward_expand(graph, journal);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buffer) {
@@ -769,7 +769,7 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
     return ok;
 }
 
-bool test_journal_view_is_allocated_with_graph(ggml_backend_t backend) {
+bool test_journal_capture_owns_storage(ggml_backend_t backend) {
     constexpr int state_size = 16;
     constexpr int heads = 1;
     constexpr int tokens = 8;
@@ -807,8 +807,9 @@ bool test_journal_view_is_allocated_with_graph(ggml_backend_t backend) {
     ggml_gallocr_t alloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     const bool allocated = alloc && ggml_gallocr_alloc_graph(alloc, graph);
-    const bool ok = allocated && journal->buffer && journal->data;
-    std::printf("gdn journal gallocr C4/W8       : %s\n",
+    const bool ok = allocated && journal->buffer && journal->data &&
+                    journal->view_src == nullptr;
+    std::printf("gdn journal owned C4/W8         : %s\n",
                 ok ? "PASS" : "FAIL");
     if (alloc) ggml_gallocr_free(alloc);
     ggml_free(ctx);
@@ -964,7 +965,7 @@ int main(int argc, char ** argv) {
         ggml_backend_free(backend);
         return ok ? 0 : 1;
     }
-    const bool gallocr_ok = test_journal_view_is_allocated_with_graph(backend);
+    const bool gallocr_ok = test_journal_capture_owns_storage(backend);
     if (argc == 2 && std::strcmp(argv[1], "--gallocr-only") == 0) {
         ggml_backend_free(backend);
         return gallocr_ok ? 0 : 1;
