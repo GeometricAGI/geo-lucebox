@@ -36,6 +36,12 @@ struct StepGraph {
     ggml_tensor *   positions = nullptr;
     ggml_tensor *   attn_mask = nullptr;     // may be null
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
+    // SpecLA topology masks ([n_tokens, n_tokens] f32, host-filled; see
+    // delta_net_specla.h). Created only when DFLASH_SPECLA capture is active.
+    ggml_tensor *   specla_m_strict = nullptr;
+    ggml_tensor *   specla_m_incl   = nullptr;
+    ggml_tensor *   specla_m_eye    = nullptr;
+    ggml_tensor *   specla_hld      = nullptr;
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
     ggml_tensor *   pad_mask_full = nullptr;      // draft only; padded-ctx mask
@@ -51,6 +57,18 @@ struct StepGraph {
     // Used by contiguous replay, KVFlash, and paged attention; null when the
     // graph uses the legacy contiguous ggml_cpy write.
     ggml_tensor *   kv_write_rows = nullptr;
+    // Compact decode row -> physical sequence slot. Padding rows carry -1.
+    // state_slot_ids has the same shape but maps padding to a safe readable
+    // slot for graph-level conv-state gathers.
+    ggml_tensor *   active_slot_ids = nullptr;
+    ggml_tensor *   state_slot_ids = nullptr;
+    // Ragged paged read (concurrent prefill): per-row block-table column and
+    // inclusive causal position, [n_tokens] i32 each. Padding rows carry -1.
+    ggml_tensor *   paged_query_seq_ids = nullptr;
+    ggml_tensor *   paged_query_positions = nullptr;
+    // Multi-prompt steps: i32 row indices gathered from the final norm
+    // before the LM head (committing rows + decode rows).
+    ggml_tensor *   logits_row_indices = nullptr;
 
     // Output
     ggml_tensor *   logits = nullptr;
@@ -80,7 +98,14 @@ inline void step_graph_free(StepGraph & sg) {
     sg.built_view = false;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
+    sg.specla_m_strict = sg.specla_m_incl = sg.specla_m_eye = nullptr;
+    sg.specla_hld = nullptr;
     sg.kv_write_rows = nullptr;
+    sg.active_slot_ids = nullptr;
+    sg.state_slot_ids = nullptr;
+    sg.paged_query_seq_ids = nullptr;
+    sg.paged_query_positions = nullptr;
+    sg.logits_row_indices = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;

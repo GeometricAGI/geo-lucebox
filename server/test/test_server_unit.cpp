@@ -35,6 +35,7 @@
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
 #include "common/gguf_inspect.h"
+#include "qwen35/prefill_helpers.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -44,6 +45,7 @@
 
 #include <filesystem>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,6 +101,13 @@ struct ServerUnitFixture {};
     } \
 } while (0)
 
+TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
+    CHECK(std::string(api_format_name(ApiFormat::OPENAI_CHAT)) == "chat");
+    CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");
+    CHECK(std::string(api_format_name(ApiFormat::RESPONSES)) == "responses");
+    CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
+}
+
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
     bool cancel = false;
     DaemonIO io;
@@ -144,6 +153,47 @@ TEST_CASE(ServerUnitFixture, test_http_peer_socket_probe_preserves_half_close) {
                 http_detail::PeerSocketState::Disconnected);
     close(sockets[1]);
 }
+
+TEST_CASE(ServerUnitFixture, test_http_heartbeat_never_waits_for_stalled_peer) {
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    TEST_ASSERT(fcntl(sockets[0], F_SETFL, O_NONBLOCK) == 0);
+    const int sndbuf = 4096;
+    TEST_ASSERT(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF,
+                           &sndbuf, sizeof(sndbuf)) == 0);
+
+    const std::string fill(4096, 'x');
+    ssize_t sent = 0;
+    do {
+        sent = send(sockets[0], fill.data(), fill.size(), MSG_NOSIGNAL);
+    } while (sent > 0);
+    TEST_ASSERT(sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    const auto started = std::chrono::steady_clock::now();
+    size_t heartbeat_offset = 0;
+    TEST_ASSERT(http_detail::try_send_sse_heartbeat(
+                    sockets[0], heartbeat_offset) ==
+                http_detail::HeartbeatSendResult::Retry);
+    TEST_ASSERT(heartbeat_offset < sizeof(": keep-alive\n\n") - 1);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    TEST_ASSERT(elapsed < std::chrono::milliseconds(100));
+
+    // Once the peer drains, retrying completes the same heartbeat rather than
+    // treating temporary backpressure as a disconnect.
+    char drained[8192];
+    while (recv(sockets[1], drained, sizeof(drained), MSG_DONTWAIT) > 0) {}
+    TEST_ASSERT(http_detail::try_send_sse_heartbeat(
+                    sockets[0], heartbeat_offset) ==
+                http_detail::HeartbeatSendResult::Complete);
+    TEST_ASSERT(heartbeat_offset == 0);
+    const std::string expected = ": keep-alive\n\n";
+    TEST_ASSERT(recv(sockets[1], drained, sizeof(drained), 0) ==
+                (ssize_t)expected.size());
+    TEST_ASSERT(std::memcmp(drained, expected.data(), expected.size()) == 0);
+
+    close(sockets[0]);
+    close(sockets[1]);
+}
 #endif
 
 TEST_CASE(ServerUnitFixture, test_http_sse_done_scanner_requires_terminal_line) {
@@ -170,6 +220,36 @@ TEST_CASE(ServerUnitFixture, test_http_sse_done_scanner_requires_terminal_line) 
     TEST_ASSERT(http_detail::sse_chunk_has_done(
         partial_line, second.data(), second.size()));
     TEST_ASSERT(partial_line.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen35_mrope_positions_axis_major) {
+    std::vector<int32_t> standalone(4 * 5, -1);
+    fill_qwen35_mrope_positions(
+        standalone.data(), /*base_pos=*/7, /*n_tokens=*/5);
+    const std::vector<int32_t> expected{
+        7, 8, 9, 10, 11,
+        7, 8, 9, 10, 11,
+        7, 8, 9, 10, 11,
+        0, 0, 0, 0, 0,
+    };
+    TEST_ASSERT(standalone == expected);
+
+    constexpr int packed_tokens = 8;
+    std::vector<int32_t> packed(4 * packed_tokens, -1);
+    fill_qwen35_mrope_positions(
+        packed.data(), packed_tokens, /*token_offset=*/2,
+        /*base_pos=*/20, /*n_tokens=*/3);
+    for (int axis = 0; axis < 4; ++axis) {
+        for (int row = 0; row < packed_tokens; ++row) {
+            const bool in_segment = row >= 2 && row < 5;
+            const int expected_value = !in_segment
+                ? -1
+                : (axis < 3 ? 20 + row - 2 : 0);
+            TEST_ASSERT(
+                packed[(size_t)axis * packed_tokens + row] ==
+                expected_value);
+        }
+    }
 }
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
@@ -770,6 +850,86 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_code_wrapper) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_wrapper) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"echo 'hello'\"}}\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo 'hello'");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_legacy_openai_function_call_json) {
+    const std::string text =
+        "{\"function_call\":{\"arguments\":"
+        "\"{\\\"location\\\":\\\"test-city\\\"}\","
+        "\"name\":\"get_weather\"}}";
+    const auto result = parse_tool_calls(text, weather_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["location"] == "test-city");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_deepseek_function_parameters_json) {
+    const std::string text =
+        "{\"function\":\"get_weather\",\"parameters\":{"
+        "\"location\":\"test-city\",\"unit\":\"celsius\"}}";
+    const auto result = parse_tool_calls(text, weather_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["location"] == "test-city");
+        TEST_ASSERT(args["unit"] == "celsius");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_deepseek_function_stringified_parameters_json) {
+    const std::string text =
+        "{\"function\":\"get_weather\",\"parameters\":"
+        "\"{\\\"location\\\":\\\"test-city\\\",\\\"unit\\\":\\\"celsius\\\"}\"}";
+    const auto result = parse_tool_calls(text, weather_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["location"] == "test-city");
+        TEST_ASSERT(args["unit"] == "celsius");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
+    std::string text =
+        "<function>\n"
+        "{\n"
+        "  \"name\": \"bash\",\n"
+        "  \"parameters\": {\n"
+        "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+        "  }\n"
+        "}\n"
+        "</function>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la \"/home/dpavlin/aimax project\"");
+    }
+}
+
+
+
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
         "<function=blocked_tool>\n"
@@ -1287,6 +1447,79 @@ TEST_CASE(ServerUnitFixture, test_emitter_tool_buffer_detection) {
     // Tool call text should not leak into accumulated content
     TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_call_tool_buffer_detection) {
+    // When the emitter sees <function_call>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function_call>\n"
+                  "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n"
+                  "</function_call>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_bare_function_json_tool_buffer_detection) {
+    // When the emitter sees <function>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function>\n"
+                  "{\n"
+                  "  \"name\": \"bash\",\n"
+                  "  \"parameters\": {\n"
+                  "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+                  "  }\n"
+                  "}\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_named_json_with_multiple_tools) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_and_bash_tools());
+    em.emit_start();
+    em.emit_token("{\"function\":\"bash\",");
+    em.emit_token("\"parameters\":{\"command\":\"pwd\"}}");
+    const auto finish = em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+        const auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "pwd");
+    }
+    TEST_ASSERT(em.accumulated_text().empty());
+    const std::string wire = concat(finish);
+    TEST_ASSERT(wire.find("bash") != std::string::npos);
+    TEST_ASSERT(wire.find("tool_calls") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_multi_tool_json_content_is_preserved) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_and_bash_tools());
+    em.emit_start();
+    em.emit_token("{\"status\":\"ok\"}");
+    const auto finish = em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "{\"status\":\"ok\"}");
+    TEST_ASSERT(concat(finish).find("status") != std::string::npos);
+}
+
+
 
 TEST_CASE(ServerUnitFixture, test_emitter_anthropic_tool_use_blocks) {
     // The Anthropic streaming tool-use branch used to be a no-op; the model
@@ -1848,6 +2081,51 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(PrefixCache::MAX_SLOTS, tokenizer);
+    TEST_ASSERT(cache.stats().capacity == PrefixCache::MAX_CACHE_SLOTS);
+    TEST_ASSERT(PrefixCache::MAX_CACHE_SLOTS == ModelBackend::kMaxSlots - 1);
+
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_canonical_turn_matches_replay_checkpoint) {
+    TEST_ASSERT(http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 9, 4}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 9, 3, 4}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 3, 4}, 0));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 3, 4}, 4));
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen_completed_tool_turn_preserves_generation_prefix) {
+    const std::string sentinel = "__AGENT_TURN_SENTINEL__";
+    for (bool thinking : {false, true}) {
+        std::vector<ChatMessage> messages = {{"user", "inspect the repo"}};
+        const std::string generation = render_chat_template(
+            messages, ChatFormat::QWEN3, true, thinking);
+        messages.push_back({"assistant", sentinel});
+        const std::string probe = render_chat_template(
+            messages, ChatFormat::QWEN3, false, thinking);
+
+        std::string content;
+        TEST_ASSERT(http_detail::canonical_assistant_content(
+            generation, probe, sentinel, "<tool_call>x</tool_call>", content));
+        messages.back().content = content;
+        const std::string completed = render_chat_template(
+            messages, ChatFormat::QWEN3, false, thinking);
+        TEST_ASSERT(completed.compare(0, generation.size(), generation) == 0);
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());
@@ -2173,6 +2451,38 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_defaults) {
     TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
 }
 
+TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
+    ServerStatus status;
+    ServerStatus::RequestInfo info;
+    info.model = "classic-model";
+    status.set_running("classic prompt", 12, true, info);
+    json snapshot = status.to_json();
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"]["model"] == "classic-model");
+
+    status.set_concurrent_requests(2, 2);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "prefill");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+    TEST_ASSERT(snapshot["current"].is_null());
+
+    status.set_concurrent_requests(2, 1);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "mixed");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+
+    status.set_concurrent_requests(2, 0);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "decode");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+
+    status.set_idle();
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "idle");
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"].is_null());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
     ServerConfig cfg;
     cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
@@ -2358,6 +2668,18 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
     TEST_ASSERT(
         resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
     TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
+    // "Unlimited" sentinels from clients such as PocketPal must fall back
+    // to the default rather than yielding a zero-token budget.
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", 0}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_output_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_placement_same_backend_local) {
@@ -2640,13 +2962,19 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
 TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
     ToolMemory tool_memory;
     const std::string call_id = "call_exec_001";
+    const std::string second_call_id = "call_read_002";
     const std::string raw_tool_call =
         "\n\n<function=exec_command>\n"
         "<parameter=cmd>\n"
         "git fetch origin && git status\n"
         "</parameter>\n"
+        "</function>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\n"
+        "src/main.cpp\n"
+        "</parameter>\n"
         "</function>\n";
-    tool_memory.remember({call_id}, raw_tool_call);
+    tool_memory.remember({call_id, second_call_id}, raw_tool_call);
 
     json messages = json::array({
         {
@@ -2670,18 +2998,31 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
             {"arguments", R"({"cmd":"git fetch origin && git status"})"}
         },
         {
+            {"type", "function_call"},
+            {"call_id", second_call_id},
+            {"name", "read_file"},
+            {"arguments", R"({"path":"src/main.cpp"})"}
+        },
+        {
             {"type", "function_call_output"},
             {"call_id", call_id},
             {"output", "Process exited with code 0"}
+        },
+        {
+            {"type", "function_call_output"},
+            {"call_id", second_call_id},
+            {"output", "int main() {}"}
         }
     });
 
-    // QWEN3 (any non-ATEM format) keeps the XML tool-call rendering this test
-    // asserts on; ATEM would replay through render_tool_call_atem instead.
-    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES,
-                                             tool_memory, ChatFormat::QWEN3);
-    TEST_ASSERT(chat_msgs.size() == 4);
-    if (chat_msgs.size() == 4) {
+      // QWEN3 (any non-ATEM format) keeps the XML tool-call rendering this test
+      // asserts on; ATEM would replay through render_tool_call_atem instead.
+      // Count is upstream's 5, not our old 4: upstream now preserves BOTH tool
+      // results rather than collapsing them, and the assertions below index [4].
+      auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES,
+                                               tool_memory, ChatFormat::QWEN3);
+      TEST_ASSERT(chat_msgs.size() == 5);
+      if (chat_msgs.size() == 5) {
         TEST_ASSERT(chat_msgs[0].role == "system");
         TEST_ASSERT(chat_msgs[0].content == "Developer rules");
         TEST_ASSERT(chat_msgs[1].role == "user");
@@ -2691,6 +3032,9 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
         TEST_ASSERT(chat_msgs[3].role == "tool");
         TEST_ASSERT(chat_msgs[3].tool_call_id == call_id);
         TEST_ASSERT(chat_msgs[3].content == "Process exited with code 0");
+        TEST_ASSERT(chat_msgs[4].role == "tool");
+        TEST_ASSERT(chat_msgs[4].tool_call_id == second_call_id);
+        TEST_ASSERT(chat_msgs[4].content == "int main() {}");
     }
 }
 
@@ -4562,7 +4906,6 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     PrefixCache  pc(0, tok);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
-
     TEST_ASSERT(body.contains("model_card"));
     TEST_ASSERT(!body["model_card"].is_null());
     // `source` is the upstream URL, NOT the filepath. The filepath label
@@ -4603,6 +4946,17 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     TEST_ASSERT(body["budget_envelope"]["model_card_source"].get<std::string>() ==
                 "family:qwen35");
     TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
+}
+
+TEST_CASE(ServerUnitFixture, test_props_deepseek4_tool_capability) {
+    ServerConfig cfg;
+    cfg.arch = "deepseek4";
+    Tokenizer tok;
+    PrefixCache pc(0, tok);
+    ToolMemory tm;
+    const json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body["capabilities"]["tools_supported"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
@@ -4675,6 +5029,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
     cfg.draft_device    = "auto:0";
+    TEST_ASSERT(cfg.admission_coalesce_ms == 20);
 
     Tokenizer    tok;
     PrefixCache  pc(0, tok);
@@ -4693,12 +5048,17 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+    TEST_ASSERT(rt["continuous_batching"]["admission_coalesce_ms"]
+                    .get<int>() == 20);
     TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();
+    cfg.admission_coalesce_ms = 7;
     body = build_props_body(cfg, pc, tm);
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+    TEST_ASSERT(body["runtime"]["continuous_batching"]
+                    ["admission_coalesce_ms"].get<int>() == 7);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4781,12 +5141,13 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_zero_decode_no_div_by_zero) {
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
-    GenTimings t{0.012, 0.25, true, 8192, 64, 8256};
+    GenTimings t{0.012, 0.25, true, 8192, 64, 8256, true};
     json j = build_timings_json(t, /*completion_tokens=*/10);
     TEST_ASSERT(j["cache_hit"].get<bool>());
     TEST_ASSERT(j["cached_prefix_tokens"].get<int>() == 8192);
     TEST_ASSERT(j["prefilled_tokens"].get<int>() == 64);
     TEST_ASSERT(j["effective_prompt_tokens"].get<int>() == 8256);
+    TEST_ASSERT(j["agent_turn_cache_hit"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_omitted_when_null) {
@@ -4837,6 +5198,7 @@ struct EmptySpecRetryBackend : MockBackend {
         restore_calls++;
         GenerateResult result;
         result.succeed();
+        result.restored_prefix_tokens = req.force_ar_decode ? 2 : 3;
         if (req.force_ar_decode) {
             restore_saw_force_ar = true;
             result.tokens = {84};
@@ -4882,6 +5244,7 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_restore_once_
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
     TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(result.restored_prefix_tokens == 3);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
 }
@@ -4924,7 +5287,7 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_resto
     TEST_ASSERT(backend.restore_saw_force_ar);
 }
 
-// GenerateResult.accept_rate plumbing tests (Day 1 of bandit MVP)
+// GenerateResult speculative telemetry plumbing tests (Day 1 of bandit MVP)
 // ═══════════════════════════════════════════════════════════════════════
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_defaults_to_zero) {
@@ -4953,6 +5316,7 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_openai) {
     result.succeed();
     result.tokens = {1, 2, 3};
     result.accept_rate = 0.75f;
+    result.spec_decode_ran = true;
 
     std::vector<int32_t> prompt_tokens = {10, 20};
 
@@ -4962,12 +5326,14 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_openai) {
             {"prompt_tokens", (int)prompt_tokens.size()},
             {"completion_tokens", (int)result.tokens.size()},
             {"total_tokens", (int)(prompt_tokens.size() + result.tokens.size())},
-            {"accept_rate", result.accept_rate}
+            {"accept_rate", result.accept_rate},
+            {"spec_decode_ran", result.spec_decode_ran}
         }}
     };
 
     TEST_ASSERT(resp["usage"].contains("accept_rate"));
     TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.75f) < 1e-6f);
+    TEST_ASSERT(resp["usage"]["spec_decode_ran"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic) {
@@ -4975,6 +5341,7 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic
     result.succeed();
     result.tokens = {1, 2};
     result.accept_rate = 0.60f;
+    result.spec_decode_ran = true;
 
     std::vector<int32_t> prompt_tokens = {5};
 
@@ -4982,20 +5349,23 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic
         {"usage", {
             {"input_tokens", (int)prompt_tokens.size()},
             {"output_tokens", (int)result.tokens.size()},
-            {"accept_rate", result.accept_rate}
+            {"accept_rate", result.accept_rate},
+            {"spec_decode_ran", result.spec_decode_ran}
         }}
     };
 
     TEST_ASSERT(resp["usage"].contains("accept_rate"));
     TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.60f) < 1e-6f);
+    TEST_ASSERT(resp["usage"]["spec_decode_ran"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_zero_when_no_spec_decode) {
     // When spec decode doesn't run (no draft model), accept_rate stays 0.
     GenerateResult r;
     r.succeed();
-    // accept_rate not set → must be 0.0f
+    // Telemetry not set → accept_rate is zero and speculative decode is false.
     TEST_ASSERT(r.accept_rate == 0.0f);
+    TEST_ASSERT(!r.spec_decode_ran);
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_error_state_is_consistent) {
@@ -5515,4 +5885,208 @@ TEST_CASE(ServerUnitFixture, test_qwen35_embedded_mtp_target_layer_count) {
     TEST_ASSERT(derive_effective_target_layer_count(
         "laguna", 65, 1, target_layers, error));
     TEST_ASSERT(target_layers == 65);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_xml) {
+    const std::string text =
+        "Reading configuration:\n"
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">server.go</param>\n"
+        "  <param name=\"offset\">10</param>\n"
+        "  <param name=\"limit\">50</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "server.go");
+        TEST_ASSERT(args["offset"] == 10);
+        TEST_ASSERT(args["limit"] == 50);
+    }
+    TEST_ASSERT(result.cleaned_text == "Reading configuration:");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_json) {
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  {\"path\": \"app.py\", \"offset\": \"5\"}\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "app.py");
+        TEST_ASSERT(args["offset"] == 5);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_inside_reasoning) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Analyzing build files.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>\n</think>");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Analyzing build files.") != std::string::npos);
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_anthropic_input_schema) {
+    json anthropic_tools = json::array({
+        {
+            {"name", "read"},
+            {"description", "Read a file"},
+            {"input_schema", {
+                {"type", "object"},
+                {"properties", {
+                    {"path", {{"type", "string"}}},
+                    {"offset", {{"type", "integer"}}}
+                }}
+            }}
+        }
+    });
+
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">main.cpp</param>\n"
+        "  <param name=\"offset\">42</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, anthropic_tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "main.cpp");
+        TEST_ASSERT(args["offset"] == 42);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_unclosed_think_flushes_reasoning) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Analyzing build files without closing tag.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Analyzing build files without closing tag.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("Analyzing build files") == std::string::npos);
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_content_tokens_accounting) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    // Token 0: reasoning
+    em.emit_token("<think>Analyzing build configuration.\n");
+    // Token 1: function_calls
+    em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>\n");
+    // Token 2: close think
+    em.emit_token("</think>\n");
+    // Token 3: content
+    em.emit_token("Here is the build summary.");
+    em.emit_finish(4);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.first_content_token_index() == 3);
+    TEST_ASSERT(em.emit_token_count() == 4);
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_param_with_literal_think_close) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    // Token 0: reasoning
+    em.emit_token("<think>Searching for tag.\n");
+    // Token 1: parameter with literal </think> inside
+    em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">test_</think>.cpp</param>\n  </invoke>\n</function_calls>\n");
+    // Token 2: real close think + trailing content in same token
+    em.emit_token("</think> Found file.");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.first_content_token_index() == 2);
+    TEST_ASSERT(em.emit_token_count() == 3);
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_length_finish_reason_at_cap) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), false);
+    em.emit_start();
+    em.emit_token("hello world");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.finish_reason() == "length");
+    bool found_length = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"length\"") != std::string::npos) {
+            found_length = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_length);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_length_finish_reason_at_zero_cap) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), false);
+    em.emit_start();
+    auto chunks = em.emit_finish(0, nullptr, 0);
+    TEST_ASSERT(em.finish_reason() == "length");
+    bool found_length = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"length\"") != std::string::npos) {
+            found_length = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_length);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_stop_sequence_beats_length_at_cap) {
+    std::vector<std::string> stops = {"END"};
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, stops);
+    em.emit_start();
+    em.emit_token("finished END");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.stop_hit());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    bool found_stop = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"stop\"") != std::string::npos) {
+            found_stop = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_stop);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_length_finish_reason_at_cap) {
+    auto em = make_emitter(ApiFormat::ANTHROPIC, json::array(), false);
+    em.emit_start();
+    em.emit_token("hello world");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.finish_reason() == "length");
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("\"stop_reason\":\"max_tokens\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_stop_sequence_beats_length_at_cap) {
+    std::vector<std::string> stops = {"END"};
+    auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, stops);
+    em.emit_start();
+    em.emit_token("finished END");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.stop_hit());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("\"stop_reason\":\"end_turn\"") != std::string::npos);
 }

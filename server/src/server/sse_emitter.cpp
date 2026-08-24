@@ -13,6 +13,7 @@ namespace dflash::common {
 
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
+static const char FUNCTION_CALLS_OPEN[] = "<function_calls>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 
@@ -20,13 +21,9 @@ static bool has_request_tools(const json & tools) {
     return tools.is_array() && !tools.empty();
 }
 
-static bool has_single_request_tool(const json & tools) {
-    return tools.is_array() && tools.size() == 1 && tools[0].is_object();
-}
-
 static bool starts_with_potential_bare_json_tool(const std::string & text,
                                                  const json & tools) {
-    if (!has_single_request_tool(tools)) return false;
+    if (!has_request_tools(tools)) return false;
     size_t first = text.find_first_not_of(" \t\n\r");
     return first != std::string::npos && text[first] == '{';
 }
@@ -62,7 +59,8 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
         {"cache_hit",             t.cache_hit},
         {"cached_prefix_tokens",  t.cached_prefix_tokens},
         {"prefilled_tokens",      t.prefilled_tokens},
-        {"effective_prompt_tokens", t.effective_prompt_tokens}
+        {"effective_prompt_tokens", t.effective_prompt_tokens},
+        {"agent_turn_cache_hit",  t.agent_turn_cache_hit}
     };
 }
 
@@ -239,7 +237,31 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     emit_token_count_++;
 
     // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
-    std::string piece = utf8_sanitize(raw_piece);
+    // First re-join any incomplete multi-byte tail held back from the previous
+    // piece, then hold back a new incomplete tail (if any) so codepoints split
+    // across tokens are emitted intact instead of as U+FFFD pairs.
+    std::string joined = utf8_tail_ + raw_piece;
+    utf8_tail_.clear();
+    {
+        size_t i = joined.size();
+        int cont = 0;
+        while (i > 0 && cont < 3 &&
+               (static_cast<unsigned char>(joined[i - 1]) & 0xC0) == 0x80) {
+            --i; ++cont;
+        }
+        if (i > 0) {
+            const unsigned char lead = static_cast<unsigned char>(joined[i - 1]);
+            int need = 0;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            if (need > 0 && joined.size() - (i - 1) < static_cast<size_t>(need)) {
+                utf8_tail_ = joined.substr(i - 1);
+                joined.resize(i - 1);
+            }
+        }
+    }
+    std::string piece = utf8_sanitize(joined);
     std::vector<std::string> out;
     accumulated_raw_ += piece;
     window_ += piece;
@@ -284,6 +306,25 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     // State machine loop — processes the window
     while (true) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
+            if (tool_from_reasoning_ && first_content_token_index_ < 0) {
+                const std::string full = tool_buffer_ + window_;
+                const size_t fc_close = full.find("</function_calls>");
+                if (fc_close != std::string::npos) {
+                    const size_t search_start = fc_close + std::strlen("</function_calls>");
+                    const size_t think_close = full.find(THINK_CLOSE, search_start);
+                    if (think_close != std::string::npos) {
+                        const size_t after_think = think_close + THINK_CLOSE_LEN;
+                        if (after_think < full.size() &&
+                            full.find_first_not_of(" \t\r\n", after_think) != std::string::npos) {
+                            // The current token already carries content after </think>
+                            first_content_token_index_ = emit_token_count_ - 1;
+                        } else {
+                            // First real content token starts on the next token
+                            first_content_token_index_ = emit_token_count_;
+                        }
+                    }
+                }
+            }
             tool_buffer_ += window_;
             window_.clear();
             break;
@@ -306,7 +347,11 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             }
 
             size_t idx = window_.find(THINK_CLOSE);
-            if (idx != std::string::npos) {
+            size_t tool_idx = std::string::npos;
+            bool tool_hit = has_request_tools(tools_) &&
+                            (tool_idx = window_.find(FUNCTION_CALLS_OPEN)) != std::string::npos;
+
+            if (idx != std::string::npos && (tool_idx == std::string::npos || idx < tool_idx)) {
                 std::string pre = window_.substr(0, idx);
                 if (!pre.empty()) {
                     reasoning_text_ += pre;
@@ -339,6 +384,39 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 }
                 window_ = window_.substr(idx + THINK_CLOSE_LEN);
                 mode_ = StreamMode::CONTENT;
+                continue;
+            }
+            if (tool_hit) {
+                std::string pre = window_.substr(0, tool_idx);
+                if (!pre.empty()) {
+                    reasoning_text_ += pre;
+                    switch (format_) {
+                    case ApiFormat::OPENAI_CHAT:
+                        out.push_back(format_openai_delta({{"reasoning_content", pre}}));
+                        break;
+                    case ApiFormat::ANTHROPIC: {
+                        if (active_kind_ != "thinking") {
+                            out.push_back(sse_event("content_block_stop",
+                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                            block_index_++;
+                            active_kind_ = "thinking";
+                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                            out.push_back(sse_event("content_block_start",
+                                json({{"type", "content_block_start"}, {"index", block_index_},
+                                      {"content_block", new_block}}).dump()));
+                        }
+                        out.push_back(sse_event("content_block_delta",
+                            json({{"type", "content_block_delta"}, {"index", block_index_},
+                                  {"delta", {{"type", "thinking_delta"}, {"thinking", pre}}}}).dump()));
+                        break;
+                    }
+                    default: break;
+                    }
+                }
+                tool_buffer_ = window_.substr(tool_idx);
+                tool_from_reasoning_ = true;
+                window_.clear();
+                mode_ = StreamMode::TOOL_BUFFER;
                 continue;
             }
             // No close tag yet — emit safe prefix if window is large enough
@@ -410,6 +488,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 // Tool-call syntax. Keep the full tag/function text buffered
                 // until finish so the parser can validate it.
                 tool_buffer_ = window_.substr(h.pos);
+                tool_from_reasoning_ = false;
                 window_.clear();
                 mode_ = StreamMode::TOOL_BUFFER;
             }
@@ -419,6 +498,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         if (accumulated_content_.find_first_not_of(" \t\n\r") == std::string::npos &&
             starts_with_potential_bare_json_tool(window_, tools_)) {
             tool_buffer_ = window_;
+            tool_from_reasoning_ = false;
             tool_buffer_fallback_to_content_ = true;
             window_.clear();
             mode_ = StreamMode::TOOL_BUFFER;
@@ -500,8 +580,18 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 // ─── emit_finish ────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
-                                                 const GenTimings * timings) {
+                                                 const GenTimings * timings,
+                                                 int generation_cap) {
     std::vector<std::string> out;
+
+    // A tail still pending at end-of-stream is a genuinely truncated
+    // codepoint; sanitize it into the window so nothing is silently lost.
+    if (!utf8_tail_.empty()) {
+        const std::string flushed = utf8_sanitize(utf8_tail_);
+        utf8_tail_.clear();
+        accumulated_raw_ += flushed;
+        window_ += flushed;
+    }
 
     // Flush remaining window
     if (mode_ == StreamMode::REASONING && !window_.empty()) {
@@ -576,8 +666,60 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
             // Emit any cleaned text from the tool buffer
             if (!parsed.cleaned_text.empty()) {
-                accumulated_content_ += parsed.cleaned_text;
-                emit_content_delta(out, parsed.cleaned_text);
+                size_t think_close = parsed.cleaned_text.find(THINK_CLOSE);
+                if (think_close != std::string::npos) {
+                    std::string reasoning = parsed.cleaned_text.substr(0, think_close);
+                    std::string content = parsed.cleaned_text.substr(think_close + THINK_CLOSE_LEN);
+                    if (first_content_token_index_ == -1) {
+                        first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
+                    }
+                    if (!reasoning.empty()) {
+                        reasoning_text_ += reasoning;
+                        if (format_ == ApiFormat::OPENAI_CHAT) {
+                            out.push_back(format_openai_delta({{"reasoning_content", reasoning}}));
+                        } else if (format_ == ApiFormat::ANTHROPIC) {
+                            if (active_kind_ != "thinking") {
+                                out.push_back(sse_event("content_block_stop",
+                                    json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                                block_index_++;
+                                active_kind_ = "thinking";
+                                json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                                out.push_back(sse_event("content_block_start",
+                                    json({{"type", "content_block_start"}, {"index", block_index_},
+                                          {"content_block", new_block}}).dump()));
+                            }
+                            out.push_back(sse_event("content_block_delta",
+                                json({{"type", "content_block_delta"}, {"index", block_index_},
+                                      {"delta", {{"type", "thinking_delta"}, {"thinking", reasoning}}}}).dump()));
+                        }
+                    }
+                    if (!content.empty()) {
+                        accumulated_content_ += content;
+                        emit_content_delta(out, content);
+                    }
+                } else if (tool_from_reasoning_) {
+                    reasoning_text_ += parsed.cleaned_text;
+                    if (format_ == ApiFormat::OPENAI_CHAT) {
+                        out.push_back(format_openai_delta({{"reasoning_content", parsed.cleaned_text}}));
+                    } else if (format_ == ApiFormat::ANTHROPIC) {
+                        if (active_kind_ != "thinking") {
+                            out.push_back(sse_event("content_block_stop",
+                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                            block_index_++;
+                            active_kind_ = "thinking";
+                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                            out.push_back(sse_event("content_block_start",
+                                json({{"type", "content_block_start"}, {"index", block_index_},
+                                      {"content_block", new_block}}).dump()));
+                        }
+                        out.push_back(sse_event("content_block_delta",
+                            json({{"type", "content_block_delta"}, {"index", block_index_},
+                                  {"delta", {{"type", "thinking_delta"}, {"thinking", parsed.cleaned_text}}}}).dump()));
+                    }
+                } else {
+                    accumulated_content_ += parsed.cleaned_text;
+                    emit_content_delta(out, parsed.cleaned_text);
+                }
             }
 
             fr = "tool_calls";
@@ -673,6 +815,11 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
     }
 
+    if (fr == "stop" && !stop_hit_ && generation_cap >= 0 && completion_tokens >= generation_cap) {
+        fr = "length";
+    }
+    finish_reason_ = fr;
+
     // Format-specific final events
     switch (format_) {
     case ApiFormat::OPENAI_CHAT: {
@@ -713,9 +860,10 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
         // stop_reason reflects the model's actual finish: "tool_use" when
         // any tool calls were emitted (downstream SDKs pivot on this to feed
-        // tool_result back), else "end_turn". Stop-sequence hits also report
-        // "end_turn" (Anthropic has no dedicated reason for that case).
-        const char * stop_reason = tool_calls_.empty() ? "end_turn" : "tool_use";
+        // tool_result back), else "end_turn" or "max_tokens".
+        const char * stop_reason = tool_calls_.empty()
+            ? (fr == "length" ? "max_tokens" : "end_turn")
+            : "tool_use";
         json anth_usage = {{"output_tokens", completion_tokens}};
         if (timings) {
             anth_usage["timings"] = build_timings_json(*timings, completion_tokens);
@@ -805,8 +953,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 }
 
 std::string SseEmitter::finish_reason() const {
-    if (!tool_calls_.empty()) return "tool_calls";
-    return "stop";
+    return finish_reason_;
 }
 
 }  // namespace dflash::common

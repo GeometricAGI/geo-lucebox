@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -22,6 +23,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "sampler.h"
+#include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
 
 namespace dflash::common {
@@ -243,6 +245,8 @@ struct GenerateResult {
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
+    // Backend-confirmed prompt tokens supplied by a restored KV snapshot.
+    int                        restored_prefix_tokens = 0;
     // True when the backend's Level 2 hook injected the </think> close
     // sequence during this generation (vs. the model self-closing). The
     // server uses this to attribute close_kind correctly: if the model
@@ -321,6 +325,19 @@ struct ModelBackend {
     virtual GenerateResult generate_impl(const GenerateRequest & req,
                                          const DaemonIO & io) = 0;
 
+    // ── Concurrent serving ───────────────────────────────────────────
+    // Backends that can hold several live sequences at once and execute a
+    // batched decode over paged KV expose them as decode slots through a
+    // SeqEngine (common/concurrency/seq_engine.h). Any additional
+    // per-sequence model state is an implementation detail of that engine.
+    // nullptr — the
+    // default — means this backend serves one request at a time and the
+    // server drives it through generate().
+    //
+    // The engine is owned by the backend; the returned pointer is borrowed
+    // and stays valid until shutdown().
+    virtual SeqEngine * seq_engine() { return nullptr; }
+
     // ── Snapshots ────────────────────────────────────────────────────
     // With right-sized CPU-resident snapshots, each slot costs only
     // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.
@@ -367,6 +384,8 @@ struct ModelBackend {
         retry.decode_s += first.decode_s;
         retry.accept_rate = first.accept_rate;
         retry.spec_decode_ran = first.spec_decode_ran || retry.spec_decode_ran;
+        retry.restored_prefix_tokens = (std::max)(
+            first.restored_prefix_tokens, retry.restored_prefix_tokens);
         retry.budget_forced_close =
             first.budget_forced_close || retry.budget_forced_close;
         retry.degenerate_decode_close =

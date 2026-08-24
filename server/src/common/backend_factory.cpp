@@ -273,6 +273,8 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
         cfg.paged_attention    = args.paged_attention;
+        cfg.max_concurrency    = args.max_concurrency;
+        cfg.kv_pool_tokens     = args.kv_pool_tokens;
         cfg.kq_stride_pad      = args.kq_stride_pad;
         cfg.draft_swa_window   = args.draft_swa_window;
         cfg.draft_ctx_max      = args.draft_ctx_max;
@@ -282,6 +284,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_budget      = args.ddtree_budget;
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
+        cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
         auto backend = std::make_unique<Qwen35Backend>(cfg);
@@ -308,6 +311,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_budget      = args.ddtree_budget;
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
+        cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
         auto backend = std::make_unique<Qwen35MoeBackend>(cfg);
@@ -447,6 +451,7 @@ std::unique_ptr<ModelBackend> create_backend(
             cfg.chunk      = args.chunk;
             cfg.expert_top_k = args.ds4_expert_top_k;
             cfg.fused_decode = args.ds4_fused_decode;
+            cfg.fused_verify_f16_kv = args.ds4_fused_verify_f16_kv;
             cfg.prefill_mode = args.ds4_prefill_mode;
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <limits>
+
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
@@ -25,6 +27,11 @@ struct BackendFeatureConfig {
     // time rather than through BackendArgs.
     bool routing_stats_requested = false;    // --freq / --collect-routing
     bool adaptive_experts_requested = false; // --adaptive-experts
+
+    // A fixed KVFlash pool requested through DFLASH_KVFLASH. "auto" is
+    // resolved later by the backend because only it has the VRAM budget needed
+    // to know whether a pool will actually be active.
+    bool kvflash_enabled = false;
 };
 
 // A superset of all per-architecture config fields. The factory reads only
@@ -54,20 +61,29 @@ struct BackendArgs {
     // deepseek4-specific decode options
     int             ds4_expert_top_k = 0;  // 0 = model default
     bool            ds4_fused_decode = false;
+    bool            ds4_fused_verify_f16_kv = false;
 
     // Attention and speculative-decode options. Individual backends consume
     // only the fields they support.
     int             fa_window        = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     bool            paged_attention  = false;  // 16-token paged K/V blocks for AR decode
+    // Concurrent decode slots (--max-concurrency). > 1 requires paged_attention;
+    // the backend serves that many sequences through the seq_* slot API.
+    int             max_concurrency  = 1;
+    // Total paged K/V pool in tokens shared by all slots (--kv-pool-tokens;
+    // block-rounded). 0 = derive capacity from available device memory.
+    long long       kv_pool_tokens   = 0;
     int             kq_stride_pad    = 32;
     int             draft_swa_window = 0;
     int             draft_ctx_max    = 4096;
     bool            fast_rollback    = true;
     bool            seq_verify       = false;
+    bool            specla_mode      = false;
     bool            ddtree_mode      = false;
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
+    float           ddtree_tau       = std::numeric_limits<float>::infinity();
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
 };
