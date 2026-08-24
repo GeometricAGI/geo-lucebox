@@ -2282,7 +2282,7 @@ int main(int argc, char ** argv) {
         return n_fail > 0 ? 1 : 0;
     }
 
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int q_len  = dw.block_size > 0 ? dw.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
     const int hidden = DFLASH27B_TARGET_HIDDEN;
     const int vocab  = DFLASH27B_TARGET_VOCAB;
     const int mask_tok = DFLASH27B_DRAFT_MASK_TOKEN_ID;
