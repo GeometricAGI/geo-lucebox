@@ -2,6 +2,7 @@
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
 #include "common/draft_block_size.h"
+#include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -361,11 +362,10 @@ bool Qwen35Backend::init() {
         apply_drafter_capture_layer_ids(dw_, w_);
 
         if (cfg_.draft_swa_window > 0) {
-            dw_.swa_window = cfg_.draft_swa_window;
-            for (int il = 0; il < dw_.n_layer - 1; il++)
-                dw_.layers[il].is_swa = true;
+            const DraftSwaOverrideResult swa =
+                apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                        dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
+                        swa.swa_layers, swa.total_layers, swa.effective_window);
         }
 
         // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
@@ -937,9 +937,10 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
             }
             if (cfg_.draft_swa_window > 0) {
-                dw_.swa_window = cfg_.draft_swa_window;
-                for (int il = 0; il < dw_.n_layer - 1; il++)
-                    dw_.layers[il].is_swa = true;
+                const DraftSwaOverrideResult swa =
+                    apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
+                std::printf("[unpark] draft SWA layers: %d/%d (window=%d)\n",
+                            swa.swa_layers, swa.total_layers, swa.effective_window);
             }
             // Re-apply the runtime block-size override: without this a
             // park/unpark cycle silently reverts to checkpoint metadata

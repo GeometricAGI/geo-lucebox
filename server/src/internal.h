@@ -338,7 +338,8 @@ struct DraftWeights {
     int head_dim  = DFLASH27B_TARGET_HEAD_DIM;         // 128
     int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
-    int swa_window = 0;  // sliding window size (0 = disabled)
+    int swa_window = 0;                 // sliding window size (0 = disabled)
+    bool swa_pattern_loaded = false;    // GGUF supplied sliding_window_pattern
     float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
 
     // YaRN rope scaling (populated by loader; 0 = disabled / plain RoPE).

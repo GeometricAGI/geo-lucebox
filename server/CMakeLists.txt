@@ -465,6 +465,7 @@ add_library(dflash_common STATIC
     src/common/pflash_drafter_ipc.cpp
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
+    src/common/draft_swa.cpp
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
     src/qwen35/concurrency/qwen35_slot_manager.cpp
@@ -1464,6 +1465,24 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_dflash2_selector_validation)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_swa.cpp")
+        # Pure host-side draft SWA metadata/override policy tests.
+        add_executable(test_draft_swa test/test_draft_swa.cpp)
+        target_include_directories(test_draft_swa PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_draft_swa PRIVATE dflash_common)
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip") AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_swa_multilane.cpp")
+        # Opt-in real-model proof for post-window lane masks and packed draft parity.
+        add_executable(test_draft_swa_multilane test/test_draft_swa_multilane.cpp)
+        target_include_directories(test_draft_swa_multilane PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_draft_swa_multilane PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_draft_swa_multilane)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
         # Pure-host tests for model-neutral token-budget/FIFO planning.
         add_executable(test_seq_batch_plan test/test_seq_batch_plan.cpp)
@@ -1803,6 +1822,7 @@ if(DFLASH27B_TESTS)
         test_model_smoke)
     set(_new_cppunit_test_targets
         test_platform_compat
+        test_draft_swa
         test_feature_gate
         test_qwen35_split_tree_guard
         test_recurrent_snapshot
