@@ -139,8 +139,11 @@ Each arm tuned independently on `--ddtree-budget`; HumanEval 10 prompts,
 | 32 | 73.38 (AL 5.99) | 73.41 (AL 5.99) | - |
 | 48 | 65.98 (AL 6.03) | - | 101.76 (AL 5.10) |
 
-**Best vs best: ours+GQH 101.82 tok/s at 13,440,110,432 B, versus #642+IQ4_XS
-96.79 tok/s at 15,567,824,480 B - +5.2% throughput for 13.7% fewer bytes.**
+**SUPERSEDED - see section 8.** This table tunes only the ddtree budget, which
+leaves both arms at the drafter's trained block width of 8. The real lever is
+the draft block size, and upstream gains far more from it than we do. Best vs
+best at the trained width was ours+GQH 101.82 vs #642+IQ4_XS 96.79 (+5.2%);
+once both arms may widen, that advantage disappears. Do not quote +5.2%.
 
 Two things this table is for.
 
@@ -175,3 +178,115 @@ from a separate run, so +5.2% is in family.
 Patch `test_dflash.cpp` in the upstream arm first (§5) or every run aborts.
 Same-arm floor measured over two full repeats: 0.2% or better (56.06/56.17 and
 101.78/101.77), so the 5.2% gap is well outside it.
+
+## 8. The real lever: draft block width (and where GQH stops)
+
+Section 7 tuned the ddtree budget and left both arms at the drafter's trained
+block width of 8. That is not the lever. Upstream's own post documents it:
+DFlash2 ships trained at 8 tokens per block but its acceptance extrapolates, and
+`--draft-block-size 16` takes their HumanEval decode from 133.9 to 208.1 tok/s.
+
+Measured here, server path, 10 HumanEval prompts, max_tokens 256, canonical
+drafter, decode-only from the engine's own `[spec-decode]` timer:
+
+| arm | block | decode tok/s | end-to-end | avg_commit |
+|---|---:|---:|---:|---:|
+| ours + IQ4_XS  |  8 | 126.88 | 108.08 |  7.57 |
+| ours + IQ4_XS  | 16 | 161.94 | 132.67 | 12.18 |
+| **ours + GQH** |  **8** | **154.35** | 88.93 |  7.22 |
+| ours + GQH     | 16 |  56.40 |  44.08 | 10.98 |
+| #642 + IQ4_XS  |  8 | 126.96 | 108.75 |  7.57 |
+| #642 + IQ4_XS  | 16 | 157.18 | 125.90 | 12.18 |
+
+**Honest standing: our best (GQH, block 8, 154.35) is 2-5% BEHIND #642's best
+(IQ4_XS, block 16, 157.18-162.82).** GQH wins per step at width 8 by 21.6%
+(154.35 vs 126.88) and loses overall because it cannot widen.
+
+Build flags are not the difference. Rebuilding with upstream's published flags
+(`-DGGML_HIP_MMQ_MFMA=ON -DGGML_HIP_NO_VMM=ON`, gfx1201 only,
+`CMAKE_HIP_COMPILER=$ROCM_PATH/lib/llvm/bin/clang++`) moved nothing:
+IQ4_XS block 16 161.94 -> 162.82, GQH block 8 154.35 -> 154.69, GQH block 16
+56.40 -> 56.59. All inside noise. Our IQ4_XS block-16 decode of 162.8 against
+their published 208.1 on the same file and drafter is therefore box or
+environment, not build configuration, and is unresolved. Note our prefill
+matches theirs closely (below), so the gap is decode-specific.
+
+### Why GQH cannot widen: the cliff is immediately after ncols 8
+
+The spec cap is `1 + n_nodes`, so a cap of 7 means the kernel runs at **ncols 8**.
+Sweeping GQH by width (`gqh_cap_spec_ddtree_budget`, `gqh_headers.cpp:65`, caps
+at `native_block - 1`, and `native_block` follows `--draft-block-size`):
+
+| block | cap | ncols | decode tok/s | avg_commit |
+|---:|---:|---:|---:|---:|
+|  8 |  7 |  **8** | **154.35** |  7.22 |
+|  9 |  8 |  9 |  69.03 |  8.16 |
+| 11 | 10 | 11 |  55.22 |  9.37 |
+| 13 | 12 | 13 |  63.37 | 10.32 |
+| 14 | 13 | 14 |  60.65 | 10.53 |
+| 16 | 15 | 16 |  56.40 | 10.98 |
+
+Acceptance rises exactly as it should (7.22 -> 10.98, tracking IQ4_XS's
+7.57 -> 12.18), so the drafter extrapolates on our artifact too. Throughput
+still falls 2.2x the moment you leave ncols 8.
+
+The cause is register pressure, already documented in `gqh.cu` around line 620:
+at ROWS==3 the measured VGPR grid reaches 99-100 VGPRs by ncols 7 and occupancy
+drops from 16 waves/SIMD to 12. `GQH_MULTICOL_SPEC_MAX` is 12, but 9..12 use
+**ROWS==1** exact-width to dodge that cliff, which discards the row reuse that
+makes ncols 8 fast; 13..16 fall to the generic instantiation. Hence cap 12
+(63.37) is no better than cap 15 (56.40). The obvious escape was tried and
+rejected on measurement: staging N=8 activations in 8 KB LDS got GQH3 under the
+VGPR cliff but ran 94-101 tok/s against register-xshared's 104 ("do not revive
+without a smaller tile").
+
+So widening GQH is not a config change and not a missing instantiation. It needs
+a wide-ncols path that keeps row reuse without spilling.
+
+## 9. Prefill: GQH has no MMQ path
+
+GQH registers only the ggml converter hooks (`dequantize_gqh3_to_fp16_cuda` ->
+`gqh_convert` -> `gqh3_decode_cuda`). There is **no MMQ kernel for the GQH types**
+- `mmq.cu`/`mmq.cuh` contain no GQH3/GQH4/GQH2_H at all. The matvec dispatch
+declines anything wider than `GQH_MAX_COLS` (16) with the comment "wider batches
+keep the dequant->GEMM path", so every prefill dequantises the weight tensors to
+fp16 and then runs a cuBLAS GEMM.
+
+Prefill throughput, same build, `--max-ctx 32768`, prefill from the server timer:
+
+| prompt tokens | IQ4_XS tok/s | GQH tok/s | ratio |
+|---:|---:|---:|---:|
+|    218 |  311.4 | 167.7 | 0.54 |
+|  1,018 | 1018.0 | 783.1 | 0.77 |
+|  4,018 | 1085.9 | 787.8 | 0.73 |
+| 12,018 |  946.3 | 719.6 | 0.76 |
+
+Two distinct costs, both from the missing MMQ path:
+
+* **A fixed per-prefill adder.** GQH prefill is *identical* at 218 and 1,018
+  tokens (1.3 s both), i.e. independent of prompt length - you are paying for the
+  weights, not the prompt. On the HumanEval prompts it shows as a steady 0.3 s
+  against IQ4_XS's 0.1 s across all ten requests. 13.44 GB of weights expand to
+  ~27 GB of fp16, ~40 GB of traffic, plus one kernel launch per tensor.
+* **~25% lower prefill throughput at length**, once that adder amortises.
+
+This is why GQH's end-to-end (88.93) sits so far under its decode (154.35), a
+0.58 ratio where IQ4_XS manages 0.81.
+
+For scale: our IQ4_XS prefill of 1018 tok/s at 1K tokens is in line with
+upstream's published 945 tok/s at 1.4K, so prefill is not where this box differs
+from theirs.
+
+### The two problems have one fix
+
+An MMQ path for the GQH types removes the dequant from prefill **and** gives
+ncols 13-16 a batched quantised kernel instead of the generic matvec that
+collapses decode. MMQ tiles read weights cooperatively through LDS, which is
+precisely the register-pressure escape the matvec comment could not find. That
+makes GQH MMQ the highest-value remaining work: it is the only route past
+#642's 157-163, and it fixes the prefill penalty on the way.
+
+Caveat on all end-to-end numbers here: everything ran `--prefix-cache-slots 0`
+to keep arms comparable. Workloads with shared prefixes amortise the fixed
+prefill cost, so the production penalty is smaller than these rows - but
+cold-prefill latency is real and it is what a first request feels.
