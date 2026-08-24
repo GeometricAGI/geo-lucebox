@@ -3620,8 +3620,12 @@ void HttpServer::remember_agent_turn(
         !emitter.tool_calls().empty() && !emitter.accumulated_raw().empty();
     if (!supported_format || !valid_tool_turn) return;
 
+    // ChatFormat is required by our signature (no default): upstream added this
+    // call site against its own 3-arg form, so the merge needs it threaded here
+    // exactly as the render path at the other call site does.
     std::vector<ChatMessage> messages =
-        normalize_chat_messages(req.messages, req.format, tool_memory_);
+        normalize_chat_messages(req.messages, req.format, tool_memory_,
+                                chat_format_);
     static constexpr const char * kSentinel =
         "__DFLASH_AGENT_TURN_CONTENT_7A21D9__";
     messages.push_back({"assistant", kSentinel});
