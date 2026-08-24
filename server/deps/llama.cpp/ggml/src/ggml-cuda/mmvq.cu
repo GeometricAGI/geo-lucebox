@@ -664,8 +664,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_NL:
-                case GGML_TYPE_IQ4_XS:
                     return 8;
+                case GGML_TYPE_IQ4_XS:
+                    // gfx1201 decode peaks at 6-7 waves; prefer the smaller
+                    // block after an end-to-end 4/5/6/7/8-wave sweep.
+                    return 6;
                 default:
                     return 1;
             }
@@ -2711,9 +2714,13 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    // On by default: memoising the q8_1-quantized activations across the
+    // matmuls of one token is a straight win on every backend measured, and
+    // requiring an env var to get the tuned path invites running the slow one
+    // by accident. LUCE_Q8_MEMO=0 opts out.
     static const bool luce_q8_memo_on = []() {
         const char * e = getenv("LUCE_Q8_MEMO");
-        return e && e[0] == '1' && e[1] == '\0';
+        return !(e && e[0] == '0' && e[1] == '\0');
     }();
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());

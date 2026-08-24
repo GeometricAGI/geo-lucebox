@@ -479,7 +479,62 @@ static void ssm_conv_specla_hld_cuda(ggml_backend_cuda_context & ctx,
     }
 }
 
+// dflash2 grouped dynamic block conv (op_params[0] == 3): one node replacing
+// the ~19-op per-site ggml expansion in the draft graph. rn intrinsics keep
+// the result bit-identical to the unfused mul/add node chain (mirrors the
+// zero-padded shift including signed-zero terms; no FMA contraction).
+static __global__ void dflash_dyn_conv_f32(
+        const float * __restrict__ x, const float * __restrict__ base,
+        const float * __restrict__ dyn, float * __restrict__ out,
+        const int C, const int T, const int G, const int gs,
+        const int site, const int K,
+        const int64_t base_ld, const int64_t dyn_ld) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int l = blockIdx.y;
+    if (c >= C || l >= T) return;
+    const int g = c / gs;
+    float acc;
+    {
+        const float cf = __fadd_rn(dyn[(int64_t)l * dyn_ld + (int64_t)(site * K) * G + g],
+                                   base[(int64_t)(site * K) * base_ld + c]);
+        acc = __fmul_rn(x[(int64_t)l * C + c], cf);
+    }
+    for (int k = 1; k < K; ++k) {
+        if (T <= k) break;   // matches the unfused builder-level break
+        const int   row = site * K + k;
+        const float xv  = (l >= k) ? x[(int64_t)(l - k) * C + c] : 0.0f;
+        const float cf  = __fadd_rn(dyn[(int64_t)l * dyn_ld + (int64_t)row * G + g],
+                                    base[(int64_t)row * base_ld + c]);
+        acc = __fadd_rn(acc, __fmul_rn(xv, cf));
+    }
+    out[(int64_t)l * C + c] = acc;
+}
+
+static void ggml_cuda_op_dflash_dyn_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * base = dst->src[1];
+    const ggml_tensor * dyn  = dst->src[2];
+    const int C    = (int)x->ne[0];
+    const int T    = (int)x->ne[1];
+    const int site = ggml_get_op_params_i32(dst, 1);
+    const int K    = ggml_get_op_params_i32(dst, 2);
+    const int gs   = ggml_get_op_params_i32(dst, 3);
+    GGML_ASSERT(gs > 0 && C % gs == 0);
+    const dim3 block(256);
+    const dim3 grid((unsigned)((C + 255) / 256), (unsigned)T, 1);
+    dflash_dyn_conv_f32<<<grid, block, 0, ctx.stream()>>>(
+        (const float *)x->data, (const float *)base->data, (const float *)dyn->data,
+        (float *)dst->data, C, T, C / gs, gs, site, K,
+        (int64_t)(base->nb[1] / sizeof(float)), (int64_t)(dyn->nb[1] / sizeof(float)));
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst) {
+    // dflash2 grouped dynamic block conv; op_params[0] == 3
+    if (ggml_get_op_params_i32(dst, 0) == 3) {
+        GGML_ASSERT(silu_dst == nullptr);
+        ggml_cuda_op_dflash_dyn_conv(ctx, dst);
+        return;
+    }
     // dflash: fused step mode (silu already applied by the kernel); op_params[0] == 2
     if (ggml_get_op_params_i32(dst, 0) == 2) {
         GGML_ASSERT(silu_dst == nullptr);

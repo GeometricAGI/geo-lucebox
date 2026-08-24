@@ -6392,7 +6392,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // op_params[0]: 1 = SpecLA heavy-light conv (x is [d_inner, n_tokens],
             // kernel guards the final partial 128-channel block), 2 = dflash fused
             // step mode (any channel count).
-            if (ggml_get_op_params_i32(op, 0) == 1 || ggml_get_op_params_i32(op, 0) == 2) {
+            if (ggml_get_op_params_i32(op, 0) == 1 || ggml_get_op_params_i32(op, 0) == 2 ||
+                ggml_get_op_params_i32(op, 0) == 3) {
                 return true;
             }
             // assumes d_inner % threads == 0

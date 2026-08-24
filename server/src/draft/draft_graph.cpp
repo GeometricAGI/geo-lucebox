@@ -126,6 +126,18 @@ static ggml_tensor * draft_dyn_conv_apply(ggml_context *           ctx,
     const int64_t groups = hidden / gs;
     const size_t  e      = ggml_element_size(dc.dyn);
 
+    // Fused single-node path (bit-identical to the expansion below);
+    // DFLASH_DYN_CONV_FUSED=0 restores the unfused graph.
+    static const bool dyn_conv_fused = []() {
+        const char * env = std::getenv("DFLASH_DYN_CONV_FUSED");
+        return !(env && env[0] == '0' && env[1] == '\0');
+    }();
+    if (dyn_conv_fused && x->ne[2] <= 1 && x->ne[3] <= 1 &&
+        ggml_is_contiguous(dc.dyn) && ggml_is_contiguous(cw.base)) {
+        ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+        return ggml_dflash_dyn_conv(ctx, xc, cw.base, dc.dyn, s, K, (int)gs);
+    }
+
     ggml_tensor * out = nullptr;
     for (int k = 0; k < K; ++k) {
         // shift_k(x): column l takes x[:, l-k], zero for l < k

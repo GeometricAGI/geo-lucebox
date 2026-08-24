@@ -8,6 +8,13 @@
 
 namespace dflash::common {
 
+// Invalidate the cached selector projection graph. MUST be called whenever
+// draft weights are freed (park); the cache is keyed on the DraftWeights
+// address, which is stable across a park/unpark reload of the same backend
+// member, so without this the cached graph would keep pointers to freed
+// selector weight tensors.
+void dflash2_selector_graph_invalidate();
+
 // DFlash 2 candidate selector for greedy chain drafting.
 //
 // For every drafted block position the target lm_head logits are reduced to

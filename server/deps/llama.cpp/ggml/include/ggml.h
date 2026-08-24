@@ -2763,6 +2763,19 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * conv_state,
             struct ggml_tensor  * conv_input_out);
+
+    // dflash2 grouped dynamic block conv (draft graph), one fused node for
+    //   out[c,l] = sum_k (dyn[(site*K+k)*G + c/gs, l] + base[c, site*K+k]) * x[c, l-k]
+    // x [C, T] f32 contiguous, base [C, >= (site+1)*K] f32, dyn [>= 2K*G, T]
+    // f32 contiguous; x is zero-padded below l < k. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_dflash_dyn_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * dyn,
+            int                   site,
+            int                   kernel,
+            int                   group_size);
     // SpecLA heavy-light convolution. Applies compact accepted inputs to the
     // durable conv state, then verifies the current tree without committing
     // speculative inputs. Current input factors are written directly to the

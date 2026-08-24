@@ -117,9 +117,11 @@ def load_arch(safetensors: Path, header: dict) -> dict:
         if isinstance(rp, dict):
             if rp.get("rope_theta") is not None:
                 a["rope_theta"] = float(rp["rope_theta"])
-            if str(rp.get("rope_type", "")).lower() == "yarn":
+            if str(rp.get("rope_type") or rp.get("type") or "").lower() == "yarn":
                 a["yarn_factor"]    = float(rp.get("factor", 0.0))
-                a["yarn_orig_ctx"]  = int(rp.get("original_max_position_embeddings", 0))
+                a["yarn_orig_ctx"]  = int(rp.get("original_max_position_embeddings")
+                                          or c.get("original_max_position_embeddings")
+                                          or 0)
                 a["yarn_beta_fast"] = float(rp.get("beta_fast", 32.0))
                 a["yarn_beta_slow"] = float(rp.get("beta_slow", 1.0))
         if dfc.get("mask_token_id") is not None:

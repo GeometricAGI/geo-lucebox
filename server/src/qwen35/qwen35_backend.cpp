@@ -1,6 +1,7 @@
 #include "qwen35_backend.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
+#include "common/draft_block_size.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -364,19 +365,39 @@ bool Qwen35Backend::init() {
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
         }
 
-        // DFlash weights are sequence-length agnostic; the GGUF block size is
-        // the training/default verify width, not a tensor dimension. A wider
-        // runtime block can trade a larger target batch for fewer verification
-        // steps without rewriting the model file.
+        // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
+        // unpark() so the rotary encoding cannot flip mid-process (it used
+        // to switch from plain RoPE to YaRN on the first park/unpark).
+        if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
+            float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
+            dw_.rope_freq_scale = 1.0f / yf;
+            dw_.rope_ext_factor = 1.0f; dw_.rope_attn_factor = 1.0f;
+            dw_.rope_beta_fast = cfg_.draft_yarn_beta_fast;
+            dw_.rope_beta_slow = cfg_.draft_yarn_beta_slow;
+            dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
+        }
+
+        // The checkpoint metadata is the drafter's published proposal
+        // horizon. Greedy chain verification keeps output byte-identical to
+        // plain decode at any width, so widening only risks acceptance
+        // depth; it is allowed up to 2x the horizon (measured on Qwen3.8
+        // DFlash2: byte-identical completions across widths 8-24, commits
+        // grow through 16, step time cliffs past 16 with no commit gain).
         if (cfg_.draft_block_size != 0) {
-            if (cfg_.draft_block_size < 2 || cfg_.draft_block_size > 32) {
+            const int checkpoint_block_size = dw_.block_size;
+            if (!draft_block_size_override_supported(
+                    cfg_.draft_block_size, checkpoint_block_size)) {
                 std::fprintf(stderr,
-                    "[draft] --draft-block-size must be in [2, 32], got %d\n",
-                    cfg_.draft_block_size);
+                    "[draft] --draft-block-size must be in [2, %d] for this "
+                    "drafter (up to 2x the checkpoint horizon); got %d\n",
+                    2 * checkpoint_block_size, cfg_.draft_block_size);
                 return false;
             }
-            std::printf("[draft]  block size override: %d -> %d\n",
-                        dw_.block_size, cfg_.draft_block_size);
+            std::printf("[draft]  block size override: %d -> %d%s\n",
+                        checkpoint_block_size, cfg_.draft_block_size,
+                        cfg_.draft_block_size > checkpoint_block_size
+                            ? " (beyond the published horizon; exact greedy verify)"
+                            : "");
             dw_.block_size = cfg_.draft_block_size;
         }
     }
@@ -886,6 +907,15 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.swa_window = cfg_.draft_swa_window;
                 for (int il = 0; il < dw_.n_layer - 1; il++)
                     dw_.layers[il].is_swa = true;
+            }
+            // Re-apply the runtime block-size override: without this a
+            // park/unpark cycle silently reverts to checkpoint metadata
+            // (out-of-bounds rollback windows when narrowing, a silent
+            // no-op when widening).
+            if (cfg_.draft_block_size != 0 &&
+                draft_block_size_override_supported(cfg_.draft_block_size,
+                                                    dw_.block_size)) {
+                dw_.block_size = cfg_.draft_block_size;
             }
         }
         draft_parked_ = false;
@@ -1604,6 +1634,24 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset) {
+    // A finite --fa-window caps the full-attention layers to a sliding
+    // window, so anything earlier than the window is invisible to them. That
+    // is silent: the model still answers, it just cannot see the head of a
+    // long prompt, which reads as a model quality problem rather than a
+    // configuration one. Say so once, the first time a prompt actually
+    // outgrows the window.
+    if (cfg_.fa_window > 0 &&
+        (int)tokens.size() + kv_offset > cfg_.fa_window) {
+        static std::atomic<bool> s_fa_window_warned{false};
+        if (!s_fa_window_warned.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35] WARNING: prompt is %d tokens but --fa-window is %d: "
+                "full-attention layers see only the last %d tokens, so content "
+                "before that cannot be retrieved. Drop --fa-window for "
+                "long-context work.\n",
+                (int)tokens.size() + kv_offset, cfg_.fa_window, cfg_.fa_window);
+        }
+    }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = qwen35_prefill_ubatch(512);
@@ -2566,7 +2614,53 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         return false;
     };
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
+    // Long-context draft width. Verify attention runs through ggml's tile
+    // kernel (the vector kernel only covers a single query row), and that
+    // kernel's cost scales with the number of query rows AND with KV length.
+    // So a wide draft block, which is a clear win on short prompts, turns
+    // into a liability once the KV is large: the extra rows multiply a term
+    // that is itself growing.
+    //
+    // Measured on one R9700 with Qwen3.8-27B IQ4_XS + DFlash2 (decode tok/s):
+    //     prompt   verify 16   verify 8
+    //      6,208         63.2           71.1
+    //     13,148         51.9           54.9
+    //     26,728         43.4           46.9
+    //     39,861         32.7           45.5
+    // Narrowing inside a block-16 drafter also holds acceptance better than
+    // configuring the drafter at block 8 outright (0.414 vs 0.375 at 27K).
+    // Below the crossover the wide block still wins by a lot (HumanEval-10
+    // 204 vs 143.6 decode), so narrow only past it. Halving also raises
+    // commit depth there (0.462*8+1 = 4.70 vs 0.200*16+1 = 4.20): fewer rows
+    // and deeper commits at the same time.
+    //
+    // The rule is a function of context length only. It deliberately does not
+    // look at the observed acceptance rate, so the width for a given prompt
+    // is reproducible and does not chase a moving target.
+    // 8192 is deliberately above every prompt in the short-context benchmarks
+    // this engine is tuned for, so high-acceptance completion workloads, where
+    // the wide block earns its keep, are untouched.
+    constexpr int kLongCtxNarrowTokens = 8192;
+    // Floor at the DFlash2 checkpoint's own published block size.
+    constexpr int kLongCtxMinVerify = 8;
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    // This caps the VERIFY batch only; the drafter still proposes a full q_len
+    // block. Narrowing the draft instead would leave the tail rows of the
+    // drafter's non-causal block unwritten while its mask still makes them
+    // visible to the rows we keep, and would break the fixed block_size
+    // contract the IPC drafter validates against.
+    const int verify_cap = committed >= kLongCtxNarrowTokens
+                               ? std::max(kLongCtxMinVerify, q_len / 2)
+                               : q_len;
+    if (verify_cap != q_len) {
+        static std::atomic<bool> s_narrowed_logged{false};
+        if (!s_narrowed_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35-spec] context %d >= %d: capping verify width %d -> %d "
+                "(wide blocks lose to verify-attention cost at long context)\n",
+                committed, kLongCtxNarrowTokens, q_len, verify_cap);
+        }
+    }
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
@@ -2657,6 +2751,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     float accepted_ema = 2.0f * adaptive.accept_threshold();
     int   ar_burst_left = 0;
     int   n_ar_burst_steps = 0;
+    int   n_spec_steps = 0;      // steps that actually proposed q_len drafts
     bool  probe_step = false;   // first spec step after a burst
     // Live step-time EMAs (seconds) for the break-even ratio; 0 = not yet measured.
     double t_spec_step_ema = 0.0;
@@ -2671,7 +2766,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // Plain-decode step inside the spec loop: no drafter forward, verify
         // the seed token only. Features are still captured, so the drafter
         // resumes cleanly on the next probe step.
-        const bool ar_step = adaptive.enabled() && ar_burst_left > 0;
+        bool ar_step = adaptive.enabled() && ar_burst_left > 0;
+        // Pending tool-call hints verify at near-100% acceptance; a plain
+        // decode burst would ignore them for up to `burst` tokens, so end
+        // the burst as soon as hints are available.
+        if (ar_step && hint_tokens && n_generated < (int)hint_tokens->size()) {
+            ar_burst_left = 0;
+            ar_step = false;
+        }
         if (ar_step) {
             ar_burst_left--;
             n_ar_burst_steps++;
@@ -2708,9 +2810,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return ok;
         }
 
-        // 1. Build noise input for draft
+        // 1. Build noise input for draft. The drafter GGUF's own MASK id
+        // wins over the target-side default (the loader resolved the
+        // precedence into dw_); remote drafters keep the target default
+        // because dw_ is not populated for them.
+        const int32_t noise_mask_id =
+            (!use_remote_draft && dw_.mask_token_id >= 0)
+                ? dw_.mask_token_id : target->mask_token_id();
         noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = target->mask_token_id();
+        for (int i = 1; i < q_len; i++) noise_ids[i] = noise_mask_id;
         if (!target->embed_tokens(noise_ids.data(), q_len, noise_embed.data())) {
             std::fprintf(stderr, "spec-decode: noise embed failed (last_tok=%d mask=%d q_len=%d)\n",
                          last_tok, target->mask_token_id(), q_len);
@@ -3005,7 +3113,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         for (int i = 1; i < q_len; ++i) {
                             noise_ids[(size_t)i] = i <= (int)prefix.size()
                                 ? prefix[(size_t)i - 1]
-                                : target->mask_token_id();
+                                : noise_mask_id;
                         }
                         if (!target->embed_tokens(noise_ids.data(), q_len,
                                                   noise_embed.data())) {
@@ -3392,6 +3500,16 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             continue;
         }
 
+        // 3a-ter. Long-context verify cap. Drafting is done; trim the block
+        // we actually check. Hint injection below fills draft_tok[1..v_len-1],
+        // so it sees the capped width and stays consistent.
+        if (!ar_step && v_len > verify_cap) {
+            v_len = verify_cap;
+            if ((int)draft_tok.size() > verify_cap) {
+                draft_tok.resize((size_t)verify_cap);
+            }
+        }
+
         // 3b. Tool call hint injection: override draft tokens with pre-known
         // structural tokens for near-100% acceptance.
         int hint_fill = 0;
@@ -3423,7 +3541,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
                                    /*capture_ssm_intermediates=*/true)) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
-            target->restore_kv();
+            // Plain-decode steps skipped the snapshot; restoring would copy
+            // back state up to a whole burst stale.
+            if (!ar_step) target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -3440,7 +3560,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (sampled_verify) {
             if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
-                target->restore_kv();
+                if (!ar_step) target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }
@@ -3747,7 +3867,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         cache_.cur_pos = committed;
         n_generated += emitted + injected;
-        n_accept_sum += std::min(accept_n, emitted);
+        // Only steps that proposed a full draft block enter the accept-rate
+        // accounting; 1-token burst steps would otherwise dilute the rate
+        // that steers the PFlash residency bandit.
+        if (!ar_step) {
+            n_accept_sum += std::min(accept_n, emitted);
+            n_spec_steps++;
+        }
         n_draft_steps++;
 
         // Adaptive policy update on real spec steps: EMA of accepted draft
@@ -3766,7 +3892,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const float alpha = probe_step ? 0.5f : adaptive.ema_alpha;
             accepted_ema = (1.0f - alpha) * accepted_ema + alpha * accepted_drafts;
             probe_step = false;
-            if (accepted_ema < adaptive.accept_threshold(live_step_ratio())) {
+            // A plain-decode burst commits greedy argmax tokens without
+            // passing through the sampler chain, so bursts stay off under
+            // sampled-verify to keep its output-distribution guarantee.
+            if (!sampled_verify &&
+                accepted_ema < adaptive.accept_threshold(live_step_ratio())) {
                 ar_burst_left = adaptive.burst;
             }
         }
@@ -3780,7 +3910,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+            const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -3825,7 +3955,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+            const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -3856,7 +3986,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "

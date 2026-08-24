@@ -330,13 +330,21 @@ bool load_draft_gguf(const std::string & path,
     // RoPE at inference silently degrades acceptance.
     {
         const float yarn_factor = read_f32("rope.scaling.factor", 0.0f);
-        if (yarn_factor > 1.0f) {
+        const int   yarn_orig   = (int)read_u32("rope.scaling.original_context_length", 0);
+        if (yarn_factor > 1.0f && yarn_orig <= 0) {
+            // ggml_rope_yarn_corr_dims takes log(n_ctx_orig): 0 would
+            // collapse the correction dims while the mscale still applies.
+            fprintf(stderr,
+                "[draft-gguf] WARNING: YaRN factor %.1f without "
+                "original_context_length; ignoring YaRN (plain RoPE)\n",
+                yarn_factor);
+        } else if (yarn_factor > 1.0f) {
             out.rope_freq_scale  = 1.0f / yarn_factor;
             out.rope_ext_factor  = 1.0f;
             out.rope_attn_factor = read_f32("rope.scaling.attn_factor", 1.0f);
             out.rope_beta_fast   = read_f32("rope.scaling.beta_fast", 32.0f);
             out.rope_beta_slow   = read_f32("rope.scaling.beta_slow", 1.0f);
-            out.rope_n_ctx_orig  = (int)read_u32("rope.scaling.original_context_length", 0);
+            out.rope_n_ctx_orig  = yarn_orig;
             fprintf(stderr,
                 "[draft-gguf] YaRN rope: factor=%.1f orig_ctx=%d beta=%.1f/%.1f\n",
                 yarn_factor, out.rope_n_ctx_orig,

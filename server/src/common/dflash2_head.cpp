@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -12,12 +13,16 @@ namespace dflash::common {
 
 namespace {
 
-// Selector projection graph, built once per (drafter, backend, n_cand, K).
+std::atomic<uint64_t> s_selector_generation{1};
+
+// Selector projection graph, built once per (drafter, backend, n_cand, K,
+// weight-load generation).
 struct SelectorGraph {
     const DraftWeights * dw = nullptr;
     ggml_backend_t backend = nullptr;
     int n_cand = 0;
     int K = 0;
+    uint64_t gen = 0;
     std::vector<uint8_t> arena;
     ggml_context *  ctx = nullptr;
     ggml_cgraph *   gf = nullptr;
@@ -28,6 +33,15 @@ struct SelectorGraph {
     ggml_tensor * hproj = nullptr;
     ggml_tensor * succ = nullptr;
     ggml_tensor * pred = nullptr;
+
+    // The graph is thread_local, so a worker thread that drafts and then
+    // exits must return its ggml context and the gallocr's device buffer.
+    // Without this each thread that ever drafted leaks one GPU allocation for
+    // the lifetime of the process.
+    ~SelectorGraph() {
+        if (galloc) { ggml_gallocr_free(galloc); galloc = nullptr; }
+        if (ctx)    { ggml_free(ctx); ctx = nullptr; }
+    }
 };
 
 SelectorGraph & selector_graph() {
@@ -45,6 +59,10 @@ void selector_graph_free(SelectorGraph & g) {
 }
 
 }  // namespace
+
+void dflash2_selector_graph_invalidate() {
+    s_selector_generation.fetch_add(1, std::memory_order_relaxed);
+}
 
 bool dflash2_score_candidates(const DraftWeights & dw,
                               ggml_backend_t backend,
@@ -77,7 +95,9 @@ bool dflash2_score_candidates(const DraftWeights & dw,
     //    every candidate. Built once per (n_cand, K) and reused across steps.
     const int n_rows_pred = 1 + n_cand * K;
     SelectorGraph & g = selector_graph();
-    if (!g.ctx || g.dw != &dw || g.backend != backend || g.n_cand != n_cand || g.K != K) {
+    const uint64_t cur_gen = s_selector_generation.load(std::memory_order_relaxed);
+    if (!g.ctx || g.dw != &dw || g.backend != backend || g.n_cand != n_cand ||
+        g.K != K || g.gen != cur_gen) {
         selector_graph_free(g);
         const size_t arena_size = ggml_tensor_overhead() * 32 + ggml_graph_overhead() + 4096;
         g.arena.assign(arena_size, 0);
@@ -109,7 +129,7 @@ bool dflash2_score_candidates(const DraftWeights & dw,
             selector_graph_free(g);
             return false;
         }
-        g.dw = &dw; g.backend = backend; g.n_cand = n_cand; g.K = K;
+        g.dw = &dw; g.backend = backend; g.n_cand = n_cand; g.K = K; g.gen = cur_gen;
     }
 
     std::vector<int32_t> pred_ids((size_t)n_rows_pred);
