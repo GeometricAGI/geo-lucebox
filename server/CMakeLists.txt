@@ -1196,6 +1196,19 @@ if(DFLASH27B_TESTS)
             add_test(NAME test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                      COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                              "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8)
+            # WIDE verify widths. nvec=8 above covers the exact-width arm only,
+            # which leaves the ncols 9..16 paths -- ROWS==1 exact-width for 9..12
+            # and the generic instantiation for 13..16 -- with NO correctness
+            # coverage. Those are exactly the paths a wide-verify optimisation
+            # touches, so a gate that stops at 8 is blind to the code being
+            # changed. 13 is the first generic width, 16 is GQH_MAX_COLS.
+            foreach(GQH_NVEC 13 16)
+                add_test(NAME test-gqh-backend-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" ${GQH_NVEC})
+                set_tests_properties(test-gqh-backend-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
+            endforeach()
             # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
             set_tests_properties(test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                 PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
