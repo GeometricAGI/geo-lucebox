@@ -1,0 +1,46 @@
+{
+  "named_gqh_only": ["HumanEval/8", "HumanEval/12", "HumanEval/20", "HumanEval/22", "HumanEval/83", "HumanEval/163"],
+  "headline": "5/6 named GQH-only HE+ fails were eval packaging, not wrong code. Same 3.93 generations: 149 -> 154 HE+. IQ4 stays 152. One real 3.93-only miss remains: HumanEval/163.",
+  "published_n1": {"gqh393_think": 149, "iq4_think": 152, "gqh445_think": 149},
+  "after_import_header": {"gqh393": 153, "iq4": 152, "gqh445": 150},
+  "after_import_header_and_last_def_fence": {"gqh393": 154, "iq4": 152},
+  "items": {
+    "HumanEval/8": {
+      "kind": "harness",
+      "detail": "Correct sum/product. GQH omitted `from typing import List, Tuple`. Evalplus exec NameError (empty fail_tests). IQ4 and 4.45 GQH copied the imports."
+    },
+    "HumanEval/12": {
+      "kind": "harness",
+      "detail": "Correct max(..., key=len). Missing Optional/List import."
+    },
+    "HumanEval/20": {
+      "kind": "harness",
+      "detail": "Correct sorted adjacent-min. Missing List/Tuple import. 4.45 GQH had the same miss, so 20 was in both GQH bands until the header merge (4.45 149 -> 150)."
+    },
+    "HumanEval/22": {
+      "kind": "harness",
+      "detail": "Correct isinstance int-not-bool filter. Missing List/Any import."
+    },
+    "HumanEval/83": {
+      "kind": "harness",
+      "detail": "Model wrote the right function as the LAST fenced block (`return 18 * 10 ** (n-2)`). Extractor took the FIRST fence, a unicode formula sketch. Last-def-fence recovers it; 4.45 already emitted a def first."
+    },
+    "HumanEval/163": {
+      "kind": "model",
+      "detail": "Understood 'even digits' as 0,2,4,6,8 but implemented `for num in range(low, high+1)` which times out on plus input [987654321, 123456789]. Canonical/IQ4/4.45 iterate digits `range(0, 10)`. Only remaining 3.93-only HE+ miss after packaging."
+    }
+  },
+  "remaining_plus_fails_gqh393_repackaged": [
+    "HumanEval/10", "HumanEval/32", "HumanEval/39", "HumanEval/91", "HumanEval/97",
+    "HumanEval/132", "HumanEval/141", "HumanEval/145", "HumanEval/154", "HumanEval/163"
+  ],
+  "remaining_plus_fails_iq4": [
+    "HumanEval/10", "HumanEval/32", "HumanEval/39", "HumanEval/55", "HumanEval/91", "HumanEval/97",
+    "HumanEval/132", "HumanEval/134", "HumanEval/141", "HumanEval/145", "HumanEval/151", "HumanEval/154"
+  ],
+  "overlap_after_repackage": {
+    "shared": ["HumanEval/10", "HumanEval/32", "HumanEval/39", "HumanEval/91", "HumanEval/97", "HumanEval/132", "HumanEval/141", "HumanEval/145", "HumanEval/154"],
+    "gqh_only": ["HumanEval/163"],
+    "iq4_only": ["HumanEval/55", "HumanEval/134", "HumanEval/151"]
+  }
+}

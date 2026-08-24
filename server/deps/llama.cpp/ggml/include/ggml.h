@@ -438,7 +438,11 @@ extern "C" {
         GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3 (P4); codebook in GGUF KV
         GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2 (gate/up); codebook in sidecar
         GGML_TYPE_Q2_0_ROCMFP2      = 107,
-        GGML_TYPE_COUNT   = 108,
+        GGML_TYPE_GQH3    = 108, // GQH 3.28125 bpw; 256-weight superblock, 105 B; 5 B per-tensor header in GGUF KV
+        GGML_TYPE_GQH2_H  = 109, // GQH 2.28125 bpw; 256-weight superblock,  73 B; 5 B per-tensor header in GGUF KV
+        GGML_TYPE_GQH2_C  = 110, // GQH 2.0625  bpw; 256-weight superblock,  66 B; no header (fp16 d in-block)
+        GGML_TYPE_GQH4    = 111, // GQH 4.28125 bpw; 256-weight superblock, 137 B; 5 B per-tensor header in GGUF KV
+        GGML_TYPE_COUNT   = 112,
     };
 
     // precision
@@ -2741,6 +2745,24 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent_ids);
 
+    // dflash extension: fused causal-conv step for recurrent decode/verify.
+    // Replaces transpose + concat(state, x) + ssm_conv + silu + state
+    // write-back with one kernel.
+    //   x:              [C, T, S] f32, rows contiguous (token stride may be
+    //                   larger than C, e.g. a row-slice of a stacked GEMV)
+    //   c:              [K, C]    f32 depthwise conv weights
+    //   conv_state:     [K-1, C, S] f32 history; READ, then OVERWRITTEN in
+    //                   place with the last K-1 conv inputs
+    //   conv_input_out: optional [>= K-1+T, C, S] f32; receives the full
+    //                   conv window (history rows then x rows) per channel,
+    //                   for speculative-decode rollback. May be a view.
+    // Returns silu(conv(x)) as [C, T, S]. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * conv_input_out);
     // SpecLA heavy-light convolution. Applies compact accepted inputs to the
     // durable conv state, then verifies the current tree without committing
     // speculative inputs. Current input factors are written directly to the
@@ -2906,6 +2928,18 @@ extern "C" {
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
+
+    // dflash extension: let the kernel derive the gates from the raw
+    // projections instead of graph-side sigmoid/softplus ops:
+    //   beta_val = sigmoid(beta_raw)
+    //   g_val    = exp(softplus(alpha_raw + dt_bias[h]) * A[h])
+    // `g` then carries alpha_raw and `beta` carries beta_raw (both [1,H,T,S]);
+    // gate_ba is a contiguous f32 [2*H] tensor holding [dt_bias | A]
+    // (src[9], op_params[10] = 1). Only for the non-tree, non-KDA,
+    // non-SpecLA CUDA/HIP path.
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor * tensor,
+            struct ggml_tensor * gate_ba);
 
     // dflash extension: tree-mode gated delta net for DDTree-style
     // speculative decoding verify. `parent_ids` is an int32 tensor of shape
@@ -3216,6 +3250,13 @@ extern "C" {
         ggml_to_float_t          to_float;
         ggml_from_float_t        from_float_ref;
     };
+
+    // GQH (108/109) per-tensor header: float32 tensor_scale + uint8 grid code. A
+    // fixed-size ggml block cannot hold the 5-byte prefix the wire puts in front of
+    // the superblock stream, so the loader reads it from GGUF KV and attaches it to
+    // the tensor's data pointer here. Decoding an unregistered GQH tensor aborts.
+    GGML_API void ggml_gqh_register(const void * base, size_t nbytes, float tensor_scale, int grid_code);
+    GGML_API void ggml_gqh_unregister(const void * base);
 
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);
 

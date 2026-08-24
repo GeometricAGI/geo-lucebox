@@ -46,6 +46,7 @@
 #include "internal.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_inspect.h"
+#include "common/gqh_headers.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
@@ -174,6 +175,14 @@ static bool should_load_target_tensor(const char * name,
         return true;
     }
     return false;
+}
+
+// GQH headers (scale + grid) are per-tensor in GGUF KV. A stacked alias is one
+// ggml tensor spanning two payloads, so the fused matvec would decode the second
+// weight with the first tensor's header. q8_0 / K-quant pairs are safe to stack.
+static bool is_gqh_weight_type(ggml_type t) {
+    return t == GGML_TYPE_GQH3 || t == GGML_TYPE_GQH2_H ||
+           t == GGML_TYPE_GQH2_C || t == GGML_TYPE_GQH4;
 }
 
 static bool validate_embedded_nextn_blocks(const gguf_context * gctx,
@@ -680,14 +689,71 @@ bool load_target_gguf_partial(const std::string & path,
         if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
-        alloc_total = align_up_size(alloc_total, alignment);
         TargetTensorAlloc a;
         a.tensor = t;
         a.file_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
         a.file_size = gguf_get_tensor_size(gctx, tid);
-        a.buffer_offset = alloc_total;
-        alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
         allocs.push_back(a);
+    }
+
+    // Stacked projections: place each (first, second) pair back to back in the
+    // weight buffer so one alias tensor spanning both rows serves a single
+    // GEMV. Only for the plain single-buffer path (the TP meta allocator
+    // places tensors itself) and only when the pair shares type/ne0 and the
+    // first tensor's byte size keeps the second one aligned.
+    const bool can_stack = !plan.metadata_only && !ggml_backend_buft_is_meta(buft) &&
+                           std::getenv("DFLASH_QWEN35_NO_STACK") == nullptr;
+    if (can_stack) {
+        auto find_alloc = [&](const std::string & name) -> int {
+            for (size_t i = 0; i < allocs.size(); i++) {
+                if (name == allocs[i].tensor->name) return (int)i;
+            }
+            return -1;
+        };
+        // (first, second) suffix pairs; the alias tensor stacks first's rows
+        // then second's, so they are emitted in that order whichever member
+        // the file lists first.
+        static const char * const kPairs[][2] = {
+            { ".attn_gate.weight", ".attn_qkv.weight"  },
+            { ".ssm_beta.weight",  ".ssm_alpha.weight" },
+        };
+        std::vector<TargetTensorAlloc> ordered;
+        ordered.reserve(allocs.size());
+        std::vector<bool> taken(allocs.size(), false);
+        for (size_t i = 0; i < allocs.size(); i++) {
+            if (taken[i]) continue;
+            const std::string name = allocs[i].tensor->name;
+            int first = -1, second = -1;
+            if (name.rfind("blk.", 0) == 0) {
+                for (const auto & pr : kPairs) {
+                    for (int m = 0; m < 2; m++) {
+                        const size_t pos = name.find(pr[m]);
+                        if (pos == std::string::npos) continue;
+                        const std::string prefix = name.substr(0, pos);
+                        first  = find_alloc(prefix + pr[0]);
+                        second = find_alloc(prefix + pr[1]);
+                        break;
+                    }
+                    if (first >= 0 || second >= 0) break;
+                }
+            }
+            if (first >= 0 && second >= 0 && !taken[(size_t)first] && !taken[(size_t)second] &&
+                !is_gqh_weight_type(allocs[(size_t)first].tensor->type) &&
+                !is_gqh_weight_type(allocs[(size_t)second].tensor->type)) {
+                taken[(size_t)first] = taken[(size_t)second] = true;
+                ordered.push_back(allocs[(size_t)first]);
+                ordered.push_back(allocs[(size_t)second]);
+                continue;
+            }
+            taken[i] = true;
+            ordered.push_back(allocs[i]);
+        }
+        allocs.swap(ordered);
+    }
+    for (TargetTensorAlloc & a : allocs) {
+        alloc_total = align_up_size(alloc_total, alignment);
+        a.buffer_offset = alloc_total;
+        alloc_total += ggml_backend_buft_get_alloc_size(buft, a.tensor);
     }
 
     // The generic meta buffer allocator must see all tensors together so it
@@ -791,6 +857,48 @@ bool load_target_gguf_partial(const std::string & path,
                 release_out_buffer();
                 gguf_free(gctx);
                 return false;
+            }
+        }
+        if (can_stack) {
+            // Alias tensors over adjacent pairs. They read the same bytes as
+            // the two source tensors (no copy, no extra VRAM).
+            ggml_init_params sip{};
+            sip.mem_size   = (2 * n_layer + 8) * ggml_tensor_overhead();
+            sip.mem_buffer = nullptr;
+            sip.no_alloc   = true;
+            out.stack_ctx = ggml_init(sip);
+            int n_stacked = 0;
+            auto make_stack = [&](ggml_tensor * first, ggml_tensor * second,
+                                  const char * name) -> ggml_tensor * {
+                if (!first || !second || !out.stack_ctx) return nullptr;
+                if (is_gqh_weight_type(first->type) || is_gqh_weight_type(second->type)) return nullptr;
+                if (first->type != second->type || first->ne[0] != second->ne[0]) return nullptr;
+                if (!ggml_is_contiguous(first) || !ggml_is_contiguous(second)) return nullptr;
+                const char * f = (const char *)first->data;
+                const char * sd = (const char *)second->data;
+                if (!f || !sd || sd != f + ggml_nbytes(first)) return nullptr;
+                ggml_tensor * st = ggml_new_tensor_2d(out.stack_ctx, first->type,
+                                                      first->ne[0], first->ne[1] + second->ne[1]);
+                // The alias must not need padding the backend would want to
+                // clear past its end (that would scribble on the next tensor).
+                if (ggml_backend_buft_get_alloc_size(buft, st) != ggml_nbytes(st)) return nullptr;
+                ggml_set_name(st, name);
+                if (ggml_backend_tensor_alloc(out.buf, st, first->data) != GGML_STATUS_SUCCESS) {
+                    return nullptr;
+                }
+                n_stacked++;
+                return st;
+            };
+            for (int il = 0; il < (int)n_layer; il++) {
+                TargetLayer & L = out.layers[il];
+                char nm[96];
+                std::snprintf(nm, sizeof(nm), "blk.%d.attn_gate_qkv.stacked", il);
+                L.wqkv_z = make_stack(L.wqkv_gate, L.wqkv, nm);
+                std::snprintf(nm, sizeof(nm), "blk.%d.ssm_beta_alpha.stacked", il);
+                L.ssm_ba = make_stack(L.ssm_beta, L.ssm_alpha, nm);
+            }
+            if (n_stacked > 0) {
+                std::fprintf(stderr, "[loader] stacked %d projection pairs (zero-copy aliases)\n", n_stacked);
             }
         }
     }
@@ -920,6 +1028,62 @@ bool load_target_gguf_partial(const std::string & path,
         return false;
     }
 
+    // ── Fused raw-gate GDN parameters: per DeltaNet layer one f32 [2*H]
+    //    tensor holding [dt_bias | A] so the kernel can apply
+    //    sigmoid/softplus itself (src[9] of the GDN op). Skipped for
+    //    metadata-only / meta (TP) loads.
+    if (!plan.metadata_only && !ggml_backend_buft_is_meta(buft)) {
+        int n_gate = 0;
+        for (int il = 0; il < (int)n_layer; il++) {
+            const TargetLayer & L = out.layers[il];
+            if (L.ssm_dt_bias && L.ssm_a && L.ssm_dt_bias->data && L.ssm_a->data &&
+                L.ssm_dt_bias->type == GGML_TYPE_F32 && L.ssm_a->type == GGML_TYPE_F32 &&
+                ggml_nelements(L.ssm_dt_bias) == ggml_nelements(L.ssm_a)) {
+                n_gate++;
+            }
+        }
+        if (n_gate > 0) {
+            ggml_init_params gip{};
+            gip.mem_size   = (n_gate + 2) * ggml_tensor_overhead();
+            gip.mem_buffer = nullptr;
+            gip.no_alloc   = true;
+            out.gate_ctx = ggml_init(gip);
+            if (out.gate_ctx) {
+                for (int il = 0; il < (int)n_layer; il++) {
+                    TargetLayer & L = out.layers[il];
+                    if (!(L.ssm_dt_bias && L.ssm_a && L.ssm_dt_bias->data && L.ssm_a->data &&
+                          L.ssm_dt_bias->type == GGML_TYPE_F32 && L.ssm_a->type == GGML_TYPE_F32 &&
+                          ggml_nelements(L.ssm_dt_bias) == ggml_nelements(L.ssm_a))) {
+                        continue;
+                    }
+                    const int64_t h = ggml_nelements(L.ssm_a);
+                    L.ssm_gate_ba = ggml_new_tensor_1d(out.gate_ctx, GGML_TYPE_F32, 2*h);
+                    char nm[96];
+                    std::snprintf(nm, sizeof(nm), "blk.%d.ssm_gate_ba", il);
+                    ggml_set_name(L.ssm_gate_ba, nm);
+                }
+                out.gate_buf = ggml_backend_alloc_ctx_tensors(out.gate_ctx, backend);
+                if (out.gate_buf) {
+                    ggml_backend_buffer_set_usage(out.gate_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    std::vector<float> tmp;
+                    for (int il = 0; il < (int)n_layer; il++) {
+                        TargetLayer & L = out.layers[il];
+                        if (!L.ssm_gate_ba) continue;
+                        const int64_t h = ggml_nelements(L.ssm_a);
+                        tmp.resize((size_t)2*h);
+                        ggml_backend_tensor_get(L.ssm_dt_bias, tmp.data(), 0, (size_t)h*sizeof(float));
+                        ggml_backend_tensor_get(L.ssm_a, tmp.data() + h, 0, (size_t)h*sizeof(float));
+                        ggml_backend_tensor_set(L.ssm_gate_ba, tmp.data(), 0, (size_t)2*h*sizeof(float));
+                    }
+                } else {
+                    for (int il = 0; il < (int)n_layer; il++) out.layers[il].ssm_gate_ba = nullptr;
+                    ggml_free(out.gate_ctx);
+                    out.gate_ctx = nullptr;
+                }
+            }
+        }
+    }
+
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");
         release_out_buffer();
@@ -952,12 +1116,27 @@ bool load_target_gguf_partial(const std::string & path,
         tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
     set_last_error(summary);
 
+    // GQH per-tensor headers, after upload because the registry is keyed by the
+    // tensor's device pointer. No-op unless the artifact carries GQH tensors.
+    if (!dflash::common::register_gqh_headers(path, out.ctx)) {
+        set_last_error("GQH header registration failed for " + path);
+        free_target_weights(out);
+        return false;
+    }
+
     return true;
 }
 
 void free_target_weights(TargetWeights & w) {
+    // Drop GQH registry entries while the tensors are still valid, BEFORE ggml_free:
+    // the registry resolves by pointer range, so a stale entry would shadow a later
+    // load that reuses the address.
+    dflash::common::unregister_gqh_headers(w.ctx);
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
+    if (w.stack_ctx) { ggml_free(w.stack_ctx);    w.stack_ctx = nullptr; }
+    if (w.gate_buf)  { ggml_backend_buffer_free(w.gate_buf); w.gate_buf = nullptr; }
+    if (w.gate_ctx)  { ggml_free(w.gate_ctx);     w.gate_ctx = nullptr; }
     // CpuEmbedder destructor handles the mmap automatically.
     w.moe_hybrid.reset();
     w.layers.clear();

@@ -59,6 +59,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Qwen 3.5 0.8B (Megakernel) | **~2×** |
 | Qwen 3.6 27B + PFlash | **~5.6×** |
 | Qwen 3.6 27B + DDTree | **4.84×** |
+| Qwen 3.8 27B GQH-Q3KXL | staging — GQH + MTP skip + DFlash2/DSpark ([#625](https://github.com/Luce-Org/lucebox/pull/625)) |
 | Laguna XS 2.1 33B + PFlash | **8.2×** @256K |
 | Laguna XS 2.1 33B + DFlash | **1.7×** @256K |
 | Qwen 3.6 27B HIP | **~2.6×** |
@@ -72,6 +73,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Drafter | Phase |
 |---------|:-----:|
 | [`Qwen3.6 27B`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
+| [`Qwen3.8 27B DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) / [`DSpark`](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark) | decode |
 | [`gemma 4 26B A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
 | [`gemma 4 31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
 | [`Laguna XS 2.1 33B`](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | decode |

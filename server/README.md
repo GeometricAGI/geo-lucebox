@@ -521,6 +521,39 @@ Same DFlash + PFlash stack on AMD GPUs. PR #119 ports the Phase 2 rocWMMA flashp
 
 **RDNA4 — Radeon AI PRO R9700 (`gfx1201`, 32 GB).** First-class RDNA4 target as of this build. Qwen3.6-27B Q4_K_M + DFlash draft (`dflash-draft-3.6-q4_k_m.gguf`), `--ddtree-budget=22`: **54.65 tok/s mean DFlash decode** across the 10-prompt HumanEval suite (`bench_he.py --n-gen 256`, AL 7.14, range 36.9–93.0 tok/s) on ROCm 7.1.1. The rocWMMA Phase 2 flashprefill kernels are numerically correct on RDNA4 — ROCm 7.1's rocWMMA handles the gfx12 WMMA operand-format change internally, so no kernel changes are needed (`test_flashprefill_kernels` PASS on `gfx1201`: max diff 5e-4, e2e `flash_prefill_forward_bf16` at S=8192 in 10.7 ms/iter). Note `gfx1200` (RX 9060) and `gfx1201` (RX 9070 / R9700) are **not** code-object compatible — build for `gfx1201` explicitly for the R9700.
 
+For Qwen3.8-27B IQ4_XS with the Q8_0 DFlash2 drafter, the drafter's metadata
+block size is conservative on the R9700. `--draft-block-size 12` is the
+general-purpose setting measured on `gfx1201`: 230.2 versus 159.8 aggregate
+decode tok/s on the ten-prompt HumanEval benchmark (+44%), 178.5 versus 139.6
+tok/s across all 164 HumanEval+ tasks (+28%), and 145/164 versus 143/164
+pass@1. A code-heavy deployment can use `--draft-block-size 16` for 279.1
+tok/s (+75%) on the short HumanEval benchmark, at the cost of small regressions
+on some low-acceptance prose prompts. Values are intentionally explicit rather
+than GPU defaults because the optimum depends on the drafter and workload.
+
+**Qwen3.8-27B GQH (Geometric-AI staging).** The published
+[`Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF`](https://huggingface.co/Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF)
+target (~3.93 bpw, GQH qtypes 108/111) loads on this tree: GQH decode lives in
+ggml, embedded MTP `nextn` blocks are skipped via #610, and DSpark/DFlash2
+spec-decode is the qwen35 path from [Luce-Org/lucebox#625](https://github.com/Luce-Org/lucebox/pull/625).
+GQH projections are **not** stacked (`attn_gate`/`attn_qkv` each carry their
+own per-tensor header); q8_0 `ssm_beta`/`ssm_alpha` stacking is unchanged.
+Stock llama.cpp cannot load this GGUF.
+
+```bash
+hf download Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF Qwen3.8-27B-GQH-Q3KXL.gguf \
+  --local-dir models/
+./build/dflash_server models/Qwen3.8-27B-GQH-Q3KXL.gguf \
+  --target-device hip:0 --fa-window 2048 --cache-type-k q8_0 --cache-type-v q8_0
+```
+
+A DFlash2/DSpark drafter is optional; without `--draft` the server runs AR on
+the GQH target. Converted Qwen3.8 drafters: `z-lab/Qwen3.8-27B-DFlash2` and
+`RadixArk/Qwen3.8-27B-DSpark` via `scripts/convert_dflash_to_gguf.py`.
+On GQH, `--specla --ddtree-budget 8` is capped to budget 7 so tree verify stays
+on the ncols=8 I8 kernel (`1+n_nodes`); uncapped budget 8 is ncols=9 and misses
+that kernel.
+
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
 

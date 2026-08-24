@@ -1,0 +1,43 @@
+{
+  "gqh_r2": {
+    "src": "/tmp/gqh625-quality-floor/gqh_r2.jsonl",
+    "dst": "/tmp/gqh625-quality-floor/gqh_r2_imphdr.jsonl",
+    "n_changed": 6,
+    "humaneval_pass": 160,
+    "humaneval_plus_pass": 153,
+    "humaneval_plus_fail": [
+      "HumanEval/10",
+      "HumanEval/32",
+      "HumanEval/39",
+      "HumanEval/83",
+      "HumanEval/91",
+      "HumanEval/97",
+      "HumanEval/132",
+      "HumanEval/141",
+      "HumanEval/145",
+      "HumanEval/154",
+      "HumanEval/163"
+    ]
+  },
+  "iq4_r2": {
+    "src": "/tmp/gqh625-quality-floor/iq4_r2.jsonl",
+    "dst": "/tmp/gqh625-quality-floor/iq4_r2_imphdr.jsonl",
+    "n_changed": 2,
+    "humaneval_pass": 161,
+    "humaneval_plus_pass": 152,
+    "humaneval_plus_fail": [
+      "HumanEval/10",
+      "HumanEval/32",
+      "HumanEval/39",
+      "HumanEval/55",
+      "HumanEval/91",
+      "HumanEval/97",
+      "HumanEval/132",
+      "HumanEval/134",
+      "HumanEval/141",
+      "HumanEval/145",
+      "HumanEval/151",
+      "HumanEval/154"
+    ]
+  }
+}

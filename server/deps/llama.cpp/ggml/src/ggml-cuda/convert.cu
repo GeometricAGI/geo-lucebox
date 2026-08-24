@@ -1,4 +1,5 @@
 #include "convert.cuh"
+#include "gqh.cuh"
 #include "dequantize.cuh"
 #include "tq3-quant.cuh"
 #include "rocmfp3_mix.cuh"
@@ -899,6 +900,15 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_rocmfp3_mix_to_fp16_cuda;
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
             return dequantize_rocmfp2_mix_to_fp16_cuda;
+        // GQH: per-tensor scale + grid code come from the header registry (gqh.cu).
+        case GGML_TYPE_GQH3:
+            return dequantize_gqh3_to_fp16_cuda;
+        case GGML_TYPE_GQH2_H:
+            return dequantize_gqh2h_to_fp16_cuda;
+        case GGML_TYPE_GQH2_C:
+            return dequantize_gqh2c_to_fp16_cuda;
+        case GGML_TYPE_GQH4:
+            return dequantize_gqh4_to_fp16_cuda;
         case GGML_TYPE_Q6_0_ROCMFPX:
             return dequantize_block_cont_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
         case GGML_TYPE_Q8_0_ROCMFPX:
@@ -970,6 +980,14 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
         case GGML_TYPE_Q8_0_ROCMFPX:
             return dequantize_block_cont_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
+        case GGML_TYPE_GQH3:
+            return dequantize_gqh3_to_fp32_cuda;
+        case GGML_TYPE_GQH2_H:
+            return dequantize_gqh2h_to_fp32_cuda;
+        case GGML_TYPE_GQH2_C:
+            return dequantize_gqh2c_to_fp32_cuda;
+        case GGML_TYPE_GQH4:
+            return dequantize_gqh4_to_fp32_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

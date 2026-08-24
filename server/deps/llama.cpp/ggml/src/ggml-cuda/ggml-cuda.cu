@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/rocmfp3_mix.cuh"
+#include "ggml-cuda/gqh.cuh"
 #include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -473,7 +474,11 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
-    static const int MAX_BUFFERS = 256;
+    // 1024 (upstream 256): LUCE_Q8_MEMO keeps one pooled q8_1 activation
+    // buffer per quantized matmul alive across a whole graph evaluation
+    // (~300 on a 64-layer hybrid), and a full pool falls back to freeing
+    // in-flight buffers with cudaFree.
+    static const int MAX_BUFFERS = 1024;
 
     int device;
     struct ggml_cuda_buffer {
@@ -2581,6 +2586,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     const int64_t ncols_dst = is_mul_mat_id ? dst->ne[2] : src1->ne[1];
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
+                             !ggml_cuda_qtype_has_no_mmvq(src0->type) &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
 #ifdef ROCMFP2_AFFINE
     // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
@@ -2747,6 +2753,96 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
     }
 
+    // GQH gate/up pair: two same-rung, same-shape GEMVs that share `x`, issued as
+    // one dispatch, then the existing SwiGLU. SuperSonic / lucebox_gqh measured this
+    // on GQH4 out==17408 (the only fractional occupancy-round bucket): folding the
+    // pair pays the per-dispatch cost once and turns 8.5 rounds into 17.0. Qwen3.8
+    // spells the FFN as {MUL_MAT, MUL_MAT, GLU} (ggml_swiglu_split), not the
+    // {MUL_MAT, UNARY, MUL_MAT, MUL} pattern that fusion originally matched, so the
+    // pair kernel was dead until this hook. GGML_GQH_FUSE_PAIR=0 is the same-binary
+    // control; GGML_GQH_FUSED=0 also declines so dequant A/B stays coherent.
+    if (direct_vector_layout && !ids &&
+            ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
+        static const bool gqh_fused_on = []() {
+            const char * e = getenv("GGML_GQH_FUSED");
+            return e ? atoi(e) != 0 : true;
+        }();
+        static const bool pair_on = []() {
+            const char * e = getenv("GGML_GQH_FUSE_PAIR");
+            return e ? atoi(e) != 0 : true;
+        }();
+        const ggml_tensor * w_gate = gate->src[0];
+        const ggml_tensor * w_up   = up->src[0];
+        const ggml_tensor * xt     = gate->src[1];
+        if (gqh_fused_on && pair_on && w_gate && w_up && xt &&
+                xt == up->src[1] && !gate->src[2] && !up->src[2] &&
+                w_gate->type == w_up->type &&
+                (w_gate->type == GGML_TYPE_GQH3 ||
+                 w_gate->type == GGML_TYPE_GQH4 ||
+                 w_gate->type == GGML_TYPE_GQH2_H) &&
+                ggml_are_same_shape(w_gate, w_up) &&
+                ggml_are_same_stride(w_gate, w_up) &&
+                ggml_are_same_shape(gate, up) &&
+                ggml_are_same_stride(gate, up) &&
+                xt->type == GGML_TYPE_F32 &&
+                gate->type == GGML_TYPE_F32 &&
+                up->type == GGML_TYPE_F32 &&
+                glu->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(xt) &&
+                ggml_is_contiguous(gate) &&
+                ggml_is_contiguous(up) &&
+                xt->ne[1] >= 1 && xt->ne[1] <= 16 &&
+                xt->ne[2] == 1 && xt->ne[3] == 1 &&
+                gate->data != up->data &&
+                w_gate->buffer && w_up->buffer &&
+                !ggml_backend_buft_is_cuda_split(w_gate->buffer->buft) &&
+                !ggml_backend_buft_is_cuda_split(w_up->buffer->buft) &&
+                ggml_cuda_gqh_mul_mat_vec_pair(
+                    w_gate->type,
+                    w_gate->data, (float *) gate->data,
+                    w_up->data,   (float *) up->data,
+                    (const float *) xt->data,
+                    (int) w_gate->ne[0], (int) w_gate->ne[1],
+                    (int) xt->ne[1],
+                    (int64_t) (xt->nb[1] / sizeof(float)),
+                    (int64_t) (gate->nb[1] / sizeof(float)),
+                    ctx.stream())) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: gqh pair-fused gate/up %s %dx%d ncols=%d\n", __func__,
+                              ggml_type_name(w_gate->type),
+                              (int) w_gate->ne[0], (int) w_gate->ne[1],
+                              (int) xt->ne[1]);
+            }
+            // ...and the SwiGLU itself folds into the pre-pass the DOWN projection would
+            // have launched separately: same tensor, two 68-block dispatches over 0.56 MB,
+            // one of which only re-reads what the other just wrote. Bit-identical output
+            // (see ggml_cuda_gqh_glu_quant), so this is a dispatch merge and not a numeric
+            // change; GGML_GQH_FUSE_GLU=0 keeps the unfused pair for the same-binary A/B.
+            // `swapped` needs no handling here: src1 is a separate tensor, which is the
+            // branch of ggml_cuda_op_unary_gated that ignores it.
+            // Logged once, for the same reason the pair fusion is: a fusion that silently
+            // declines is indistinguishable from a fusion that bought nothing, and
+            // iteration 10 lost eight HE runs to exactly that class of mistake.
+            static bool glu_logged = false;
+            if (!ggml_cuda_gqh_glu_quant(
+                        (const float *) gate->data, (const float *) up->data,
+                        (float *) glu->data, (int) glu->ne[0], (int) xt->ne[1],
+                        (int64_t) (gate->nb[1] / sizeof(float)),
+                        (int64_t) (up->nb[1]   / sizeof(float)),
+                        (int64_t) (glu->nb[1]  / sizeof(float)),
+                        ctx.stream())) {
+                ggml_cuda_op_swiglu(ctx, glu);
+            } else if (!glu_logged) {
+                glu_logged = true;
+                GGML_LOG_INFO("%s: gqh glu-fused swiglu+prepass %dx%d\n", __func__,
+                              (int) glu->ne[0], (int) xt->ne[1]);
+            }
+            return true;
+        }
+    }
+
     if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.gate = gate->src[0];
@@ -2830,6 +2926,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
+        && !ggml_cuda_qtype_has_no_mmvq(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
@@ -2904,6 +3001,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const char * e = getenv("DFLASH_MIX_FUSED");
         return e ? atoi(e) != 0 : true;
     }();
+
+    // GQH fused decode matvec, same shape of hook and same reason: the generic chain
+    // would dequantize the whole weight matrix to f16 per token. Returns false for an
+    // unregistered tensor, keeping the fallback. GGML_GQH_FUSED=0 forces the fallback.
+    //
+    // NOT gated on luce_mmvq_max_ncols. That cap is the MMVQ/MMQ crossover for types
+    // that have a vec_dot (default 3). GQH has no MMVQ and no MMQ: N > 3 used to fall
+    // through to dequant->GEMM, which is pathological (N=4 was 6x a fused N=5). The
+    // kernel itself declines anything past GQH_MAX_COLS (16), so DFlash2 verify
+    // (block 8, --draft-block-size 12) stays on the fused path.
+    static const bool gqh_fused_on = []() {
+        const char * e = getenv("GGML_GQH_FUSED");
+        return e ? atoi(e) != 0 : true;
+    }();
+    if (gqh_fused_on && !split
+            && (src0->type == GGML_TYPE_GQH3 || src0->type == GGML_TYPE_GQH2_H
+                || src0->type == GGML_TYPE_GQH2_C || src0->type == GGML_TYPE_GQH4)
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[2] == 1 && src1->ne[3] == 1
+            && ggml_cuda_gqh_mul_mat_vec(
+                   src0->type, src0->data, (const float *) src1->data, (float *) dst->data,
+                   (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
+                   (int64_t) (src1->nb[1] / sizeof(float)),
+                   (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
+        return;
+    }
     if (mix_fused_on && is_rocmfp3_mix && !split
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
             && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
@@ -4365,6 +4489,49 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // dflash: residual ADD + RMS_NORM + MUL. The add output stays live (it is
+    // the next residual), so this is a subgraph fusion with two outputs.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM &&
+        ops.begin()[2] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[node_idx];
+        const ggml_tensor * rms = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+        if (rms->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * w = nullptr;
+        if (mul->src[0] == rms) {
+            w = mul->src[1];
+        } else if (mul->src[1] == rms) {
+            w = mul->src[0];
+        } else {
+            return false;
+        }
+        const ggml_tensor * a = add->src[0];
+        const ggml_tensor * b = add->src[1];
+        if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(w) ||
+            !ggml_is_contiguous(add) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(a, mul)) {
+            return false;
+        }
+        if (w->ne[0] != a->ne[0] || ggml_nelements(w) != a->ne[0]) {
+            return false;
+        }
+        if (ggml_backend_buft_is_cuda_split(a->buffer->buft) || ggml_backend_buft_is_cuda_split(b->buffer->buft)) {
+            return false;
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4416,8 +4583,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
         const ggml_tensor * silu     = cgraph->nodes[node_idx+1];
 
-        if (ggml_get_op_params_i32(ssm_conv, 0) == 1) {
-            // the Specla ssm_conv kernel applies SiLU itself
+        if (ggml_get_op_params_i32(ssm_conv, 0) != 0) {
+            // the Specla (1) and dflash step (2) ssm_conv kernels apply SiLU themselves
             return false;
         }
 
@@ -4966,6 +5133,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     if (fused_mul_mat_vec) {
                         i += fused_node_count - 1;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+                        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        i += 2;
                         continue;
                     }
 
@@ -6216,9 +6389,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
-            if (ggml_get_op_params_i32(op, 0) == 1) {
-                // Specla layout: x is [d_inner, n_tokens], so d_inner = ne[0]
-                // and the kernel guards the final partial 128-channel block.
+            // op_params[0]: 1 = SpecLA heavy-light conv (x is [d_inner, n_tokens],
+            // kernel guards the final partial 128-channel block), 2 = dflash fused
+            // step mode (any channel count).
+            if (ggml_get_op_params_i32(op, 0) == 1 || ggml_get_op_params_i32(op, 0) == 2) {
                 return true;
             }
             // assumes d_inner % threads == 0
