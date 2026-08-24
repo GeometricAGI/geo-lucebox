@@ -1682,11 +1682,25 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         // model; see deepseek4_budget_hook.h for why this overrides rather than appends.
         {
             bool hook_forced = false;
-            next_token = dflash::deepseek4::budget_hook_apply(
+            bool hook_soft   = false;
+            // `logits` is the distribution for THIS step, so the soft stage can ask whether
+            // the model already ranks the close marker highly. Passing it null (which the
+            // 2-stage helper tolerates) would silently degrade to hard-only.
+            next_token = dflash::deepseek4::budget_hook_apply_2stage(
                 budget_hook.close_token_ids, n_gen - generated,
-                budget_hook.hard_limit_remaining, next_token,
-                budget_close_started, close_inject_pos, hook_forced);
-            if (hook_forced && forced_close_out) *forced_close_out = true;
+                budget_hook.soft_limit_remaining, budget_hook.hard_limit_remaining,
+                budget_hook.soft_close_rank,
+                logits.data(), w_.n_vocab, budget_hook.soft_probe_token,
+                next_token, budget_close_started, close_inject_pos,
+                hook_forced, hook_soft);
+            // Both stages end thinking, so both must report a close to the caller; the
+            // distinction is only interesting for telemetry.
+            if ((hook_forced || hook_soft) && forced_close_out) *forced_close_out = true;
+            if (hook_soft) {
+                std::fprintf(stderr,
+                    "[deepseek4] soft close at %d remaining (marker ranked within top-%d)\n",
+                    n_gen - generated, budget_hook.soft_close_rank);
+            }
         }
 
         if (process_logits) {

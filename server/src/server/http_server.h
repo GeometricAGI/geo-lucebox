@@ -96,6 +96,18 @@ struct ServerConfig {
     // forwards into GenerateRequest.budget_hook when thinking is opted in.
     std::vector<int32_t> think_close_token_ids;
 
+    // Soft-close stage (spec parity with antirez/ds4 ds4_eval.c). The close sequence above is
+    // injected unconditionally at hard_limit_reply_budget; this fires EARLIER, but only when
+    // the model already ranks the bare think marker within soft_close_rank. Defaults match
+    // upstream (1024 / rank 3) and are overridable from the model card.
+    //
+    // soft_probe_token is the bare marker's token (e.g. </think> = 128822), NOT
+    // think_close_token_ids[0] -- with a thinking_terminator_hint the sequence starts with a
+    // newline, and ranking a newline says nothing about wanting to stop. -1 disables.
+    int                  soft_limit_reply_budget = 0;
+    int                  soft_close_rank         = 0;
+    int32_t              soft_probe_token        = -1;
+
     // Phase-1 budgets per `reasoning.effort` tier (spec §4.2). Selected
     // by the request parser when `reasoning.effort` is present. Each
     // value is itself capped at `think_max_tokens` at startup.

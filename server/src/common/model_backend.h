@@ -144,6 +144,27 @@ struct BudgetHook {
     // a single close-tag token. Empty = hook disabled.
     std::vector<int32_t> close_token_ids;
     int                  hard_limit_remaining = 0;
+
+    // Soft stage, ported from antirez/ds4 ds4_eval.c (soft_limit_reply_budget=1024,
+    // soft_limit_think_close_rank=3). While the remaining window is inside
+    // `soft_limit_remaining` and the model ALREADY ranks the think-close token within
+    // `soft_close_rank`, close on that step instead of waiting for the unconditional hard
+    // limit. Upstream: "it accepts the model's own desire to end thinking when </think> is
+    // already near the top of the distribution."
+    //
+    // Measured motivation: on the bf16 anchor P(</think>) at a real stop point is 0.999 at
+    // rank 1, so the hard stage alone suffices for a healthy model. Our quantized arms fail
+    // to make the transition at all on 5 of 10 COMPSEC cases (no answer emitted inside a
+    // full 1000-token reply reserve) while a 2-bit reference recovers 10/10. A blunted spike
+    // sitting at rank 2-3 is caught by this test and missed by an argmax-only path.
+    //
+    // `soft_probe_token` is the token whose rank is tested -- the real </think>, which is NOT
+    // close_token_ids[0] when a thinking_terminator_hint makes the sequence "\n</think>\n\n".
+    // -1 falls back to close_token_ids[0] (upstream's single-token behaviour).
+    // Zero/negative soft_limit_remaining or soft_close_rank disables the soft stage.
+    int                  soft_limit_remaining = 0;
+    int                  soft_close_rank      = 0;
+    int32_t              soft_probe_token     = -1;
 };
 
 struct GenerateRequest {

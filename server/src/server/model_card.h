@@ -64,6 +64,13 @@ struct ModelCard {
     // override down to 512-1024; verbose math/code models keep 4096.
     int               hard_limit_reply_budget    = 4096;
 
+    // Soft-close stage (antirez/ds4 ds4_eval.c parity). 0 = use the built-in default
+    // (2x hard_limit / rank 3). The soft stage closes EARLY but only with the model's
+    // assent -- it fires solely when the bare thinking marker already ranks within
+    // soft_limit_think_close_rank, so a model that is mid-derivation is left alone.
+    int               soft_limit_reply_budget    = 0;
+    int               soft_limit_think_close_rank = 0;
+
     // Two distinct concepts for thinking-budget control:
     //
     // (a) `thinking_marker` — the parse-side terminator. Bytes that signal

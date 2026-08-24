@@ -216,6 +216,17 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
         // See docs/specs/thinking-budget.md §3.3.
         out.hard_limit_reply_budget = j["hard_limit_reply_budget"].get<int>();
     }
+    if (j.contains("soft_limit_reply_budget") &&
+        j["soft_limit_reply_budget"].is_number_integer()) {
+        // Remaining-window threshold at which the model MAY close thinking of its own
+        // accord. Must exceed hard_limit_reply_budget to have any effect; server_main
+        // checks that and logs when the stage stays disabled.
+        out.soft_limit_reply_budget = j["soft_limit_reply_budget"].get<int>();
+    }
+    if (j.contains("soft_limit_think_close_rank") &&
+        j["soft_limit_think_close_rank"].is_number_integer()) {
+        out.soft_limit_think_close_rank = j["soft_limit_think_close_rank"].get<int>();
+    }
     if (j.contains("thinking_marker") &&
         j["thinking_marker"].is_string()) {
         out.thinking_marker = j["thinking_marker"].get<std::string>();

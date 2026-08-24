@@ -3109,6 +3109,21 @@ void HttpServer::prepare_generation_inputs(
         inputs.request.budget_hook.close_token_ids =
             config_.think_close_token_ids;
         inputs.request.budget_hook.hard_limit_remaining = reply_budget;
+        // Soft stage rides on the same reply_budget scaling: when a request overrides the
+        // reserve, shift the soft threshold by the same ratio so the two stages keep their
+        // relative spacing instead of the soft one collapsing onto (or below) the hard one.
+        if (config_.soft_limit_reply_budget > config_.hard_limit_reply_budget &&
+            config_.soft_close_rank > 0 && config_.soft_probe_token >= 0) {
+            const int soft = (reply_budget == config_.hard_limit_reply_budget)
+                ? config_.soft_limit_reply_budget
+                : (int) ((long long) reply_budget * config_.soft_limit_reply_budget /
+                         (std::max)(config_.hard_limit_reply_budget, 1));
+            if (soft > reply_budget) {
+                inputs.request.budget_hook.soft_limit_remaining = soft;
+                inputs.request.budget_hook.soft_close_rank      = config_.soft_close_rank;
+                inputs.request.budget_hook.soft_probe_token     = config_.soft_probe_token;
+            }
+        }
     }
 
     if (!req.tools.empty() && !req.tool_choice.is_null()) {

@@ -1146,6 +1146,48 @@ int main(int argc, char ** argv) {
             }
             if (close_ids.size() > 16) std::fprintf(stderr, ",...");
             std::fprintf(stderr, "\n");
+
+            // Soft stage. Probe the BARE marker, which is the token that actually signals
+            // "I want to stop"; with a thinking_terminator_hint, close_ids[0] is a newline.
+            // Only meaningful when the marker is a single token -- otherwise there is no one
+            // rank to test and we leave the soft stage off rather than test a fragment.
+            auto marker_ids = tokenizer.encode(marker);
+            // Three-way, because "absent" and "explicitly off" must not collapse together:
+            //   negative -> EXPLICITLY DISABLED (the only way a card can turn the stage off)
+            //   zero     -> unset, take the default
+            //   positive -> explicit budget
+            // Without the negative case a card cannot disable the soft stage at all: 0 fell
+            // through to the default and silently enabled it. That cost an A/B run whose "off"
+            // control logged 5 soft closes, so both arms differed only in threshold and the
+            // comparison measured nothing. model_backend.h already documents a zero/negative
+            // disable; this makes that reachable from configuration.
+            const bool soft_disabled = card.soft_limit_reply_budget < 0 ||
+                                       card.soft_limit_think_close_rank < 0;
+            const int soft_budget = card.soft_limit_reply_budget > 0
+                                        ? card.soft_limit_reply_budget
+                                        : 2 * sconfig.hard_limit_reply_budget;
+            const int soft_rank = card.soft_limit_think_close_rank > 0
+                                      ? card.soft_limit_think_close_rank
+                                      : 3;
+            if (soft_disabled) {
+                std::fprintf(stderr,
+                    "[server] level-2 soft close DISABLED by model card "
+                    "(soft_limit_reply_budget=%d, soft_limit_think_close_rank=%d)\n",
+                    card.soft_limit_reply_budget, card.soft_limit_think_close_rank);
+            } else if (marker_ids.size() == 1 && soft_budget > sconfig.hard_limit_reply_budget) {
+                sconfig.soft_limit_reply_budget = soft_budget;
+                sconfig.soft_close_rank         = soft_rank;
+                sconfig.soft_probe_token        = marker_ids[0];
+                std::fprintf(stderr,
+                    "[server] level-2 SOFT close: at <=%d remaining, close when marker %d "
+                    "(%.16s) ranks within top-%d\n",
+                    soft_budget, marker_ids[0], marker.c_str(), soft_rank);
+            } else {
+                std::fprintf(stderr,
+                    "[server] level-2 soft close disabled (marker tokenizes to %zu tokens, "
+                    "soft_budget=%d vs hard=%d)\n",
+                    marker_ids.size(), soft_budget, sconfig.hard_limit_reply_budget);
+            }
         } else {
             std::fprintf(stderr,
                 "[server] level-2 force-close DISABLED: text %.40s... "
