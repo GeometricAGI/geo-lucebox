@@ -120,3 +120,58 @@ range 4.74-7.53 identical across ours/#625/#642, tok/s within 0.4%.
 Same-arm floor across two full repeats: 0.2% or better.
 
 If your AL is below ~5 on HumanEval prompts, the drafter is wrong. Go back to §2.
+
+## 7. Tuned head-to-head vs upstream #642 (R9700, lucebox6, 2026-08-24)
+
+Each arm tuned independently on `--ddtree-budget`; HumanEval 10 prompts,
+`--specla --n-gen 128`, canonical drafter from §2, greedy.
+
+| budget | #642 + IQ4_XS | ours + IQ4_XS | ours + GQH |
+|---:|---:|---:|---:|
+| 3  | 68.21 (AL 3.46) | - | - |
+| 4  | 76.37 (AL 3.95) | 76.39 (AL 3.95) | 65.14 (AL 3.80) |
+| 5  | 83.80 (AL 4.40) | - | - |
+| 6  | 89.76 (AL 4.79) | 89.92 (AL 4.79) | 65.06 (AL 4.62) |
+| 7  | 94.13 (AL 5.17) | - | 100.47 (AL 5.10) |
+| 8  | **96.79 (AL 5.83)** | **96.33 (AL 5.83)** | 101.69 (AL 5.10) |
+| 16 | 78.22 (AL 5.76) | - | 101.77 (AL 5.10) |
+| 22 | 76.34 (AL 5.84) | 76.27 (AL 5.84) | **101.82 (AL 5.10)** |
+| 32 | 73.38 (AL 5.99) | 73.41 (AL 5.99) | - |
+| 48 | 65.98 (AL 6.03) | - | 101.76 (AL 5.10) |
+
+**Best vs best: ours+GQH 101.82 tok/s at 13,440,110,432 B, versus #642+IQ4_XS
+96.79 tok/s at 15,567,824,480 B - +5.2% throughput for 13.7% fewer bytes.**
+
+Two things this table is for.
+
+**The gain is the format, not the stack.** Our arm on IQ4_XS peaks at 96.33 vs
+#642's 96.79 - a 0.5% difference, i.e. the two stacks are equivalent and all of
+the win comes from the GQH artifact. Matched-budget rows agree even more closely
+(76.27 vs 76.34 at 22; 89.92 vs 89.76 at 6; 76.39 vs 76.37 at 4).
+
+**Never compare these two at a single budget.** The arms have opposite tuning
+curves. IQ4_XS peaks sharply at 8 and decays hard (96.79 -> 65.98 by 48); GQH is
+flat from 7 upward because it self-caps at `ncols=8`, but falls off a cliff
+*below* 7 (100.47 at 7, 65.14 at 4) where the fused kernel is not filled. So:
+
+* at the default budget 22, GQH looks **+33%** ahead - flattering, wrong
+* at budget 4, GQH looks **15% behind** - unflattering, also wrong
+* tuned per arm, the honest figure is **+5.2%**
+
+An independent check: the campaign status doc records +7% on the same pairing
+from a separate run, so +5.2% is in family.
+
+### Reproducing exactly this table
+
+    for b in 3 4 5 6 7 8 16 22 32 48; do
+      DFLASH_BIN=<arm>/server/build-bench/test_dflash \
+      DFLASH_TARGET=<target.gguf> \
+      DFLASH_DRAFT=qwen38-dflash2-q8_0.gguf \
+      HIP_VISIBLE_DEVICES=0 TMPDIR=$HOME/tmp \
+      python3 server/scripts/bench_he.py --specla --n-gen 128 \
+        --ddtree-budget $b --skip-tokenize
+    done
+
+Patch `test_dflash.cpp` in the upstream arm first (§5) or every run aborts.
+Same-arm floor measured over two full repeats: 0.2% or better (56.06/56.17 and
+101.78/101.77), so the 5.2% gap is well outside it.
