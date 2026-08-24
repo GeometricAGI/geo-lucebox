@@ -1048,6 +1048,7 @@ static __device__ __forceinline__ void gqh_load_x(
 // kernel's per-row scale chain stays d_real * ratio * qxs -- one extra v_mul per row
 // per superblock, none per column.
 #define GQH_Q8_XSCALE (1.0f / (127.0f * 127.0f))
+#define GQH_Q4_XSCALE (1.0f / (7.0f * 7.0f))
 
 // The fp8 arm's activation range target, and its scale. e4m3 carries no /127: the LUT byte
 // IS the level, so only the activation normaliser folds into qxs. GQH_FP8_XSHIFT is a power
@@ -1093,7 +1094,7 @@ static __device__ __forceinline__ void gqh_load_x(
 // whole correctness argument for the fusion: the down-projection matvec reads the same
 // bytes either way, so the decode stays bit-exact and the HE token stream cannot move.
 // Do not reorder the amax / shfl / round chain -- it is the wire format.
-template <bool XSSHARED>
+template <bool XSSHARED, bool I4DOT = false>
 static __device__ __forceinline__ void gqh_quant_group(
         const float (&v)[GQH_PER_LANE], int c, int g, int ngroups,
         int8_t * __restrict__ qx, float * __restrict__ qxs, int64_t qx_col_stride) {
@@ -1128,6 +1129,19 @@ static __device__ __forceinline__ void gqh_quant_group(
         make_int2(packed[0], packed[1]);
     qxs[c * (int64_t) ngroups + g] = amax * GQH_FP8_XSCALE;
 #else
+    if constexpr (I4DOT) {
+        const float inv = amax > 0.0f ? 7.0f / amax : 0.0f;
+        uint32_t packed = 0;
+#pragma unroll
+        for (int t = 0; t < GQH_PER_LANE; ++t) {
+            int q = __float2int_rn(v[t] * inv);
+            q = q > 7 ? 7 : (q < -7 ? -7 : q);
+            packed |= (uint32_t) (q & 0x0f) << (4 * t);
+        }
+        *(uint32_t *) (qx + c * qx_col_stride + (int64_t) g * GQH_PER_LANE) = packed;
+        qxs[c * (int64_t) ngroups + g] = amax * GQH_Q4_XSCALE;
+        return;
+    }
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     int packed[2] = { 0, 0 };
 #pragma unroll
@@ -1142,7 +1156,7 @@ static __device__ __forceinline__ void gqh_quant_group(
 #endif
 }
 
-template <bool XSSHARED>
+template <bool XSSHARED, bool I4DOT = false>
 static __global__ void gqh_quant_x_kernel(
         const float * __restrict__ x, int ngroups, int64_t x_col_stride,
         int8_t * __restrict__ qx, float * __restrict__ qxs, int64_t qx_col_stride) {
@@ -1160,7 +1174,7 @@ static __global__ void gqh_quant_x_kernel(
     const float4 x0 = xv[0];
     const float4 x1 = xv[1];
     const float v[GQH_PER_LANE] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
-    gqh_quant_group<XSSHARED>(v, c, g, ngroups, qx, qxs, qx_col_stride);
+    gqh_quant_group<XSSHARED, I4DOT>(v, c, g, ngroups, qx, qxs, qx_col_stride);
 }
 
 // GGML_GQH_FUSE_GLU: the FFN's SwiGLU and the down-projection's activation pre-pass are
@@ -1506,6 +1520,11 @@ static __device__ __forceinline__ int gqh_q8_level(float level) {
     return q > 127 ? 127 : (q < -127 ? -127 : q);
 }
 
+static __device__ __forceinline__ int gqh_q4_level(float level) {
+    const int q = __float2int_rn(level * 7.0f);
+    return q > 7 ? 7 : (q < -7 ? -7 : q);
+}
+
 // The fp8 arm's codebook byte. Every rung's grid spans -1 .. +1 so there is no clamping to
 // do and no scale to carry: e4m3 has 8 binades below 1.0, the level lands on its own
 // exponent, and the byte the hardware dot reads IS the level to 3 mantissa bits. Rounding
@@ -1565,12 +1584,15 @@ static __device__ __forceinline__ uint16_t * gqh_q8_lut_lds() {
 
 template <ggml_type RUNG>
 static __device__ __forceinline__ void gqh_q8_lut_fill(
-        uint16_t * lut, const float * __restrict__ g_levels) {
+        uint16_t * lut, const float * __restrict__ g_levels, bool q4 = false) {
     constexpr int SIZE = gqh_pair_lut<RUNG>::SIZE;
     for (int i = threadIdx.x; i < SIZE; i += blockDim.x) {
-        const int q0 = gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code0(i)]);
-        const int q1 = gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code1(i)]);
-        lut[i] = (uint16_t) ((q0 & 0xff) | ((q1 & 0xff) << 8));
+        const int q0 = q4 ? gqh_q4_level(g_levels[gqh_pair_lut<RUNG>::code0(i)])
+                          : gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code0(i)]);
+        const int q1 = q4 ? gqh_q4_level(g_levels[gqh_pair_lut<RUNG>::code1(i)])
+                          : gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code1(i)]);
+        lut[i] = q4 ? (uint16_t) ((q0 & 0x0f) | ((q1 & 0x0f) << 4))
+                    : (uint16_t) ((q0 & 0xff) | ((q1 & 0xff) << 8));
     }
 }
 
@@ -1613,7 +1635,7 @@ static __device__ __forceinline__ float gqh_d_real_uni(uint8_t d_raw, float t_sc
 // codegen does not move.
 template <ggml_type RUNG, int NCOLS_MAX, int ROWS, bool PAIRED, int NSB = 0,
           bool PAIRLUT = false, bool F16DOT = false, bool I8DOT = false,
-          bool XSSHARED = true>
+          bool XSSHARED = true, bool I4DOT = false>
 static __global__ void gqh_matvec_kernel(
         const uint8_t * __restrict__ data, const float * __restrict__ x,
         float * __restrict__ y, int in, int out, int ncols, float tensor_scale,
@@ -1706,7 +1728,7 @@ static __global__ void gqh_matvec_kernel(
     // PAIRLUT == false, so no other instantiation moves. Ahead of the row clamp for the
     // same reason the first barrier is: __syncthreads needs the whole block.
     float * s_pair = nullptr;
-    if constexpr (PAIRLUT && !I8DOT) {
+    if constexpr (PAIRLUT && !I8DOT && !I4DOT) {
         s_pair = gqh_pair_lut_lds<RUNG>();
         gqh_pair_lut_fill<RUNG>(s_pair, s_grid);
         __syncthreads();
@@ -1715,9 +1737,9 @@ static __global__ void gqh_matvec_kernel(
     // loop, so it takes the pair table unconditionally (GGML_GQH_PAIRLUT does not gate
     // it) and the f32 one is not even allocated -- 128 B of LDS on gqh3 against 608 B.
     uint16_t * s_q8 = nullptr;
-    if constexpr (I8DOT) {
+    if constexpr (I8DOT || I4DOT) {
         s_q8 = gqh_q8_lut_lds<RUNG>();
-        gqh_q8_lut_fill<RUNG>(s_q8, s_grid);
+        gqh_q8_lut_fill<RUNG>(s_q8, s_grid, I4DOT);
         __syncthreads();
     }
     if (row >= out) return;
@@ -1977,7 +1999,7 @@ static __global__ void gqh_matvec_kernel(
         // bit-identical.
         const float * __restrict__ xcol[NCOLS_MAX];
         uint32_t xoff[NCOLS_MAX] = {};
-        if constexpr (XSHARED && !I8DOT) {
+        if constexpr (XSHARED && !I8DOT && !I4DOT) {
     #pragma unroll
             for (int c = 0; c < NCOLS_MAX; ++c) {
                 const int b = c < GQH_MULTICOL_XBASES ? c : 0;
@@ -1992,7 +2014,7 @@ static __global__ void gqh_matvec_kernel(
         // is `sb * 32 + lane`, one coalesced 128 B request per wave per superblock.
         const int8_t * __restrict__ qxcol[NCOLS_MAX];
         uint32_t qxoff[NCOLS_MAX] = {};
-        if constexpr (XSHARED && I8DOT) {
+        if constexpr (XSHARED && (I8DOT || I4DOT)) {
     #pragma unroll
             for (int c = 0; c < NCOLS_MAX; ++c) {
                 const int b = c < GQH_MULTICOL_XBASES ? c : 0;
@@ -2017,7 +2039,7 @@ static __global__ void gqh_matvec_kernel(
             half2 xh[NCOLS_MAX][GQH_PER_LANE / 2];
             int2  xq[NCOLS_MAX];
             float xq_scale[NCOLS_MAX];
-            if constexpr (XSHARED && !I8DOT) {
+            if constexpr (XSHARED && !I8DOT && !I4DOT) {
     #pragma unroll
                 for (int c = 0; c < NCOLS_MAX; ++c) {
                     gqh_load_x(xcol[c], sb, j0, xshared[c], xoff[c]);
@@ -2039,7 +2061,7 @@ static __global__ void gqh_matvec_kernel(
             // b128, and 16 VGPRs of live activation against 64. The scale rides the same
             // load group so the wait that consumes it also covers the codes -- and both
             // stay ahead of the wire prefetch below, for the loadcnt reason above.
-            if constexpr (XSHARED && I8DOT) {
+            if constexpr (XSHARED && (I8DOT || I4DOT)) {
                 const uint32_t qxo = (uint32_t) (sb * GQH_SUPERBLOCK + j0);
     #pragma unroll
                 for (int c = 0; c < NCOLS_MAX; ++c) {
@@ -2049,7 +2071,11 @@ static __global__ void gqh_matvec_kernel(
                     // costs a v_add_co_u32 / v_add_co_ci_u32 pair per column (measured:
                     // 7 of the 8 loads lost SADDR). Summing the two 32-bit offsets first
                     // leaves `SGPR base + 32-bit voffset`, the form gqh_load_x keeps.
-                    xq[c] = *(const int2 *) (qxcol[c] + (qxo + qxoff[c]));
+                    if constexpr (I4DOT) {
+                        xq[c].x = *(const int *) (qxcol[c] + (qxo + qxoff[c]));
+                    } else {
+                        xq[c] = *(const int2 *) (qxcol[c] + (qxo + qxoff[c]));
+                    }
                 }
                 const int grp = sb * (GQH_SUPERBLOCK / GQH_PER_LANE) + lane;
                 if constexpr (XSSHARED) {
@@ -2098,7 +2124,7 @@ static __global__ void gqh_matvec_kernel(
                     d_cover[r] = wire[r].d;
                 } else {
                     const uint8_t d_raw = wire[r].d;
-                    d_real[r] = gqh_d_real_uni<UNIFORM_ADDR, I8DOT>(d_raw, t_scale);
+                    d_real[r] = gqh_d_real_uni<UNIFORM_ADDR, I8DOT || I4DOT>(d_raw, t_scale);
                 }
                 codes[r] = wire[r].codes;
                 rb[r]    = wire[r].rb;
@@ -2145,13 +2171,13 @@ static __global__ void gqh_matvec_kernel(
             // codegen -- they are this file's only instrument on the paths the scoring rig
             // does not execute, and LSR made a different (already-good) choice there.
             const uint32_t sbn_off_raw = (uint32_t) sbn * (uint32_t) sb_bytes;
-            const uint32_t sbn_off = I8DOT
+            const uint32_t sbn_off = (I8DOT || I4DOT)
                 ? (uint32_t) gqh_uniform((int) sbn_off_raw) : sbn_off_raw;
             // The 2-deep arm prefetches sb+2, clamped the same way -- the last two trips
             // re-read the final superblock (an L2 hit) rather than splitting the body.
             const int sbn2 = sb + 2 < nsb ? sb + 2 : nsb - 1;
             const uint32_t sbn2_off_raw = (uint32_t) sbn2 * (uint32_t) sb_bytes;
-            const uint32_t sbn2_off = I8DOT
+            const uint32_t sbn2_off = (I8DOT || I4DOT)
                 ? (uint32_t) gqh_uniform((int) sbn2_off_raw) : sbn2_off_raw;
             // Every row's wire load is issued here, in one group, so the wave holds ROWS
             // independent DRAM requests in flight instead of one. That is the whole point
@@ -2203,7 +2229,7 @@ static __global__ void gqh_matvec_kernel(
             if constexpr (COVER) {
     #pragma unroll
                 for (int r = 0; r < ROWS; ++r) {
-                    d_real[r] = gqh_d_real_uni<UNIFORM_ADDR, I8DOT>(d_cover[r], t_scale);
+                    d_real[r] = gqh_d_real_uni<UNIFORM_ADDR, I8DOT || I4DOT>(d_cover[r], t_scale);
                 }
             }
 
@@ -2228,7 +2254,23 @@ static __global__ void gqh_matvec_kernel(
                 // activation group's scale (which already carries both /127s), so the
                 // eight `level * s_b` muls the f32 arm pays per row per superblock are
                 // gone and the per-row scale chain grows by exactly one v_mul.
-                if constexpr (I8DOT && XSHARED) {
+                if constexpr ((I8DOT || I4DOT) && XSHARED) {
+                    if constexpr (I4DOT) {
+                        uint32_t wq = 0;
+#pragma unroll
+                        for (int d = 0; d < 4; ++d) {
+                            const int idx = gqh_pair_lut<RUNG>::index(codes[r], hi1[r], d);
+                            wq |= (uint32_t) (s_q8[idx] & 0xff) << (8 * d);
+                        }
+                        const float s_row = s_b * (XSSHARED ? xq_scale[0] : 1.0f);
+#pragma unroll
+                        for (int c = 0; c < NCOLS_MAX; ++c) {
+                            const int dot = __builtin_amdgcn_sudot8(true, (int) wq, true, xq[c].x, 0, false);
+                            const float s = XSSHARED ? s_row : (s_b * xq_scale[c]);
+                            acc[r][c] += s * (float) dot;
+                        }
+                        continue;
+                    }
                     int wq[2];
     #pragma unroll
                     for (int d = 0; d < 2; ++d) {
@@ -3085,6 +3127,10 @@ static int gqh_pairlut_mode() {
 // the closed v_dot2 experiment and only applies when I8DOT is explicitly 0.
 static int gqh_n8_dot_mode() {
     static const int mode = []() {
+        const char * i4 = getenv("GGML_GQH_I4DOT");
+        if (i4 && atoi(i4) != 0) {
+            return 3;
+        }
         const char * i8 = getenv("GGML_GQH_I8DOT");
         if (i8) {
             return atoi(i8) != 0 ? 2 : 0;
@@ -3132,7 +3178,7 @@ struct gqh_qx_view {
 
 static gqh_qx_view gqh_quant_x(
         cudaStream_t stream, const float * x, int in, int ncols,
-        int64_t x_col_stride, bool shared) {
+        int64_t x_col_stride, bool shared, bool i4 = false) {
     // ncols == 8 is baked into the kernel's lane -> (group, column) split (`tid & 7`),
     // which is what makes the shared-scale reduction three intra-wave xors. The only
     // caller is the NCOLS == 8 branch of gqh_exact_dispatch; this keeps that contract
@@ -3164,11 +3210,21 @@ static gqh_qx_view gqh_quant_x(
     constexpr int threads = 256;
     const int blocks = (ngroups * ncols + threads - 1) / threads;
     if (shared) {
-        gqh_quant_x_kernel<true><<<blocks, threads, 0, stream>>>(
-            x, ngroups, x_col_stride, q, s, in);
+        if (i4) {
+            gqh_quant_x_kernel<true, true><<<blocks, threads, 0, stream>>>(
+                x, ngroups, x_col_stride, q, s, in);
+        } else {
+            gqh_quant_x_kernel<true><<<blocks, threads, 0, stream>>>(
+                x, ngroups, x_col_stride, q, s, in);
+        }
     } else {
-        gqh_quant_x_kernel<false><<<blocks, threads, 0, stream>>>(
-            x, ngroups, x_col_stride, q, s, in);
+        if (i4) {
+            gqh_quant_x_kernel<false, true><<<blocks, threads, 0, stream>>>(
+                x, ngroups, x_col_stride, q, s, in);
+        } else {
+            gqh_quant_x_kernel<false><<<blocks, threads, 0, stream>>>(
+                x, ngroups, x_col_stride, q, s, in);
+        }
     }
     return { q, s };
 }
@@ -3445,28 +3501,29 @@ static int gqh_n8_rows(int out, bool paired, bool i8) {
 // same tensor twice (as they always did) and get a grid.y == 1 launch; PAIRED gets
 // grid.y == 2 and blockIdx.y selects gate vs up inside the kernel.
 template <ggml_type RUNG, int NCOLS, int ROWS, bool PAIRED, bool PAIRLUT = false,
-          bool F16DOT = false, bool I8DOT = false, bool XSSHARED = true>
+          bool F16DOT = false, bool I8DOT = false, bool XSSHARED = true,
+          bool I4DOT = false>
 static void gqh_exact_launch(
         cudaStream_t stream,
         const uint8_t * a, float * ya, const uint8_t * b, float * yb,
         const float * x, int in, int out,
         float scale_a, gqh_grid16 grid_a, float scale_b, gqh_grid16 grid_b,
         int64_t x_col_stride, int64_t y_col_stride, gqh_qx_view qxv = {}) {
-    const int warps = gqh_verify_warps(NCOLS, PAIRED ? 2 * out : out, I8DOT);
+    const int warps = gqh_verify_warps(NCOLS, PAIRED ? 2 * out : out, I8DOT || I4DOT);
     const int rows_per_block = warps * ROWS;
     const dim3 threads(GQH_WARP * warps, 1, 1);
     const dim3 blocks((out + rows_per_block - 1) / rows_per_block, PAIRED ? 2 : 1, 1);
     const int nsb_spec = gqh_knsb_nsb<NCOLS>(in);
     if (nsb_spec == 20) {
-        gqh_matvec_kernel<RUNG, NCOLS, ROWS, PAIRED, 20, PAIRLUT, F16DOT, I8DOT, XSSHARED><<<blocks, threads, 0, stream>>>(
+        gqh_matvec_kernel<RUNG, NCOLS, ROWS, PAIRED, 20, PAIRLUT, F16DOT, I8DOT, XSSHARED, I4DOT><<<blocks, threads, 0, stream>>>(
             a, x, ya, in, out, NCOLS, scale_a, grid_a,
             x_col_stride, y_col_stride, b, yb, scale_b, grid_b, qxv.q, qxv.s);
     } else if (nsb_spec == 68) {
-        gqh_matvec_kernel<RUNG, NCOLS, ROWS, PAIRED, 68, PAIRLUT, F16DOT, I8DOT, XSSHARED><<<blocks, threads, 0, stream>>>(
+        gqh_matvec_kernel<RUNG, NCOLS, ROWS, PAIRED, 68, PAIRLUT, F16DOT, I8DOT, XSSHARED, I4DOT><<<blocks, threads, 0, stream>>>(
             a, x, ya, in, out, NCOLS, scale_a, grid_a,
             x_col_stride, y_col_stride, b, yb, scale_b, grid_b, qxv.q, qxv.s);
     } else {
-        gqh_matvec_kernel<RUNG, NCOLS, ROWS, PAIRED, 0, PAIRLUT, F16DOT, I8DOT, XSSHARED><<<blocks, threads, 0, stream>>>(
+        gqh_matvec_kernel<RUNG, NCOLS, ROWS, PAIRED, 0, PAIRLUT, F16DOT, I8DOT, XSSHARED, I4DOT><<<blocks, threads, 0, stream>>>(
             a, x, ya, in, out, NCOLS, scale_a, grid_a,
             x_col_stride, y_col_stride, b, yb, scale_b, grid_b, qxv.q, qxv.s);
     }
@@ -3482,9 +3539,10 @@ static void gqh_n8_launch(
         const float * x, int in, int out,
         float scale_a, gqh_grid16 grid_a, float scale_b, gqh_grid16 grid_b,
         int64_t x_col_stride, int64_t y_col_stride, gqh_qx_view qxv = {}) {
-    // dot: 0=f32, 1=f16 v_dot2, 2=i8 dp4a. Never instantiate f16&&i8.
+    // dot: 0=f32, 1=f16 v_dot2, 2=i8 dp4a, 3=i4 dot8.
     const bool f16 = dot == 1;
     const bool i8  = dot == 2;
+    const bool i4  = dot == 3;
     // The i8 arm carries its OWN level table, so PAIRLUT is dead for it and only the
     // x-scale layout forks -- two instantiations, not four.
     if (i8) {
@@ -3497,6 +3555,12 @@ static void gqh_n8_launch(
                 stream, a, ya, b, yb, x, in, out, scale_a, grid_a, scale_b, grid_b,
                 x_col_stride, y_col_stride, qxv);
         }
+        return;
+    }
+    if (i4) {
+        gqh_exact_launch<RUNG, NCOLS, ROWS, PAIRED, true, false, false, true, true>(
+            stream, a, ya, b, yb, x, in, out, scale_a, grid_a, scale_b, grid_b,
+            x_col_stride, y_col_stride, qxv);
         return;
     }
     if (lut) {
@@ -3542,13 +3606,16 @@ static void gqh_exact_dispatch(
         }
         const bool lut = gqh_pairlut_on<RUNG>();
         int  dot = gqh_n8_dot_mode();
+        if (dot == 3 && RUNG != GGML_TYPE_GQH3) {
+            dot = 2;
+        }
         // The int8 arm's one pre-pass, ahead of the matvec on the same stream, shared by
         // both halves of a PAIRED dispatch (gate and up read the same x). Below the shape
         // floor the extra launch costs more than the arm saves, so the dispatch falls
         // back to the f32 instantiation -- which is compiled either way.
         gqh_qx_view qxv;
         if (dot == 2) {
-            if (gqh_i8_shape_ok(in, PAIRED ? 2 * out : out)) {
+            if (gqh_i8_shape_ok(in, PAIRED ? 2 * out : out) || getenv("GGML_GQH_I8_FORCE")) {
                 // Read-and-clear FIRST, unconditionally: the memo's safety comes from
                 // living exactly one ncols == 8 GQH dispatch (see gqh_qx_memo), so it
                 // has to be cleared even on a miss and even on the fallback below.
@@ -3561,13 +3628,19 @@ static void gqh_exact_dispatch(
                 gqh_qx_memo_take(x, in, NCOLS, x_col_stride, gqh_i8_xscale_shared());
                 dot = 0;
             }
+        } else if (dot == 3) {
+            // Explicit probe mode bypasses the production i8 profitability floor so
+            // the small reference vectors exercise the real dot8 kernel.
+            qxv = gqh_quant_x(stream, x, in, NCOLS, x_col_stride,
+                              gqh_i8_xscale_shared(), true);
+            gqh_qx_memo_take(x, in, NCOLS, x_col_stride, gqh_i8_xscale_shared());
         } else {
             gqh_qx_memo_take(x, in, NCOLS, x_col_stride, gqh_i8_xscale_shared());
         }
         // `dot == 2` after the shape-floor check above, so a dispatch that fell back to
         // the f32 instantiation also falls back to the f32 ROWS rule -- the two choices
         // have to agree, since it is the int8 arm's register footprint that wants R == 4.
-        switch (gqh_n8_rows(out, PAIRED, dot == 2)) {
+        switch (gqh_n8_rows(out, PAIRED, dot == 2 || dot == 3)) {
             case 3:
                 gqh_n8_launch<RUNG, NCOLS, 3, PAIRED>(
                     lut, dot, stream, a, ya, b, yb, x, in, out, scale_a, grid_a, scale_b,

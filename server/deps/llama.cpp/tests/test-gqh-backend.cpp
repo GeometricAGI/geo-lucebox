@@ -32,6 +32,8 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -128,7 +130,7 @@ int main(int argc, char ** argv) {
         return 77;
     }
 
-    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + 2 * ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     const int nvec = argc == 7 ? atoi(argv[6]) : 8; // must be <= the fused hook's column cap
     const bool has_fused = true;
@@ -183,6 +185,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (const char * e = getenv("GQH_BENCH_ITERS")) {
+        const int iters = atoi(e);
+        ggml_cgraph * gf_bench = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf_bench, D2);
+        ggml_backend_synchronize(backend);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            if (ggml_backend_graph_compute(backend, gf_bench) != GGML_STATUS_SUCCESS) return 1;
+        }
+        ggml_backend_synchronize(backend);
+        const auto us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t0).count() / iters;
+        fprintf(stderr, "GQH bench %.3f us/graph (%d iterations)\n", us, iters);
+    }
+
     std::vector<float> got(n_elem);
     std::vector<float> got2((size_t) rows * nvec);
     ggml_backend_tensor_get(D,  got.data(),  0, got.size()  * sizeof(float));
@@ -221,11 +238,16 @@ int main(int argc, char ** argv) {
     auto norm = [](float v) { return v == 0.0f ? 0.0f : v; };
 
     size_t bad2 = 0;
+    double fused_err2 = 0.0;
+    double fused_ref2 = 0.0;
     if (has_fused) {
         for (int i = 0; i < rows; ++i) {
             for (int j = 0; j < nvec; ++j) {
                 const float g = norm(got2[(size_t) j * rows + i]);
                 const float w = norm(want[(size_t) i * cols + j]);
+                const double e = (double) g - w;
+                fused_err2 += e * e;
+                fused_ref2 += (double) w * w;
                 if (memcmp(&g, &w, 4) != 0) {
                     if (bad2 < 5) {
                         fprintf(stderr, "  fused mismatch at [%d,%d]: got %a want %a\n", i, j, g, w);
@@ -234,6 +256,18 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+    }
+
+    const bool expect_i4 = getenv("GGML_GQH_I4DOT") && atoi(getenv("GGML_GQH_I4DOT")) != 0;
+    if (expect_i4) {
+        const double rel_rms = fused_ref2 > 0.0 ? sqrt(fused_err2 / fused_ref2) : 0.0;
+        if (rung != "gqh3" || rel_rms < 0.03 || rel_rms > 0.20) {
+            fprintf(stderr, "i4 fused relative RMS %.6f outside GQH3 probe band [0.03, 0.20]\n", rel_rms);
+            return 1;
+        }
+        printf("OK   %s i4 probe: fused relative RMS %.6f over %d one-hot columns\n",
+               rung.c_str(), rel_rms, nvec);
+        return 0;
     }
 
     if (bad || bad2) {
