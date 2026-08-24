@@ -139,6 +139,13 @@ public:
                               uint32_t token_count,
                               bool only_first_last_slots = false);
 
+    // Reverse the most recent `token_count` appended rows. Pages made
+    // invisible by the rewind stay owned as private reservations, so the
+    // same append receives the same physical rows on retry. On failure the
+    // sequence is unchanged.
+    PagedKvStatus rollback_append(PagedKvSequenceHandle handle,
+                                  uint32_t token_count);
+
     // Return the sequence's blocks and slot to the pool; the handle (and
     // any copy of it) becomes stale.
     PagedKvStatus release(PagedKvSequenceHandle handle);

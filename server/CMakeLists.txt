@@ -464,6 +464,7 @@ add_library(dflash_common STATIC
     src/common/domino_head.cpp
     src/common/dspark_head.cpp
     src/common/dflash2_head.cpp
+    src/common/dflash2_batch.cpp
     src/common/target_shard_ipc.cpp
     src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
@@ -473,6 +474,7 @@ add_library(dflash_common STATIC
     src/common/pflash_drafter_ipc.cpp
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
+    src/common/draft_swa.cpp
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
     src/qwen35/concurrency/qwen35_slot_manager.cpp
@@ -1553,6 +1555,52 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_seq_engine_contract)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ddtree_path.cpp")
+        # Pure host-side accepted-path/pending-token contract tests.
+        add_executable(test_ddtree_path
+            test/test_ddtree_path.cpp
+            src/common/ddtree.cpp)
+        target_include_directories(test_ddtree_path PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_ddtree_path)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_chain_spec_shapes.cpp")
+        # Pure host-side DFlash2 chain topology and mixed-launch arithmetic.
+        add_executable(test_chain_spec_shapes
+            test/test_chain_spec_shapes.cpp
+            src/common/ddtree.cpp)
+        target_include_directories(test_chain_spec_shapes PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_chain_spec_shapes)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash2_selector_validation.cpp")
+        # Pure host-side selector metadata/layout validation: no GPU.
+        add_executable(test_dflash2_selector_validation
+            test/test_dflash2_selector_validation.cpp)
+        target_include_directories(test_dflash2_selector_validation PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_dflash2_selector_validation)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_swa.cpp")
+        # Pure host-side draft SWA metadata/override policy tests.
+        add_executable(test_draft_swa test/test_draft_swa.cpp)
+        target_include_directories(test_draft_swa PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_draft_swa PRIVATE dflash_common)
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip") AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_swa_multilane.cpp")
+        # Opt-in real-model proof for post-window lane masks and packed draft parity.
+        add_executable(test_draft_swa_multilane test/test_draft_swa_multilane.cpp)
+        target_include_directories(test_draft_swa_multilane PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_draft_swa_multilane PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_draft_swa_multilane)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
         # Pure-host tests for model-neutral token-budget/FIFO planning.
         add_executable(test_seq_batch_plan test/test_seq_batch_plan.cpp)
@@ -1961,6 +2009,7 @@ if(DFLASH27B_TESTS)
         test_model_smoke)
     set(_new_cppunit_test_targets
         test_platform_compat
+        test_draft_swa
         test_feature_gate
         test_qwen35_split_tree_guard
         test_recurrent_snapshot
@@ -2128,6 +2177,23 @@ if(DFLASH27B_TESTS)
         add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
         if(TARGET check)
             add_dependencies(check test_batched_gdn)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gdn_transition_journal.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_gdn_transition_journal
+            test/test_gdn_transition_journal.cpp)
+        add_test(NAME gdn_transition_journal COMMAND test_gdn_transition_journal)
+        add_test(
+            NAME gdn_transition_journal_gallocr
+            COMMAND test_gdn_transition_journal --gallocr-only)
+        add_test(
+            NAME gdn_transition_journal_preflight
+            COMMAND test_gdn_transition_journal --preflight-only)
+        if(TARGET check)
+            add_dependencies(check test_gdn_transition_journal)
         endif()
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR

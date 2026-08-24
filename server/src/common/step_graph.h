@@ -20,6 +20,8 @@ struct StepGraph {
     ggml_context *  ctx = nullptr;
     ggml_cgraph *   gf  = nullptr;
     ggml_gallocr_t  alloc = nullptr;
+    ggml_context * commit_ctx = nullptr;
+    ggml_backend_buffer_t commit_buffer = nullptr;
 
     // Persistent metadata arena for the draft graph. Reusing the same arena
     // across rebuilds keeps every ggml_tensor at a stable address, which is
@@ -36,6 +38,7 @@ struct StepGraph {
     ggml_tensor *   positions = nullptr;
     ggml_tensor *   attn_mask = nullptr;     // may be null
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
+    ggml_tensor *   tree_sizes = nullptr;    // DDTree [n_tree_seqs], 0 = padding
     // SpecLA topology masks ([n_tokens, n_tokens] f32, host-filled; see
     // delta_net_specla.h). Created only when DFLASH_SPECLA capture is active.
     ggml_tensor *   specla_m_strict = nullptr;
@@ -61,11 +64,21 @@ struct StepGraph {
     // state_slot_ids has the same shape but maps padding to a safe readable
     // slot for graph-level conv-state gathers.
     ggml_tensor *   active_slot_ids = nullptr;
+    // Recurrent gather rows. Unlike active/paged IDs, padding must name a
+    // valid harmless slot (normally 0): ggml_get_rows does not mask -1.
     ggml_tensor *   state_slot_ids = nullptr;
     // Ragged paged read (concurrent prefill): per-row block-table column and
     // inclusive causal position, [n_tokens] i32 each. Padding rows carry -1.
     ggml_tensor *   paged_query_seq_ids = nullptr;
     ggml_tensor *   paged_query_positions = nullptr;
+    // DFlash target-feature destination rows. Multi-slot replay maps each
+    // token to its slot-local ring; padding maps to the cache's dead row.
+    ggml_tensor *   target_feat_rows = nullptr;
+    // Packed-tree direct-commit metadata uploaded after posterior selection.
+    ggml_tensor *   accepted_prefixes = nullptr;   // [n_tree_seqs] i32
+    ggml_tensor *   commit_slot_ids = nullptr;      // [n_tree_seqs] i32
+    ggml_tensor *   commit_rows = nullptr;         // [tree_width,n_tree_seqs] i64
+    ggml_tensor *   feature_commit_rows = nullptr; // [n_tokens] i32
     // Multi-prompt steps: i32 row indices gathered from the final norm
     // before the LM head (committing rows + decode rows).
     ggml_tensor *   logits_row_indices = nullptr;
@@ -83,12 +96,18 @@ struct StepGraph {
 
     // Per-delta-net-layer captures (verify only).
     std::vector<DeltaNetCapture> delta_captures;
+    ggml_tensor * tree_features = nullptr;
     std::vector<ggml_tensor *> moe_selected;
 };
 
 // Reset the per-call graph state (ctx + graph + tensor handles) but KEEP the
 // persistent CUDA buffer in `sg.alloc` alive across steps.
 inline void step_graph_free(StepGraph & sg) {
+    if (sg.commit_buffer) {
+        ggml_backend_buffer_free(sg.commit_buffer);
+        sg.commit_buffer = nullptr;
+    }
+    if (sg.commit_ctx) { ggml_free(sg.commit_ctx); sg.commit_ctx = nullptr; }
     if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
     sg.gf = nullptr;
     sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
@@ -98,6 +117,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.built_view = false;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
+    sg.tree_sizes = nullptr;
     sg.specla_m_strict = sg.specla_m_incl = sg.specla_m_eye = nullptr;
     sg.specla_hld = nullptr;
     sg.kv_write_rows = nullptr;
@@ -105,6 +125,11 @@ inline void step_graph_free(StepGraph & sg) {
     sg.state_slot_ids = nullptr;
     sg.paged_query_seq_ids = nullptr;
     sg.paged_query_positions = nullptr;
+    sg.target_feat_rows = nullptr;
+    sg.accepted_prefixes = nullptr;
+    sg.commit_slot_ids = nullptr;
+    sg.commit_rows = nullptr;
+    sg.feature_commit_rows = nullptr;
     sg.logits_row_indices = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
@@ -116,6 +141,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.hot_local_lut = nullptr;
     sg.valid_lut = nullptr;
     sg.delta_captures.clear();
+    sg.tree_features = nullptr;
     sg.moe_selected.clear();
 }
 

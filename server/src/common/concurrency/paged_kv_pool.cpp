@@ -169,6 +169,26 @@ PagedKvAppendResult PagedKvPool::append(PagedKvSequenceHandle handle,
     return result;
 }
 
+PagedKvStatus PagedKvPool::rollback_append(
+        PagedKvSequenceHandle handle, uint32_t token_count) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    SequenceState & sequence = sequences_[handle.slot];
+    if (token_count > sequence.kv_seq_len) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    const uint32_t restored_length = sequence.kv_seq_len - token_count;
+    const uint32_t restored_blocks = blocks_for_tokens(restored_length);
+    while (sequence.block_table.size() > restored_blocks) {
+        const uint32_t block = sequence.block_table.back();
+        sequence.block_table.pop_back();
+        give_back(sequence.reserved_blocks, block);
+    }
+    sequence.kv_seq_len = restored_length;
+    return PagedKvStatus::Ok;
+}
+
 PagedKvStatus PagedKvPool::release(PagedKvSequenceHandle handle) {
     const PagedKvStatus status = validate(handle);
     if (status != PagedKvStatus::Ok) return status;

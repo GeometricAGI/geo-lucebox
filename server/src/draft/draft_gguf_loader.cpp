@@ -26,6 +26,8 @@
 //   blk.<i>.ffn_down.weight                 [hidden, intermediate]  Q8_0 / F16
 
 #include "internal.h"
+#include "common/dflash2_selector_validation.h"
+#include "common/draft_swa.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
@@ -59,6 +61,12 @@ int count_swa_layers(const DraftWeights & w) {
         if (layer.is_swa) n_swa++;
     }
     return n_swa;
+}
+
+uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0) return fallback;
+    return gguf_get_val_u32(g, id);
 }
 
 int count_attn_gate_layers(const DraftWeights & w) {
@@ -622,6 +630,25 @@ bool load_draft_gguf(const std::string & path,
                 ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
                 return false;
             }
+            DFlash2SelectorLayout selector_layout;
+            selector_layout.rank = out.selector.rank;
+            selector_layout.top_k = out.selector.top_k;
+            selector_layout.hproj_rank = out.selector.hproj->ne[1];
+            selector_layout.pred_rank = out.selector.pred_cb->ne[0];
+            selector_layout.pred_vocab = out.selector.pred_cb->ne[1];
+            selector_layout.succ_rank = out.selector.succ_cb->ne[0];
+            selector_layout.succ_vocab = out.selector.succ_cb->ne[1];
+            selector_layout.target_output_vocab =
+                target && target->output ? target->output->ne[1] : 0;
+            selector_layout.target_declared_vocab =
+                target ? target->n_vocab : 0;
+            std::string selector_error;
+            if (!validate_dflash2_selector_layout(
+                    selector_layout, selector_error)) {
+                set_last_error("draft GGUF: " + selector_error);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
             out.selector.enabled = true;
             std::fprintf(stderr, "[draft GGUF] DFlash 2 selector enabled: rank=%d top_k=%d vocab=%lld\n",
                          out.selector.rank, out.selector.top_k, (long long)out.selector.pred_cb->ne[1]);
@@ -631,6 +658,7 @@ bool load_draft_gguf(const std::string & path,
     // GGUF Qwen3.6 drafters carry SWA metadata emitted by the converter:
     //   dflash-draft.attention.sliding_window = 2048
     //   dflash-draft.attention.sliding_window_pattern = [true,true,true,true,false]
+    out.swa_pattern_loaded = false;
     out.swa_window = (int)read_u32("attention.sliding_window", 0);
     std::snprintf(key, sizeof(key), "%s.%s", A, "attention.sliding_window_pattern");
     int64_t swp_id = gguf_find_key(gctx, key);
@@ -638,14 +666,16 @@ bool load_draft_gguf(const std::string & path,
         gguf_get_arr_type(gctx, swp_id) == GGUF_TYPE_BOOL) {
         const size_t n = gguf_get_arr_n(gctx, swp_id);
         const bool * pattern = static_cast<const bool *>(gguf_get_arr_data(gctx, swp_id));
+        out.swa_pattern_loaded = true;
         for (size_t il = 0; il < n && il < out.layers.size(); il++) {
             out.layers[il].is_swa = pattern[il];
         }
     }
-    const int n_swa = count_swa_layers(out);
-    if (n_swa > 0) {
+    const DraftSwaOverrideResult swa =
+        apply_draft_swa_window_override(out, 0);
+    if (swa.swa_layers > 0) {
         std::fprintf(stderr, "[draft GGUF] SWA layers: %d/%d (window=%d)\n",
-                     n_swa, out.n_layer, out.swa_window);
+                     swa.swa_layers, swa.total_layers, swa.effective_window);
     }
     const bool meta_context_kv_layer_norm =
         read_u32("dflash.context_kv_layer_norm", 0) != 0;

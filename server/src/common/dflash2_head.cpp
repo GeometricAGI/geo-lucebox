@@ -1,5 +1,6 @@
 #include "dflash2_head.h"
 
+#include "dflash2_selector_validation.h"
 #include "ggml-alloc.h"
 
 #include <algorithm>
@@ -80,6 +81,21 @@ bool dflash2_score_candidates(const DraftWeights & dw,
     const int K      = sel.top_k;
     const int n_cand = q_len - 1;
     if (hdim <= 0 || rank <= 0 || K <= 0) return false;
+    DFlash2SelectorLayout selector_layout;
+    selector_layout.rank = rank;
+    selector_layout.top_k = K;
+    selector_layout.hproj_rank = sel.hproj->ne[1];
+    selector_layout.pred_rank = sel.pred_cb->ne[0];
+    selector_layout.pred_vocab = sel.pred_cb->ne[1];
+    selector_layout.succ_rank = sel.succ_cb->ne[0];
+    selector_layout.succ_vocab = sel.succ_cb->ne[1];
+    std::string selector_error;
+    if (!validate_dflash2_selector_layout(
+            selector_layout, selector_error)) {
+        std::fprintf(stderr, "dflash2_score_candidates: %s\n",
+                     selector_error.c_str());
+        return false;
+    }
 
     // 1. Top-k candidates (log-probs) per block position through the target
     //    lm_head. Position 0 of local_hidden is the seed slot; candidates are

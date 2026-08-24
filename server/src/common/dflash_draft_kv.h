@@ -99,4 +99,33 @@ bool draft_kv_begin_step(DraftKvState & st,
                          const DraftFeatureMirror & ring,
                          int committed);
 
+struct DraftKvBatchGraph {
+    DraftKvBatchGraph() = default;
+    DraftKvBatchGraph(const DraftKvBatchGraph &) = delete;
+    DraftKvBatchGraph & operator=(const DraftKvBatchGraph &) = delete;
+
+    int n_lanes = 0;
+    int q_len = 0;
+    const void * built_for = nullptr;
+    std::vector<DraftKvState *> lane_states;
+
+    std::vector<uint8_t> meta_arena;
+    ggml_context * g_ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    std::vector<ggml_tensor *> hidden_by_lane;
+};
+
+void draft_kv_batch_free(DraftKvBatchGraph & batch);
+
+// All lane states must already have draft_kv_begin_step() inputs and
+// inp_embed uploaded. The packed graph computes the shared backbone and
+// returns one host-visible hidden-state block per lane.
+bool draft_kv_batch_compute(
+    DraftKvBatchGraph & batch,
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    const std::vector<DraftKvState *> & lane_states,
+    std::vector<std::vector<float>> & hidden_by_lane);
+
 }  // namespace dflash::common
