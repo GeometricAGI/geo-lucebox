@@ -11,6 +11,7 @@
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
 #include "gemma4_layer_split_adapter.h"
+#include "muse_backend.h"
 #include "deepseek4_backend.h"
 #include "deepseek4_layer_split_adapter.h"
 #include "layer_split_backend.h"
@@ -96,6 +97,7 @@ DFLASH_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterCon
 DFLASH_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 DFLASH_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
+DFLASH_CHECK_ARCH("muse-glimmer", MuseBackendConfig,   NoLayerSplitConfig);
 
 // These sit outside the bundle because the field-presence trait cannot
 // separate qwen35 from qwen35moe: they share Qwen35Config, while the factory
@@ -407,6 +409,29 @@ std::unique_ptr<ModelBackend> create_backend(
         auto backend = std::make_unique<Gemma4Backend>(gcfg);
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Gemma4Backend init failed\n");
+            return nullptr;
+        }
+        return backend;
+
+    } else if (arch == "muse-glimmer") {
+        if (args.device.is_layer_split()) {
+            std::fprintf(stderr, "[backend_factory] muse-glimmer has no "
+                         "layer-split adapter yet; run it on one device\n");
+            return nullptr;
+        }
+        MuseBackendConfig mcfg;
+        mcfg.model_path = args.model_path;
+        mcfg.device     = args.device;
+        mcfg.stream_fd  = args.stream_fd;
+        mcfg.chunk      = args.chunk;
+        mcfg.fa_window  = args.fa_window;
+        mcfg.draft_path = args.draft_path;
+        mcfg.draft_gpu  = args.draft_device.gpu;
+        if (args.draft_ctx_max > 0) mcfg.draft_ctx_max = args.draft_ctx_max;
+
+        auto backend = std::make_unique<MuseBackend>(mcfg);
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] MuseBackend init failed\n");
             return nullptr;
         }
         return backend;

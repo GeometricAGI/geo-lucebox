@@ -77,7 +77,8 @@ namespace dflash::common {
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
-    ToolMemory & tool_memory);
+    ToolMemory & tool_memory,
+    ChatFormat chat_format);
 }
 
 namespace {
@@ -610,7 +611,10 @@ TEST_CASE(ServerUnitFixture, test_tool_syntax_scanner_declared_name_guards) {
 
     json invalid = edit_tools();
     invalid[0]["function"]["name"] = std::string(65, 'x');
-    TEST_ASSERT(tool_syntax_holdback(invalid) == 15);
+    // An over-long name is not a declared tool, so the holdback falls back to
+    // the longest fixed opener: `<atem:function_calls>` (20). Was 15 when
+    // `<parameter name=` was the longest.
+    TEST_ASSERT(tool_syntax_holdback(invalid) == 20);
     pos = std::string::npos;
     TEST_ASSERT(!find_tool_syntax_start("<" + std::string(65, 'x') + ">",
                                         invalid, pos));
@@ -2077,6 +2081,51 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(PrefixCache::MAX_SLOTS, tokenizer);
+    TEST_ASSERT(cache.stats().capacity == PrefixCache::MAX_CACHE_SLOTS);
+    TEST_ASSERT(PrefixCache::MAX_CACHE_SLOTS == ModelBackend::kMaxSlots - 1);
+
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_canonical_turn_matches_replay_checkpoint) {
+    TEST_ASSERT(http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 9, 4}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 9, 3, 4}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 3, 4}, 0));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 3, 4}, 4));
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen_completed_tool_turn_preserves_generation_prefix) {
+    const std::string sentinel = "__AGENT_TURN_SENTINEL__";
+    for (bool thinking : {false, true}) {
+        std::vector<ChatMessage> messages = {{"user", "inspect the repo"}};
+        const std::string generation = render_chat_template(
+            messages, ChatFormat::QWEN3, true, thinking);
+        messages.push_back({"assistant", sentinel});
+        const std::string probe = render_chat_template(
+            messages, ChatFormat::QWEN3, false, thinking);
+
+        std::string content;
+        TEST_ASSERT(http_detail::canonical_assistant_content(
+            generation, probe, sentinel, "<tool_call>x</tool_call>", content));
+        messages.back().content = content;
+        const std::string completed = render_chat_template(
+            messages, ChatFormat::QWEN3, false, thinking);
+        TEST_ASSERT(completed.compare(0, generation.size(), generation) == 0);
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());
@@ -2913,13 +2962,19 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
 TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
     ToolMemory tool_memory;
     const std::string call_id = "call_exec_001";
+    const std::string second_call_id = "call_read_002";
     const std::string raw_tool_call =
         "\n\n<function=exec_command>\n"
         "<parameter=cmd>\n"
         "git fetch origin && git status\n"
         "</parameter>\n"
+        "</function>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\n"
+        "src/main.cpp\n"
+        "</parameter>\n"
         "</function>\n";
-    tool_memory.remember({call_id}, raw_tool_call);
+    tool_memory.remember({call_id, second_call_id}, raw_tool_call);
 
     json messages = json::array({
         {
@@ -2943,15 +2998,31 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
             {"arguments", R"({"cmd":"git fetch origin && git status"})"}
         },
         {
+            {"type", "function_call"},
+            {"call_id", second_call_id},
+            {"name", "read_file"},
+            {"arguments", R"({"path":"src/main.cpp"})"}
+        },
+        {
             {"type", "function_call_output"},
             {"call_id", call_id},
             {"output", "Process exited with code 0"}
+        },
+        {
+            {"type", "function_call_output"},
+            {"call_id", second_call_id},
+            {"output", "int main() {}"}
         }
     });
 
-    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES, tool_memory);
-    TEST_ASSERT(chat_msgs.size() == 4);
-    if (chat_msgs.size() == 4) {
+      // QWEN3 (any non-ATEM format) keeps the XML tool-call rendering this test
+      // asserts on; ATEM would replay through render_tool_call_atem instead.
+      // Count is upstream's 5, not our old 4: upstream now preserves BOTH tool
+      // results rather than collapsing them, and the assertions below index [4].
+      auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES,
+                                               tool_memory, ChatFormat::QWEN3);
+      TEST_ASSERT(chat_msgs.size() == 5);
+      if (chat_msgs.size() == 5) {
         TEST_ASSERT(chat_msgs[0].role == "system");
         TEST_ASSERT(chat_msgs[0].content == "Developer rules");
         TEST_ASSERT(chat_msgs[1].role == "user");
@@ -2961,6 +3032,9 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
         TEST_ASSERT(chat_msgs[3].role == "tool");
         TEST_ASSERT(chat_msgs[3].tool_call_id == call_id);
         TEST_ASSERT(chat_msgs[3].content == "Process exited with code 0");
+        TEST_ASSERT(chat_msgs[4].role == "tool");
+        TEST_ASSERT(chat_msgs[4].tool_call_id == second_call_id);
+        TEST_ASSERT(chat_msgs[4].content == "int main() {}");
     }
 }
 
@@ -5067,12 +5141,13 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_zero_decode_no_div_by_zero) {
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
-    GenTimings t{0.012, 0.25, true, 8192, 64, 8256};
+    GenTimings t{0.012, 0.25, true, 8192, 64, 8256, true};
     json j = build_timings_json(t, /*completion_tokens=*/10);
     TEST_ASSERT(j["cache_hit"].get<bool>());
     TEST_ASSERT(j["cached_prefix_tokens"].get<int>() == 8192);
     TEST_ASSERT(j["prefilled_tokens"].get<int>() == 64);
     TEST_ASSERT(j["effective_prompt_tokens"].get<int>() == 8256);
+    TEST_ASSERT(j["agent_turn_cache_hit"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_omitted_when_null) {
@@ -5123,6 +5198,7 @@ struct EmptySpecRetryBackend : MockBackend {
         restore_calls++;
         GenerateResult result;
         result.succeed();
+        result.restored_prefix_tokens = req.force_ar_decode ? 2 : 3;
         if (req.force_ar_decode) {
             restore_saw_force_ar = true;
             result.tokens = {84};
@@ -5168,6 +5244,7 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_restore_once_
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
     TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(result.restored_prefix_tokens == 3);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
 }
@@ -5943,5 +6020,73 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_calls_param_with_literal_thin
     TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
 }
 
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_length_finish_reason_at_cap) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), false);
+    em.emit_start();
+    em.emit_token("hello world");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.finish_reason() == "length");
+    bool found_length = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"length\"") != std::string::npos) {
+            found_length = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_length);
+}
 
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_length_finish_reason_at_zero_cap) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), false);
+    em.emit_start();
+    auto chunks = em.emit_finish(0, nullptr, 0);
+    TEST_ASSERT(em.finish_reason() == "length");
+    bool found_length = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"length\"") != std::string::npos) {
+            found_length = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_length);
+}
 
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_stop_sequence_beats_length_at_cap) {
+    std::vector<std::string> stops = {"END"};
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, stops);
+    em.emit_start();
+    em.emit_token("finished END");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.stop_hit());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    bool found_stop = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"stop\"") != std::string::npos) {
+            found_stop = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_stop);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_length_finish_reason_at_cap) {
+    auto em = make_emitter(ApiFormat::ANTHROPIC, json::array(), false);
+    em.emit_start();
+    em.emit_token("hello world");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.finish_reason() == "length");
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("\"stop_reason\":\"max_tokens\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_stop_sequence_beats_length_at_cap) {
+    std::vector<std::string> stops = {"END"};
+    auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, stops);
+    em.emit_start();
+    em.emit_token("finished END");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.stop_hit());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("\"stop_reason\":\"end_turn\"") != std::string::npos);
+}

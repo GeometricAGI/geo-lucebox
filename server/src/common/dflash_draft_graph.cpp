@@ -176,7 +176,8 @@ bool build_draft_step(
             for (int q = 0; q < q_len; q++) {
                 for (int k = 0; k < ctx_len; k++)
                     mask_data[(size_t)q * kv_pad + k] = ZERO;
-                for (int j = 0; j <= q; j++)
+                const int j_hi = dw.block_bidirectional ? q_len - 1 : q;
+                for (int j = 0; j <= j_hi; j++)
                     mask_data[(size_t)q * kv_pad + (ctx_alloc + j)] = ZERO;
             }
             ggml_backend_tensor_set(sg.attn_mask, mask_data.data(), 0,
@@ -300,16 +301,19 @@ bool build_draft_step(
         const int eff_total_k = eff_ctx + q_len;
         const int kv_pad = mask_align_up(eff_total_k, MASK_KV_PAD);
 
-        // Build causal mask in F16 directly (same pattern as attn_masks.h):
+        // Build the block mask in F16 directly (same pattern as attn_masks.h):
         // Context keys (k < eff_ctx): always visible.
-        // Noise keys (k = eff_ctx + j): visible if j <= q (causal).
+        // Noise keys (k = eff_ctx + j): visible if j <= q (causal), or all of
+        // them when the drafter was trained with a bidirectional block
+        // (dw.block_bidirectional — the DFlash-paper convention).
         static constexpr uint16_t ZERO = 0x0000;
         static constexpr uint16_t NEG_INF = 0xFC00;
         std::vector<uint16_t> mask_data((size_t)kv_pad * q_len, NEG_INF);
         for (int q = 0; q < q_len; q++) {
             for (int k = 0; k < vis_ctx; k++)
                 mask_data[(size_t)q * kv_pad + k] = ZERO;
-            for (int j = 0; j <= q; j++)
+            const int j_hi = dw.block_bidirectional ? q_len - 1 : q;
+            for (int j = 0; j <= j_hi; j++)
                 mask_data[(size_t)q * kv_pad + (eff_ctx + j)] = ZERO;
         }
         ggml_backend_tensor_set(sg.attn_mask, mask_data.data(), 0,

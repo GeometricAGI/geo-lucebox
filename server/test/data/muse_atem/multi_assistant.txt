@@ -1,0 +1,7 @@
+<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.
+Knowledge cutoff: 2026-01-04.
+Current date: 2026-08-12.
+
+Reasoning strength: high.
+
+# Valid recipients: "self", "user".<|eot|><|start|>user<|message|>hi<|eot|><|start|>assistant to=user<|message|>thinking out loud<|eot|><|start|>assistant to=user<|message|>the answer<|eot|><|start|>assistant

@@ -103,6 +103,12 @@ static bool declared_tool_open_at(const std::string & text, size_t pos,
 
 bool find_tool_syntax_start(const std::string & text, const json & tools,
                             size_t & pos) {
+    // ATEM opener, so the streaming emitter buffers the block instead of
+    // shipping half a tool call as visible text.
+    {
+        const size_t at = text.find("<atem:function_calls>");
+        if (at != std::string::npos) { pos = at; return true; }
+    }
     size_t idx = text.find('<');
     while (idx != std::string::npos) {
         if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
@@ -138,11 +144,14 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
 }
 
 size_t tool_syntax_holdback(const json & tools) {
-    // Longest fixed opener is `<parameter name=` (16 bytes).
+    // Longest fixed opener is `<atem:function_calls>` (21 bytes), ahead of
+    // upstream's `<function_calls>` and `<parameter name=` (16).
+    static const char ATEM_CALLS_OPEN[] = "<atem:function_calls>";
     size_t holdback = std::max({sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2,
                                 sizeof(FUNCTION_CALLS_OPEN) - 2,
                                 sizeof(FUNCTION_CALL_OPEN) - 2,
-                                sizeof(BARE_FUNCTION_OPEN) - 2});
+                                sizeof(BARE_FUNCTION_OPEN) - 2,
+                                sizeof(ATEM_CALLS_OPEN) - 2});
     if (!tools.is_array()) return holdback;
     for (const auto & tool : tools) {
         const std::string name = declared_tool_name(tool);
@@ -851,6 +860,82 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         positioned_calls.emplace_back(start, std::move(tc));
         removals.push_back({start, end});
     };
+
+    // Pattern 0 (ATEM / muse-glimmer):
+    //   <atem:function_calls>
+    //   <atem:invoke name="fs.read_file">
+    //   <atem:parameter name="path">a.txt</atem:parameter>
+    //   </atem:invoke>
+    //   </atem:function_calls>
+    //
+    // Checked first: the wrapper is unambiguous, and its parameter bodies may
+    // contain any of the other dialects' opener strings as literal text
+    // (agentic prompts routinely pass XML and code as arguments). Claiming
+    // the span here stops a later pattern from half-consuming it.
+    //
+    // Parameter values are raw text, exactly as the chat template emits them
+    // (`<atem:parameter name="k">value</atem:parameter>` with no escaping),
+    // so they are coerced through the declared schema like every other
+    // dialect rather than parsed as JSON.
+    {
+        static const char kCallsOpen[]  = "<atem:function_calls>";
+        static const char kCallsClose[] = "</atem:function_calls>";
+        static const char kInvokeOpen[] = "<atem:invoke name=\"";
+        static const char kInvokeClose[] = "</atem:invoke>";
+        static const char kParamOpen[]  = "<atem:parameter name=\"";
+        static const char kParamClose[] = "</atem:parameter>";
+
+        size_t block = 0;
+        while ((block = text.find(kCallsOpen, block)) != std::string::npos) {
+            const size_t block_body = block + sizeof(kCallsOpen) - 1;
+            const size_t block_end = text.find(kCallsClose, block_body);
+            if (block_end == std::string::npos) break;   // still streaming
+            const size_t block_stop = block_end + sizeof(kCallsClose) - 1;
+
+            size_t inv = block_body;
+            while ((inv = text.find(kInvokeOpen, inv)) != std::string::npos &&
+                   inv < block_end) {
+                const size_t name_start = inv + sizeof(kInvokeOpen) - 1;
+                const size_t name_end = text.find('"', name_start);
+                if (name_end == std::string::npos || name_end > block_end) break;
+                const std::string fn = text.substr(name_start, name_end - name_start);
+
+                const size_t inv_close = text.find(kInvokeClose, name_end);
+                if (inv_close == std::string::npos || inv_close > block_end) break;
+
+                json args = json::object();
+                if (valid_tool_name(fn)) {
+                    const json props = find_tool_properties(tools, fn);
+                    size_t ppos = name_end;
+                    while ((ppos = text.find(kParamOpen, ppos)) != std::string::npos &&
+                           ppos < inv_close) {
+                        const size_t k_start = ppos + sizeof(kParamOpen) - 1;
+                        const size_t k_end = text.find('"', k_start);
+                        if (k_end == std::string::npos || k_end > inv_close) break;
+                        const std::string key = text.substr(k_start, k_end - k_start);
+                        const size_t v_start = text.find('>', k_end);
+                        if (v_start == std::string::npos || v_start > inv_close) break;
+                        const size_t v_end = text.find(kParamClose, v_start + 1);
+                        if (v_end == std::string::npos || v_end > inv_close) break;
+                        const std::string val =
+                            text.substr(v_start + 1, v_end - (v_start + 1));
+                        if (!key.empty()) {
+                            args[key] = convert_param_value(val, key, props);
+                        }
+                        ppos = v_end + sizeof(kParamClose) - 1;
+                    }
+                }
+
+                if (valid_tool_name(fn)) {
+                    // Span covers the whole block so the wrapper does not
+                    // survive in the visible text.
+                    add_call(fn, args, block, block_stop);
+                }
+                inv = inv_close + sizeof(kInvokeClose) - 1;
+            }
+            block = block_stop;
+        }
+    }
 
     // Pattern 8 (Laguna): <tool_call>NAME\n<arg_key>K</arg_key>\n
     // <arg_value>V</arg_value>...\n</tool_call>. Values are raw strings or

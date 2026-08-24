@@ -2594,7 +2594,9 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
         result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
         return result;
     }
-    return generate_from_state(req, io, snap_pos);
+    result = generate_from_state(req, io, snap_pos);
+    if (result.ok()) result.restored_prefix_tokens = snap_pos;
+    return result;
 }
 
 bool DeepSeek4Backend::handle_compress(const std::string & line,

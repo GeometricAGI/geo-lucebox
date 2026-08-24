@@ -79,7 +79,15 @@ private:
     int32_t eos_chat_id_ = -1;  // <|im_end|> for Qwen3
 
     // Pre-tokenizer type
-    enum class PreTokenizer { QWEN2, QWEN35 };
+    // Pre-tokenizer dialects. The difference that bites is the DIGIT rule:
+    // the qwen patterns match one digit at a time (\p{N}), while the
+    // llama3/llama4/gpt-4 family groups runs of up to three (\p{N}{1,3}).
+    // Applying the qwen rule to a llama4 vocab splits "52" into "5"+"2",
+    // which are different tokens from the ones the model was trained and
+    // benchmarked on — measured on muse-glimmer: the model read
+    // "All 52 tests passed." as "All 5 2 tests passed." and echoed it back
+    // that way, costing agentic-suite items outright.
+    enum class PreTokenizer { QWEN2, QWEN35, LLAMA_BPE };
     PreTokenizer pre_type_ = PreTokenizer::QWEN35;
 
     // Decode mode: SentencePiece tokens use UTF-8 with ▁ for space;

@@ -59,7 +59,8 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
         {"cache_hit",             t.cache_hit},
         {"cached_prefix_tokens",  t.cached_prefix_tokens},
         {"prefilled_tokens",      t.prefilled_tokens},
-        {"effective_prompt_tokens", t.effective_prompt_tokens}
+        {"effective_prompt_tokens", t.effective_prompt_tokens},
+        {"agent_turn_cache_hit",  t.agent_turn_cache_hit}
     };
 }
 
@@ -236,7 +237,31 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     emit_token_count_++;
 
     // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
-    std::string piece = utf8_sanitize(raw_piece);
+    // First re-join any incomplete multi-byte tail held back from the previous
+    // piece, then hold back a new incomplete tail (if any) so codepoints split
+    // across tokens are emitted intact instead of as U+FFFD pairs.
+    std::string joined = utf8_tail_ + raw_piece;
+    utf8_tail_.clear();
+    {
+        size_t i = joined.size();
+        int cont = 0;
+        while (i > 0 && cont < 3 &&
+               (static_cast<unsigned char>(joined[i - 1]) & 0xC0) == 0x80) {
+            --i; ++cont;
+        }
+        if (i > 0) {
+            const unsigned char lead = static_cast<unsigned char>(joined[i - 1]);
+            int need = 0;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            if (need > 0 && joined.size() - (i - 1) < static_cast<size_t>(need)) {
+                utf8_tail_ = joined.substr(i - 1);
+                joined.resize(i - 1);
+            }
+        }
+    }
+    std::string piece = utf8_sanitize(joined);
     std::vector<std::string> out;
     accumulated_raw_ += piece;
     window_ += piece;
@@ -555,8 +580,18 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 // ─── emit_finish ────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
-                                                 const GenTimings * timings) {
+                                                 const GenTimings * timings,
+                                                 int generation_cap) {
     std::vector<std::string> out;
+
+    // A tail still pending at end-of-stream is a genuinely truncated
+    // codepoint; sanitize it into the window so nothing is silently lost.
+    if (!utf8_tail_.empty()) {
+        const std::string flushed = utf8_sanitize(utf8_tail_);
+        utf8_tail_.clear();
+        accumulated_raw_ += flushed;
+        window_ += flushed;
+    }
 
     // Flush remaining window
     if (mode_ == StreamMode::REASONING && !window_.empty()) {
@@ -780,6 +815,11 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
     }
 
+    if (fr == "stop" && !stop_hit_ && generation_cap >= 0 && completion_tokens >= generation_cap) {
+        fr = "length";
+    }
+    finish_reason_ = fr;
+
     // Format-specific final events
     switch (format_) {
     case ApiFormat::OPENAI_CHAT: {
@@ -820,9 +860,10 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
         // stop_reason reflects the model's actual finish: "tool_use" when
         // any tool calls were emitted (downstream SDKs pivot on this to feed
-        // tool_result back), else "end_turn". Stop-sequence hits also report
-        // "end_turn" (Anthropic has no dedicated reason for that case).
-        const char * stop_reason = tool_calls_.empty() ? "end_turn" : "tool_use";
+        // tool_result back), else "end_turn" or "max_tokens".
+        const char * stop_reason = tool_calls_.empty()
+            ? (fr == "length" ? "max_tokens" : "end_turn")
+            : "tool_use";
         json anth_usage = {{"output_tokens", completion_tokens}};
         if (timings) {
             anth_usage["timings"] = build_timings_json(*timings, completion_tokens);
@@ -912,8 +953,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 }
 
 std::string SseEmitter::finish_reason() const {
-    if (!tool_calls_.empty()) return "tool_calls";
-    return "stop";
+    return finish_reason_;
 }
 
 }  // namespace dflash::common

@@ -46,8 +46,13 @@ namespace dflash::common {
 static ggml_tensor * draft_rope(ggml_context * ctx, ggml_tensor * t,
                                 ggml_tensor * positions,
                                 const DraftWeights & w) {
+    // w.rope_type, NOT a hardcoded NEOX: internal.h added that field precisely
+    // because hardcoding it at the call sites hid the assumption, and getting it
+    // wrong is silent — the drafter emits plausible-but-unrelated tokens and only
+    // the acceptance rate drops. Folding the call sites into this helper must not
+    // re-hide it.
     return ggml_rope_ext(ctx, t, positions, /*freq_factors=*/nullptr,
-                         w.head_dim, GGML_ROPE_TYPE_NEOX, w.rope_n_ctx_orig,
+                         w.head_dim, w.rope_type, w.rope_n_ctx_orig,
                          w.rope_theta, w.rope_freq_scale,
                          w.rope_ext_factor, w.rope_attn_factor,
                          w.rope_beta_fast, w.rope_beta_slow);
@@ -260,7 +265,9 @@ DraftGraphOutputs build_draft_graph(
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_V", il);
             ggml_set_name(V, probe_name);
 
-            // ── 2d. RoPE (NEOX, theta=10M)
+            // ── 2d. RoPE. The pairing convention is w.rope_type (NEOX for the
+            //   Qwen3-style drafters, NORMAL for the muse-glimmer one) — GGUF
+            //   carries no key for it, so the loader sets it per family.
             //   Q: positions_q  [q_len]           values [ctx_len..ctx_len+q_len-1]
             //   K: positions_k  [eff_total_k]     — for SWA, starts from ctx_offset
             ggml_tensor * pk = in.positions_k;

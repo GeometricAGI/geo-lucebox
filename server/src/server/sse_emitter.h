@@ -46,6 +46,7 @@ struct GenTimings {
     int    cached_prefix_tokens = 0;
     int    prefilled_tokens     = 0;
     int    effective_prompt_tokens = 0;
+    bool   agent_turn_cache_hit = false;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
@@ -87,7 +88,8 @@ public:
     // the pre-timings API for unit tests that don't exercise that
     // shape.
     std::vector<std::string> emit_finish(int completion_tokens,
-                                         const GenTimings * timings = nullptr);
+                                         const GenTimings * timings = nullptr,
+                                         int generation_cap = -1);
 
     // Get the finish_reason for non-streaming responses.
     std::string finish_reason() const;
@@ -97,6 +99,9 @@ public:
 
     // Get accumulated content (for non-streaming).
     const std::string & accumulated_text() const { return accumulated_content_; }
+
+    // Exact model text before structured tool-call normalization.
+    const std::string & accumulated_raw() const { return accumulated_raw_; }
 
     // Get the parsed tool calls (after emit_finish).
     const std::vector<ToolCall> & tool_calls() const { return tool_calls_; }
@@ -155,6 +160,11 @@ private:
     StreamMode   mode_;
     bool         tool_from_reasoning_ = false;
     std::string  window_;           // holdback buffer
+    // Incomplete trailing UTF-8 bytes from the previous token piece.
+    // BPE tokens can split a multi-byte codepoint (emoji arrive as two
+    // 2-byte halves); sanitizing halves independently turned every such
+    // codepoint into two U+FFFD. The tail is carried into the next piece.
+    std::string  utf8_tail_;
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;
     std::string  accumulated_content_;
@@ -183,6 +193,7 @@ private:
     bool         stop_hit_ = false;
 
     int64_t      created_at_;
+    std::string  finish_reason_ = "stop";
 
     // Responses API IDs
     std::string  msg_item_id_;

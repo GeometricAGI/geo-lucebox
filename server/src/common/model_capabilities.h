@@ -77,6 +77,14 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever, kNever, kNever},
     {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kNever, kBoth, kNever, kNever},
     {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever, kNever, kNever},
+    // muse-glimmer: dense decode with DFlash speculative decode against the
+    // vendor drafter. Monolithic for --draft because there is no layer-split
+    // adapter for this family. Every remaining option is Never because
+    // MuseBackendConfig carries no field for it — the static_asserts in
+    // backend_factory.cpp enforce that correspondence, so this row cannot
+    // drift from what the backend can actually accept. dblock is Never for the
+    // same reason (the column arrived with the GQH work, after this row).
+    {"muse-glimmer", false, false, false, false,  kMono,  kNever, kNever, kNever, kMono,  kNever, kNever},
 };
 
 inline constexpr std::size_t kArchCount =

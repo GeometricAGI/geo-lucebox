@@ -18,6 +18,7 @@
 #include "common/model_backend.h"
 #include "tokenizer.h"
 #include "chat_template.h"
+#include "atem_stream.h"
 #include "tool_memory.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
@@ -46,6 +47,7 @@
 #include <unistd.h>
 #endif
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dflash::common {
@@ -92,6 +94,8 @@ struct ServerConfig {
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
+    // Extend the existing prefix cache through generated tool-call turns.
+    bool        agent_turn_cache = false;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
     // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
@@ -248,6 +252,16 @@ float resolve_pflash_keep_ratio(float configured_ratio,
                                 const HttpServerSessions & sessions);
 bool should_clamp_flowkv_disk_cache(
     bool flowkv, const DiskPrefixCachePolicy & policy);
+bool canonical_turn_matches_checkpoint(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & completed_turn,
+    int checkpoint);
+bool canonical_assistant_content(
+    const std::string & generation_prompt,
+    const std::string & sentinel_rendered,
+    const std::string & sentinel,
+    const std::string & generated_text,
+    std::string & content);
 
 }  // namespace http_detail
 
@@ -256,6 +270,7 @@ bool should_clamp_flowkv_disk_cache(
 struct ParsedRequest {
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
+    std::string               rendered_prompt;
     int                       max_output   = 4096;
     bool                      stream       = true;
     SamplerCfg                sampler;
@@ -405,6 +420,13 @@ private:
         const GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
+    void remember_agent_turn(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache, const GenerateResult & result,
+        const SseEmitter & emitter, int completion_tokens,
+        bool visible_output_seen, bool client_disconnected,
+        bool replay_cache);
+    void forget_inline_slot_metadata(int slot);
 
     struct GenerationInputs {
         GenerateRequest request;
@@ -419,6 +441,10 @@ private:
         int completion_tokens = 0;
         bool visible_output_seen = false;
         bool client_disconnected = false;
+        // ATEM channel state for muse-glimmer. Per request: the segmenter
+        // carries the open/closed reasoning channel across tokens, so it
+        // cannot be shared or reused.
+        std::unique_ptr<AtemSegmenter> atem;
     };
 
     void prepare_generation_inputs(
@@ -481,6 +507,10 @@ private:
     bool render_and_tokenize_request(
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);
+    bool render_messages_to_text(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool add_generation_prompt,
+        std::string & rendered, std::string & error);
     bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
     void log_parsed_request(const ParsedRequest & req) const;
     void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
@@ -502,6 +532,7 @@ private:
     // Job queue.
     void enqueue(ServerJob * job);
     ServerJob * dequeue();
+    bool has_pending_jobs();
 
     // Members.
     ModelBackend &   backend_;
@@ -539,6 +570,7 @@ private:
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
+    std::unordered_set<int> agent_turn_cache_slots_;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;
