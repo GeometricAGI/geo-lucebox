@@ -230,15 +230,27 @@ Acceptance rises exactly as it should (7.22 -> 10.98, tracking IQ4_XS's
 7.57 -> 12.18), so the drafter extrapolates on our artifact too. Throughput
 still falls 2.2x the moment you leave ncols 8.
 
-The cause is register pressure, already documented in `gqh.cu` around line 620:
-at ROWS==3 the measured VGPR grid reaches 99-100 VGPRs by ncols 7 and occupancy
-drops from 16 waves/SIMD to 12. `GQH_MULTICOL_SPEC_MAX` is 12, but 9..12 use
-**ROWS==1** exact-width to dodge that cliff, which discards the row reuse that
-makes ncols 8 fast; 13..16 fall to the generic instantiation. Hence cap 12
-(63.37) is no better than cap 15 (56.40). The obvious escape was tried and
-rejected on measurement: staging N=8 activations in 8 KB LDS got GQH3 under the
-VGPR cliff but ran 94-101 tok/s against register-xshared's 104 ("do not revive
-without a smaller tile").
+**The cause is NOT register pressure**, and getting this wrong sends the fix in
+the wrong direction. `gqh.cu` around line 620 does document a VGPR wall - at
+ROWS==3 the grid reaches 99-100 VGPRs by ncols 7 and occupancy drops from 16
+waves/SIMD to 12 - but occupancy is not what limits this kernel. The geo-evo
+`gqh_mtp_multicol` run measured it directly (iteration 6): an LDS-burn probe
+drove this same arm from 16 waves/SIMD down through 10 / 7 / 6 / 5 / 3 and the
+scored shape **did not move**; it collapses only at 1 wave/SIMD. So the VGPR
+table describes occupancy, not throughput.
+
+What actually changes across the cliff is work per instruction. The ncols == 8
+arm is instruction-issue bound (its own comment says so). `GQH_MULTICOL_SPEC_MAX`
+is 12, but 9..12 use **ROWS==1** exact-width, which discards the row reuse that
+makes ncols 8 efficient, and 13..16 fall to the generic instantiation. Hence cap
+12 (63.37) is no better than cap 15 (56.40): both pay more instructions per
+useful FMA than the ROWS>1 arm at 8.
+
+For the same reason, LDS staging is aimed at the wrong constraint. It was tried
+and rejected on measurement anyway - staging N=8 activations in 8 KB LDS got
+GQH3 under the VGPR cliff but ran 94-101 tok/s against register-xshared's 104
+("do not revive without a smaller tile") - but the lesson is that it bought
+occupancy, which this kernel does not want.
 
 So widening GQH is not a config change and not a missing instantiation. It needs
 a wide-ncols path that keeps row reuse without spilling.
@@ -290,3 +302,38 @@ Caveat on all end-to-end numbers here: everything ran `--prefix-cache-slots 0`
 to keep arms comparable. Workloads with shared prefixes amortise the fixed
 prefill cost, so the production penalty is smaller than these rows - but
 cold-prefill latency is real and it is what a first request feels.
+
+## 10. Where the search runs
+
+The widening work is driven by the geo-evo kernel loop, target `gqh_wide_he`
+(geo-evo branch `geo-loop/gqh-wide-verify`). It reuses the `gqh_n8_he` adapter
+with three env overrides - `GQH_HE_BLOCK_SIZE=16`, `GQH_HE_AL_MIN=10.5`,
+`GQH_HE_GOAL_TPS=163.0` - so the narrow target is unchanged when they are unset.
+
+The AL floor is the gate that makes the search honest, and it is validated
+against real logs rather than assumed. At 10.5:
+
+    block-8  (narrow): he_tok_s = 154.19  avg_commit =  7.22  -> REJECTED
+    block-16 (wide)  : he_tok_s =  55.97  avg_commit = 10.98  -> accepted
+
+The narrow arm is 2.75x faster and is still rejected. Without that floor the
+loop's best move is to abandon wide verify, which is the thing being optimised.
+
+Two measurement disciplines carried over from the earlier `gqh_mtp_multicol`
+run on this same kernel, both learned the hard way there:
+
+* The scorer's floor is ~1.3%: one code state re-read five times gave
+  1.4705 / 1.4728 / 1.4745 / 1.4765 / 1.4895, all ISA-identical. Nothing under
+  ~2-3% is a result.
+* The bare rig drifts ~1.3% upward over about two minutes, monotonically, so
+  **interleave** build+measure (base, cand, base, ...) rather than batching, and
+  keep some benched shapes ISA-identical so those shapes measure the machine.
+
+Consequence for scheduling: the loop needs the R9700 to itself. Both candidate
+boxes are single-R9700, and a co-tenant benchmark makes every number arguable.
+Absolute tok/s is NOT portable between them - our IQ4_XS block-16 decode is
+162.8 here against upstream's published 208.1 on the same file and drafter, a
+gap that survived rebuilding with their exact flags - so a goal threshold must
+be calibrated on the box that will run the search. The 157-163 bar above is
+measured on lucebox6, which is also where every number in sections 8 and 9 was
+taken. Ratios port between boxes; thresholds do not.
