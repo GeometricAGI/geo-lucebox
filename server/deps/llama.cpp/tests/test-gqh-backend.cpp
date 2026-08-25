@@ -84,8 +84,8 @@ static std::vector<uint8_t> read_file(const char * path) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 6 && argc != 7) {
-        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> [nvec]\n", argv[0]);
+    if (argc < 6 || argc > 8) {
+        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> [nvec] [i8]\n", argv[0]);
         return 1;
     }
     const std::string rung = argv[1];
@@ -132,7 +132,15 @@ int main(int argc, char ** argv) {
 
     ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    const int nvec = argc == 7 ? atoi(argv[6]) : 8; // must be <= the fused hook's column cap
+    const int nvec = argc >= 7 ? atoi(argv[6]) : 8; // must be <= the fused hook's column cap
+    // "i8" selects the tolerances the int8 activation arm needs. The arm is NOT
+    // bit-exact: both sides carry one symmetric int8 round (weights bake to int8
+    // against a grid whose amax is exactly 1.0, activations quantise per group by
+    // 127/amax), and the two 1/127s fold into GQH_Q8_XSCALE. Reaching it from this
+    // harness also needs GGML_GQH_I8_MINWORK=0, because gqh_i8_shape_ok() floors the
+    // arm at 16 Mi of in*rows and the largest case here is 64*1024 = 64 Ki -- 256x
+    // under it. That floor, not the I8DOT knob, is why this path had no coverage.
+    const bool i8_mode = argc == 8 && std::string(argv[7]) == "i8";
     const bool has_fused = true;
 
     ggml_tensor * W  = ggml_new_tensor_2d(ctx, wtype, cols, rows);
@@ -191,6 +199,30 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(D2, got2.data(), 0, got2.size() * sizeof(float));
 
     const float * want = (const float *) ref.data();
+
+    // Single-term I8 error is bounded by the weight LUT step, which is per row:
+    // the grid amax is 1.0, so the step is max|w_row|/127. Dense error scales with
+    // the dot's own magnitude, so that pass normalises by ||w_row|| * ||x_col||
+    // rather than max(1, |ref|), which would turn a quantisation-sized absolute
+    // error on a near-zero accumulator into a meaningless "relative" number.
+    std::vector<float>  row_max(rows, 0.0f);
+    std::vector<double> row_nrm(rows, 0.0);
+    for (int i = 0; i < rows; ++i) {
+        double sq = 0.0;
+        float  mx = 0.0f;
+        for (int k = 0; k < cols; ++k) {
+            const float w = want[(size_t) i * cols + k];
+            mx = std::max(mx, std::fabs(w));
+            sq += (double) w * (double) w;
+        }
+        row_max[i] = mx;
+        row_nrm[i] = std::sqrt(sq);
+    }
+    // Single-term tolerance, and the dense relative bar. Both are inert at I8DOT=0.
+    const double I8_DENSE_REL = 2e-2;
+    auto onehot_tol = [&](int i) {
+        return i8_mode ? std::max((double) row_max[i] / 127.0, 1e-6) : 0.0;
+    };
     size_t bad = 0;
     size_t ties = 0;
     for (int i = 0; i < rows; ++i) {
@@ -257,7 +289,10 @@ int main(int argc, char ** argv) {
                     float wv = want[(size_t) i * cols + off + j];
                     if (gv == 0.0f) { gv = 0.0f; }   // normalise -0.0, as above
                     if (wv == 0.0f) { wv = 0.0f; }
-                    if (memcmp(&gv, &wv, 4) != 0) {
+                    const bool differs = i8_mode
+                        ? (std::fabs((double) gv - (double) wv) > onehot_tol(i))
+                        : (memcmp(&gv, &wv, 4) != 0);
+                    if (differs) {
                         if (bad_off < 5) {
                             fprintf(stderr, "  offset-onehot mismatch off=%d [%d,%d]: "
                                             "got %a want %a\n", off, i, j, gv, wv);
@@ -288,10 +323,20 @@ int main(int argc, char ** argv) {
                            (double) xd[(size_t) j * cols + k];
                 }
                 const double gv  = (double) g[(size_t) j * rows + i];
-                const double den = std::max(1.0, std::fabs(acc));
+                double den;
+                if (i8_mode) {
+                    double xsq = 0.0;
+                    for (int k = 0; k < cols; ++k) {
+                        const double xv = xd[(size_t) j * cols + k];
+                        xsq += xv * xv;
+                    }
+                    den = std::max(1e-12, row_nrm[i] * std::sqrt(xsq));
+                } else {
+                    den = std::max(1.0, std::fabs(acc));
+                }
                 const double rel = std::fabs(gv - acc) / den;
                 if (rel > max_rel) { max_rel = rel; }
-                if (rel > 1e-4) {
+                if (rel > (i8_mode ? I8_DENSE_REL : 1e-4)) {
                     if (bad_dense < 5) {
                         fprintf(stderr, "  dense mismatch [%d,%d]: got %.9g want %.9g "
                                         "rel %.3g\n", i, j, gv, acc, rel);
@@ -319,7 +364,10 @@ int main(int argc, char ** argv) {
             for (int j = 0; j < nvec; ++j) {
                 const float g = norm(got2[(size_t) j * rows + i]);
                 const float w = norm(want[(size_t) i * cols + j]);
-                if (memcmp(&g, &w, 4) != 0) {
+                const bool differs = i8_mode
+                    ? (std::fabs((double) g - (double) w) > onehot_tol(i))
+                    : (memcmp(&g, &w, 4) != 0);
+                if (differs) {
                     if (bad2 < 5) {
                         fprintf(stderr, "  fused mismatch at [%d,%d]: got %a want %a\n", i, j, g, w);
                     }
@@ -330,18 +378,20 @@ int main(int argc, char ** argv) {
     }
 
     if (bad || bad2 || bad_off || bad_dense) {
-        printf("FAIL %s %dx%d: dequant %zu/%zu differ, fused %zu/%d differ, "
+        printf("FAIL %s %dx%d [%s]: dequant %zu/%zu differ, fused %zu/%d differ, "
                "offset-onehot %zu differ over %d offsets, dense %zu differ "
                "(max rel %.3g)\n",
-               rung.c_str(), rows, cols, bad, n_elem, bad2, rows * nvec,
+               rung.c_str(), rows, cols, i8_mode ? "i8" : "f32",
+               bad, n_elem, bad2, rows * nvec,
                bad_off, n_off, bad_dense, max_rel);
         return 1;
     }
-    printf("OK   %s %dx%d: dequant->BLAS matches the fp16-rounded reference%s, "
-           "fused matvec bit-identical to the f32 reference over %d cols at %d "
+    printf("OK   %s %dx%d [%s]: dequant->BLAS matches the fp16-rounded reference%s, "
+           "fused matvec %s the f32 reference over %d cols at %d "
            "activation offsets, dense max rel %.3g (scale %.9g, grid %d)\n",
-           rung.c_str(), rows, cols,
+           rung.c_str(), rows, cols, i8_mode ? "i8" : "f32",
            ties ? (" apart from " + std::to_string(ties) + " exact fp16 ties").c_str() : "",
+           i8_mode ? "within the int8 bound of" : "bit-identical to",
            nvec, n_off + 1, max_rel, tensor_scale, grid_code);
     return 0;
 }
