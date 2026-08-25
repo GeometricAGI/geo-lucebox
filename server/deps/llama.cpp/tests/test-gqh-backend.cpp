@@ -35,6 +35,15 @@
 //   mmqN adds a SECOND wide multiply at ncols = N (N > 16) and requires that MMQ
 //   actually dispatched, which is what makes these cases a gate rather than a
 //   re-run of the fallback. Needs GGML_GQH_MMQ=1.
+//   gridN overrides the grid code the wire header carries, and decodes the
+//   reference on the HOST for that grid instead of reading the .decode.f32 file
+//   (ggml_get_type_traits()->to_float, the same CPU decoder test-gqh-cpu-decode
+//   checks). That is what makes the int8 range guard testable: no artifact and no
+//   vector file uses a grid wide enough to trip it.
+//   refuse says MMQ must DECLINE this grid. Then the answer has to come back
+//   BITWISE equal to the fp16-rounded reference, which only the dequant path can
+//   produce -- so a guard that failed to refuse cannot pass by accident, it comes
+//   back int8-perturbed and fails loudly. See the guard in gqh.cu.
 // exit:  0 = bit-identical, 1 = mismatch/error, 77 = skipped (no GPU)
 
 #include "ggml.h"
@@ -116,6 +125,31 @@ int main(int argc, char ** argv) {
     // gqh2_c carries no per-tensor header: fp16 scale in-block, frozen codebook.
     const bool has_header = wtype != GGML_TYPE_GQH2_C;
 
+    // Trailing tokens in any order: a bare integer is nvec, "i8" selects the int8
+    // activation arm's tolerances, "mmqN" adds the wide MMQ multiply at ncols = N.
+    int  nvec     = 8;   // must be <= the fused hook's column cap
+    bool i8_flag  = false;
+    int  nwide    = 0;
+    int  grid_force = -1;
+    bool expect_refuse = false;
+    for (int a = 6; a < argc; ++a) {
+        const std::string tok = argv[a];
+        if (tok == "i8") {
+            i8_flag = true;
+        } else if (tok == "refuse") {
+            expect_refuse = true;
+        } else if (tok.rfind("mmq", 0) == 0) {
+            nwide = atoi(tok.c_str() + 3);
+        } else if (tok.rfind("grid", 0) == 0) {
+            grid_force = atoi(tok.c_str() + 4);
+        } else {
+            nvec = atoi(tok.c_str());
+        }
+    }
+    if (nwide < 0 || nwide > cols) {
+        fprintf(stderr, "mmq width %d must be in 1..cols (%d)\n", nwide, cols);
+        return 1;
+    }
     const std::vector<uint8_t> wire = read_file(argv[4]);
     const std::vector<uint8_t> ref  = read_file(argv[5]);
     const size_t n_elem = (size_t) rows * cols;
@@ -129,6 +163,43 @@ int main(int argc, char ** argv) {
     if (has_header) {
         memcpy(&tensor_scale, wire.data(), sizeof(float));
         grid_code = wire[4];
+    }
+    if (grid_force >= 0) {
+        if (!has_header) {
+            fprintf(stderr, "gridN needs a header-bearing rung\n");
+            return 1;
+        }
+        grid_code = grid_force;
+    }
+
+    // "i8" selects the tolerances the int8 activation arm needs. The arm is NOT
+    // bit-exact: both sides carry one symmetric int8 round (weights bake to int8
+    // against a grid whose amax is exactly 1.0, activations quantise per group by
+    // 127/amax), and the two 1/127s fold into GQH_Q8_XSCALE. Reaching it from this
+    // harness also needs GGML_GQH_I8_MINWORK=0, because gqh_i8_shape_ok() floors the
+    // arm at 16 Mi of in*rows and the largest case here is 64*1024 = 64 Ki -- 256x
+    // under it. That floor, not the I8DOT knob, is why this path had no coverage.
+    // A forced grid makes the shipped .decode.f32 the wrong reference, so decode
+    // on the host for the grid actually in force. The CPU decoder is registry
+    // driven like the CUDA one, so the host copy of the wire body has to be
+    // registered too -- the registry is a pointer-range map, so both can be.
+    std::vector<float> hostref;
+    if (grid_force >= 0) {
+        const size_t body_bytes = wire.size() - GQH_HEADER_BYTES;
+        const uint8_t * body = wire.data() + GQH_HEADER_BYTES;
+        if (body_bytes % (size_t) rows) {
+            fprintf(stderr, "wire body %zu B is not a whole number of rows\n", body_bytes);
+            return 1;
+        }
+        const size_t row_bytes = body_bytes / (size_t) rows;
+        hostref.resize(n_elem);
+        ggml_gqh_register(body, body_bytes, tensor_scale, grid_code);
+        const struct ggml_type_traits * tt = ggml_get_type_traits(wtype);
+        for (int i = 0; i < rows; ++i) {
+            tt->to_float(body + (size_t) i * row_bytes,
+                         hostref.data() + (size_t) i * cols, cols);
+        }
+        ggml_gqh_unregister(body);
     }
 
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -144,34 +215,11 @@ int main(int argc, char ** argv) {
 
     ggml_init_params ip = { ggml_tensor_overhead() * 12 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    // Trailing tokens in any order: a bare integer is nvec, "i8" selects the int8
-    // activation arm's tolerances, "mmqN" adds the wide MMQ multiply at ncols = N.
-    int  nvec     = 8;   // must be <= the fused hook's column cap
-    bool i8_flag  = false;
-    int  nwide    = 0;
-    for (int a = 6; a < argc; ++a) {
-        const std::string tok = argv[a];
-        if (tok == "i8") {
-            i8_flag = true;
-        } else if (tok.rfind("mmq", 0) == 0) {
-            nwide = atoi(tok.c_str() + 3);
-        } else {
-            nvec = atoi(tok.c_str());
-        }
-    }
-    if (nwide < 0 || nwide > cols) {
-        fprintf(stderr, "mmq width %d must be in 1..cols (%d)\n", nwide, cols);
-        return 1;
-    }
-    // "i8" selects the tolerances the int8 activation arm needs. The arm is NOT
-    // bit-exact: both sides carry one symmetric int8 round (weights bake to int8
-    // against a grid whose amax is exactly 1.0, activations quantise per group by
-    // 127/amax), and the two 1/127s fold into GQH_Q8_XSCALE. Reaching it from this
-    // harness also needs GGML_GQH_I8_MINWORK=0, because gqh_i8_shape_ok() floors the
-    // arm at 16 Mi of in*rows and the largest case here is 64*1024 = 64 Ki -- 256x
-    // under it. That floor, not the I8DOT knob, is why this path had no coverage.
     const bool i8_mode  = i8_flag;
     const bool mmq_mode  = nwide > 0;
+    // Only an ACCEPTED grid produces int8 numerics. A refused one falls back to
+    // dequant->cuBLAS, whose answer is fp16-exact -- see the bitwise arms below.
+    const bool mmq_numeric = mmq_mode && !expect_refuse;
     const bool has_fused = true;
 
     ggml_tensor * W  = ggml_new_tensor_2d(ctx, wtype, cols, rows);
@@ -246,7 +294,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const size_t mmq_launches = ggml_backend_cuda_get_mmq_launch_count() - mmq_before;
-    if (mmq_mode && mmq_launches < 2) {
+    if (mmq_mode && expect_refuse && mmq_launches != 0) {
+        fprintf(stderr, "GUARD FAILED: MMQ dispatched %zu times on grid %d, which "
+                        "int8 cannot represent -- it must decline and leave the "
+                        "multiply to the dequant path\n",
+                mmq_launches, grid_code);
+        return 1;
+    }
+    if (mmq_mode && !expect_refuse && mmq_launches < 2) {
         fprintf(stderr, "MMQ did not dispatch: %zu launches for the two wide "
                         "multiplies (need GGML_GQH_MMQ=1 and an eligible grid)\n",
                 mmq_launches);
@@ -258,7 +313,7 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(D,  got.data(),  0, got.size()  * sizeof(float));
     ggml_backend_tensor_get(D2, got2.data(), 0, got2.size() * sizeof(float));
 
-    const float * want = (const float *) ref.data();
+    const float * want = hostref.empty() ? (const float *) ref.data() : hostref.data();
 
     // Single-term I8 error is bounded by the weight LUT step, which is per row:
     // the grid amax is 1.0, so the step is max|w_row|/127. Dense error scales with
@@ -310,14 +365,32 @@ int main(int argc, char ** argv) {
     // here at ncols up to 1024, not just past 15.
     size_t bad = 0;
     size_t ties = 0;
+    size_t collapsed = 0;
     double max_onehot_abs = 0.0;
     for (int i = 0; i < rows; ++i) {
         for (int j = 0; j < cols; ++j) {
             const float ref = want[(size_t) i * cols + j];
             const float g = got[(size_t) j * rows + i];
-            if (mmq_mode) {
+            if (mmq_numeric) {
                 const double err = std::fabs((double) g - (double) ref);
                 if (err > max_onehot_abs) { max_onehot_abs = err; }
+                // A NON-ZERO weight must not come back as EXACTLY zero. This is
+                // the one failure the absolute bound above cannot see, and it is
+                // the failure the int8 range guard exists to prevent: on a grid
+                // past ~127:1 the innermost levels round to zero, and because
+                // those levels are SMALL the error stays well inside row_max/127.
+                // Measured on gqh4_64x1024: grid 11 zeroes 17.1% of all weights
+                // and still passes the bound. On an accepted grid this cannot
+                // fire -- a grid within 127:1 quantises every level to |q| >= 1 --
+                // so there are no false positives by construction.
+                if (ref != 0.0f && g == 0.0f) {
+                    if (collapsed < 5) {
+                        fprintf(stderr, "  COLLAPSED TO ZERO at [%d,%d]: want %a, "
+                                        "got exactly 0 -- the grid's innermost level "
+                                        "does not survive int8\n", i, j, ref);
+                    }
+                    ++collapsed;
+                }
                 if (err > int8_step(i)) {
                     if (bad < 5) {
                         fprintf(stderr, "  mmq mismatch at [%d,%d]: got %a want %a "
@@ -481,15 +554,35 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_get(D3, g3.data(), 0, g3.size() * sizeof(float));
             for (int i = 0; i < rows; ++i) {
                 for (int j = 0; j < nwide; ++j) {
-                    const double gv  = (double) g3[(size_t) j * rows + i];
-                    const double wv  = (double) want[(size_t) i * cols + off + j];
+                    const float  gf  = g3[(size_t) j * rows + i];
+                    const float  wf  = want[(size_t) i * cols + off + j];
+                    const double gv  = (double) gf;
+                    const double wv  = (double) wf;
                     const double err = std::fabs(gv - wv);
                     if (err > mmq_max_abs) { mmq_max_abs = err; }
-                    if (err > int8_step(i)) {
+                    bool differs;
+                    if (mmq_numeric) {
+                        if (wf != 0.0f && gf == 0.0f) {
+                            if (collapsed < 5) {
+                                fprintf(stderr, "  COLLAPSED TO ZERO off=%d [%d,%d]: "
+                                                "want %a, got exactly 0\n", off, i, j, wf);
+                            }
+                            ++collapsed;
+                        }
+                        differs = err > int8_step(i);
+                    } else {
+                        // The guard refused, so this came off the dequant path and
+                        // must be fp16-exact. An int8-perturbed answer here means the
+                        // guard let the grid through.
+                        const float w16 = ggml_fp16_to_fp32(ggml_fp32_to_fp16(wf));
+                        differs = memcmp(&gf, &w16, 4) != 0 && !fp16_tie_equivalent(wf, gf);
+                    }
+                    if (differs) {
                         if (bad_mmq_off < 5) {
                             fprintf(stderr, "  mmq offset-onehot mismatch off=%d [%d,%d]: "
-                                            "got %.9g want %.9g (err %.4g > step %.4g)\n",
-                                    off, i, j, gv, wv, err, int8_step(i));
+                                            "got %.9g want %.9g (err %.4g, step %.4g, %s)\n",
+                                    off, i, j, gv, wv, err, int8_step(i),
+                                    mmq_numeric ? "int8 bound" : "fp16 bitwise");
                         }
                         ++bad_mmq_off;
                     }
@@ -565,7 +658,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (bad || bad2 || bad_off || bad_dense || bad_mmq_off || bad_mmq_dense) {
+    if (bad || bad2 || bad_off || bad_dense || bad_mmq_off || bad_mmq_dense || collapsed) {
         printf("FAIL %s %dx%d [%s]: wide %zu/%zu differ, fused %zu/%d differ, "
                "offset-onehot %zu differ over %d offsets, dense %zu differ "
                "(max rel %.3g)",
@@ -574,21 +667,32 @@ int main(int argc, char ** argv) {
                bad_off, n_off, bad_dense, max_rel);
         if (mmq_mode) {
             printf(", mmq n%d: offset-onehot %zu differ over %d offsets "
-                   "(max abs %.4g), dense %zu differ (max rel %.3g)",
+                   "(max abs %.4g), dense %zu differ (max rel %.3g), "
+                   "%zu non-zero weights COLLAPSED to zero",
                    nwide, bad_mmq_off, n_mmq_off, mmq_max_abs,
-                   bad_mmq_dense, mmq_max_rel);
+                   bad_mmq_dense, mmq_max_rel, collapsed);
         }
         printf("\n");
         return 1;
     }
     if (mmq_mode) {
+        if (expect_refuse) {
+            printf("OK   %s %dx%d [mmq-refused]: the int8 range guard DECLINED grid %d "
+                   "(%zu MMQ launches, must be 0) and the dequant path answered "
+                   "fp16-exact at ncols %d and %d over %d offsets%s (scale %.9g)\n",
+                   rung.c_str(), rows, cols, grid_code, mmq_launches, cols, nwide,
+                   n_mmq_off,
+                   ties ? (", " + std::to_string(ties) + " exact fp16 ties").c_str() : "",
+                   tensor_scale);
+            return 0;
+        }
         printf("OK   %s %dx%d [mmq]: MMQ dispatched (%zu launches), wide n%d one-hot "
                "within one weight step (max abs %.4g), n%d one-hot over %d offsets "
-               "(max abs %.4g), n%d dense max rel %.3g, fused matvec n%d "
-               "bit-identical (scale %.9g, grid %d)\n",
+               "(max abs %.4g), n%d dense max rel %.3g, no level collapsed to "
+               "zero, fused matvec n%d bit-identical (scale %.9g, grid %d%s)\n",
                rung.c_str(), rows, cols, mmq_launches, cols, max_onehot_abs,
                nwide, n_mmq_off, mmq_max_abs, nwide, mmq_max_rel, nvec,
-               tensor_scale, grid_code);
+               tensor_scale, grid_code, grid_force >= 0 ? ", forced" : "");
         return 0;
     }
     printf("OK   %s %dx%d [%s]: dequant->BLAS matches the fp16-rounded reference%s, "

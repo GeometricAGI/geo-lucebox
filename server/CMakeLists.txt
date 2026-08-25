@@ -1207,7 +1207,7 @@ if(DFLASH27B_TESTS)
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                  "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" ${GQH_NVEC})
                 set_tests_properties(test-gqh-backend-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
+                                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=0")
             endforeach()
             # The I8 ACTIVATION ARM -- what serving actually runs, since
             # GGML_GQH_I8DOT defaults ON. It had no correctness coverage at all, and
@@ -1226,7 +1226,7 @@ if(DFLASH27B_TESTS)
                              COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                      "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" ${GQH_NVEC} i8)
                     set_tests_properties(test-gqh-backend-i8-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0")
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_MMQ=0")
                 endforeach()
                 # Per-column scale form. GGML_GQH_I8_XSCALE=0 also turns SB2 off, so
                 # this is the only coverage of the non-SB2 wide kernel.
@@ -1234,7 +1234,7 @@ if(DFLASH27B_TESTS)
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                  "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 16 i8)
                 set_tests_properties(test-gqh-backend-i8xs0-n16-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_I8_XSCALE=0")
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_I8_XSCALE=0;GGML_GQH_MMQ=0")
             endif()
             # WIDER THAN THE MATVEC: the MMQ path. Everything above stops at
             # GQH_MAX_COLS (16) because that is where ggml_cuda_gqh_mul_mat_vec
@@ -1253,7 +1253,7 @@ if(DFLASH27B_TESTS)
             # GGML_GQH_MMQ=1 because the path is opt-in while the dequant route it
             # is verified against remains the reference; GGML_GQH_I8DOT=0 keeps
             # the narrow fused arm in the same run bit-exact.
-            if(GQH_RUNG STREQUAL "gqh3")
+            if(GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4")
                 foreach(GQH_MMQN 17 33 64)
                     add_test(NAME test-gqh-backend-mmq${GQH_MMQN}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                              COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
@@ -1263,9 +1263,64 @@ if(DFLASH27B_TESTS)
                         PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
                 endforeach()
             endif()
+            # THE INT8 RANGE GUARD. MMQ quantises the GRID, and int8 spans 127:1, so
+            # a wider grid loses its innermost levels -- gqh4 codes 10 and 11 round
+            # two of their sixteen to exactly zero. ggml_cuda_gqh_mmq_info refuses
+            # those. Nothing real trips it: the shipping artifact uses gqh3 {3,4} and
+            # gqh4 {2,3,4}, and no vector file is wider either. So the guard had no
+            # coverage at all, on the one code path whose failure is a silently wrong
+            # answer rather than a crash.
+            #
+            # "gridN" forces the code and decodes the reference on the host for it,
+            # which is what makes these reachable. The pairs straddle the threshold
+            # exactly: gqh4 grid 7 is 112.84:1 and must be ACCEPTED, grid 8 is
+            # 164.69:1 and must be REFUSED. grid 11 (512:1) is the collapse case.
+            # gqh3 grid 11 is 64:1 -- its widest -- and must be accepted, so the
+            # guard is shown not to over-refuse either.
+            #
+            # "refuse" makes the answer bitwise-checked against the fp16-rounded
+            # reference, which only the dequant fallback can produce. A guard that
+            # let the grid through returns int8-perturbed values and fails loudly.
+            if(GQH_ROWS GREATER 1)
+                if(GQH_RUNG STREQUAL "gqh4")
+                    set(GQH_GUARD_GRIDS 7 8 11)
+                elseif(GQH_RUNG STREQUAL "gqh3")
+                    set(GQH_GUARD_GRIDS 11)
+                else()
+                    set(GQH_GUARD_GRIDS "")
+                endif()
+                foreach(GQH_GRID ${GQH_GUARD_GRIDS})
+                    # Accepted iff the grid fits int8's 127:1. gqh4 crosses between
+                    # code 7 (112.84:1) and code 8 (164.69:1); every gqh3 grid fits,
+                    # its widest being code 11 at 64:1.
+                    if(GQH_RUNG STREQUAL "gqh4" AND GQH_GRID GREATER_EQUAL 8)
+                        set(GQH_VERDICT refuse)
+                    else()
+                        set(GQH_VERDICT accept)
+                    endif()
+                    set(GQH_GUARD_ARGS 8 mmq33 grid${GQH_GRID})
+                    if(GQH_VERDICT STREQUAL "refuse")
+                        list(APPEND GQH_GUARD_ARGS refuse)
+                    endif()
+                    set(GQH_GUARD_NAME test-gqh-backend-guard-${GQH_VERDICT}${GQH_GRID}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS})
+                    add_test(NAME ${GQH_GUARD_NAME}
+                             COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                     "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32"
+                                     ${GQH_GUARD_ARGS})
+                    set_tests_properties(${GQH_GUARD_NAME}
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+                endforeach()
+            endif()
             # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
+            # GGML_GQH_MMQ=0 is pinned on every case above that asserts the DEQUANT
+            # result, because ctest's ENVIRONMENT adds to the ambient environment
+            # rather than replacing it: with GGML_GQH_MMQ=1 exported, 42 of these
+            # silently moved their wide node onto MMQ while still demanding
+            # fp16-bitwise dequant output. gqh_wide_measure.sh exports exactly that
+            # when the search runs with MMQ on, so an unpinned gate reports a false
+            # failure and the loop cannot tell it from a real one.
             set_tests_properties(test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
+                PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=0")
         endforeach()
     endif()
 

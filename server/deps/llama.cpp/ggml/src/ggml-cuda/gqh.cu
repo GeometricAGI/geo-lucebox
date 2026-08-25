@@ -5164,7 +5164,11 @@ void dequantize_gqh2c_to_fp32_cuda(const void * vx, float * y, int64_t k, cudaSt
 // than the weights, and why some grids are refused.
 
 bool ggml_cuda_gqh_mmq_type(ggml_type type) {
-    return type == GGML_TYPE_GQH3;
+    // The two rungs the shipping artifact actually contains, decoded from its
+    // geoquant.gqh.headers KV: gqh3 (139 tensors) and gqh4 (257). gqh2_h and
+    // gqh2_c appear in no artifact yet, so they get no loader -- there would be
+    // nothing to measure it against.
+    return type == GGML_TYPE_GQH3 || type == GGML_TYPE_GQH4;
 }
 
 bool ggml_cuda_gqh_mmq_enabled(void) {
