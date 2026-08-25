@@ -59,9 +59,9 @@ bool ggml_cuda_gqh_mul_mat_vec(
 
 // One dispatch for two same-rung, same-shape GQH GEMVs that share `x`
 // (FFN gate/up). Writes both y buffers; the caller still runs SwiGLU.
-// ncols 1..12: batch-1 decode and DFlash2 verify (block 8, optional 12).
-// Launch geometry matches the unpaired arm (GQH3 N=1 uses GQH_MATVEC_ROWS;
-// N=2..8 uses GQH_MULTICOL_ROWS; N=9..12 uses ROWS=1).
+// ncols 1..16: batch-1 decode and DFlash2 verify (block 8, or 9..16 with
+// --draft-block-size). Launch geometry matches the unpaired arm (GQH3 N=1 uses
+// GQH_MATVEC_ROWS; N=2..8 uses GQH_MULTICOL_ROWS; N=9..16 uses ROWS=1).
 bool ggml_cuda_gqh_mul_mat_vec_pair(
         ggml_type type,
         const void * vx_a, float * y_a, const void * vx_b, float * y_b,
