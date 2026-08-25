@@ -192,6 +192,17 @@ def generate(name, cfg, tasks, samples_path):
                         "messages": [{"role": "user", "content": user_msg}],
                         "max_tokens": MAX_TOKENS,
                         "stream": False,
+                        # This harness reports its result as "greedy", but it never
+                        # asked for greedy: with no temperature in the payload the
+                        # server falls back to the model card's sampling defaults.
+                        # Two runs of the SAME config then agreed on only 16.5% of
+                        # replies, and 30 of 164 items flipped verdict between them
+                        # -- wider than any effect this instrument gets used to
+                        # measure, and the reason an n=1 pass@1 from it means very
+                        # little. top_k is pinned too so the choice is argmax
+                        # regardless of how temperature 0 is handled downstream.
+                        "temperature": 0,
+                        "top_k": 1,
                         "chat_template_kwargs": {"enable_thinking": False},
                     })
                     err = None
