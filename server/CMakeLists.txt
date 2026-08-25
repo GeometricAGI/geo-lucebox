@@ -1209,6 +1209,33 @@ if(DFLASH27B_TESTS)
                 set_tests_properties(test-gqh-backend-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                                      PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
             endforeach()
+            # The I8 ACTIVATION ARM -- what serving actually runs, since
+            # GGML_GQH_I8DOT defaults ON. It had no correctness coverage at all, and
+            # not because of the env var: gqh_i8_shape_ok() floors the arm at 16 Mi
+            # of in*rows, and the largest case here is 64*1024 = 64 Ki, i.e. 256x
+            # under the floor. So the arm was unreachable from ctest at ANY setting
+            # of GGML_GQH_I8DOT, which is why a kernel trace of these cases shows
+            # only the f32 arm. GGML_GQH_I8_MINWORK=0 lifts the floor host-side --
+            # it moves no dispatch and no kernel. The arm is NOT bit-exact, so these
+            # cases pass "i8" to select int8-sized tolerances.
+            # gqh2_c is excluded on purpose: it returns before any I8 dispatch and
+            # has no I8 arm, so its bitwise cases above are already complete.
+            if(NOT GQH_RUNG STREQUAL "gqh2_c")
+                foreach(GQH_NVEC 8 13 16)
+                    add_test(NAME test-gqh-backend-i8-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                             COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                     "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" ${GQH_NVEC} i8)
+                    set_tests_properties(test-gqh-backend-i8-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0")
+                endforeach()
+                # Per-column scale form. GGML_GQH_I8_XSCALE=0 also turns SB2 off, so
+                # this is the only coverage of the non-SB2 wide kernel.
+                add_test(NAME test-gqh-backend-i8xs0-n16-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 16 i8)
+                set_tests_properties(test-gqh-backend-i8xs0-n16-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_I8_XSCALE=0")
+            endif()
             # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
             set_tests_properties(test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                 PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
