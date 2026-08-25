@@ -4,6 +4,10 @@
 #include "vecdotq.cuh"
 #include "mma.cuh"
 
+// GQH superblock geometry (GQH3_SB_BYTES, GQH_SUPERBLOCK, GQH_N_SUB); the loader
+// below indexes wire bytes and must not hand-copy them.
+#include "../gqh-tables.h"
+
 #include <climits>
 #include <cstdint>
 
@@ -70,6 +74,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_GQH3:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q2_0_ROCMFP2:
 #ifdef ROCMFP2_AFFINE
@@ -278,6 +283,11 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_DP4A_TXS_Q8_0_16;
+        // GQH3: 64 code words and 16 sub-block scales per 256-weight
+        // superblock, which is exactly one x-scale per 16 int8 weights --
+        // the _16 vec_dot family's granularity, so no new activation
+        // quantiser is needed.
+        case GGML_TYPE_GQH3:    return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
@@ -332,6 +342,8 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
+        // 2*32 code words + 32/2 scale floats == 64 + 16, the GQH3 superblock.
+        case GGML_TYPE_GQH3:    return MMQ_MMA_TILE_X_K_Q3_K;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_MMA_TILE_X_K_NVFP4;
@@ -4021,6 +4033,202 @@ static __device__ __forceinline__ void mmq_write_back_mma(
     }
 }
 
+// ---- GQH -----------------------------------------------------------------
+// Per-tensor MMQ side data for the header-bearing GQH rungs. Unlike the mix
+// qtypes, whose codebooks are big enough to need a device buffer and an LDS
+// stage, a GQH grid is 4-16 levels: quantised to int8 it is 16 bytes, so it
+// rides in the kernarg struct and the loader selects a byte out of a register
+// pair. That removes the LDS staging AND its bank conflicts -- an int8 LUT in
+// LDS would be four ds_read_u8 per code word, since 16 packed bytes span only
+// four banks (contrast the 16 distinct banks the by-value float grid gets in
+// gqh.cu's decode kernel).
+//
+// See gqh.cuh for how ggml_cuda_gqh_mmq_info builds these and which grids it
+// refuses. `lut` is ascending by code; `dscale` is tensor_scale * (amax/127).
+struct gqh_mmq_params {
+    int   lut[4];
+    float dscale;
+};
+
+// torch.float8_e4m3fn -> float32 for the superblock scale byte. gqh-tables.h has
+// the reference [32][8] table, but a table would have to be __constant__ in every
+// TU that instantiates an MMQ case (141 of them) and NVIDIA caps __constant__ at
+// 64 KiB per module, so this is the closed form instead. It is written on the BITS
+// so the static_assert below can check it against GQH_E4M3_LUT for all 256
+// encodings at compile time -- the table stays the authority and the two cannot
+// drift.
+static __host__ __device__ constexpr uint32_t gqh_mmq_e4m3_bits(const uint32_t d) {
+    const uint32_t sign = (d & 0x80u) << 24;
+    const uint32_t e    = (d >> 3) & 0x0fu;
+    const uint32_t m    =  d       & 0x07u;
+    if (e == 0u) {
+        // Subnormal: value = m * 2^-9. Normalising it means shifting the mantissa
+        // up by the position of m's high bit and dropping that bit.
+        if (m == 0u) {
+            return sign;                                   // +-0
+        }
+        const uint32_t hi = m >= 4u ? 2u : (m >= 2u ? 1u : 0u);
+        return sign | ((118u + hi) << 23) | ((m << (23 - hi)) & 0x7fffffu);
+    }
+    if (e == 0x0fu && m == 0x07u) {
+        return sign | 0x7ff00000u;                         // e4m3fn reserves this for NaN
+    }
+    return sign | ((e + 120u) << 23) | (m << 20);          // e - 7 + 127
+}
+
+namespace gqh_mmq_selfcheck {
+constexpr uint32_t e4m3_ref[32][8] = GQH_E4M3_LUT_INIT;
+constexpr bool e4m3_closed_form_exact() {
+    for (uint32_t d = 0; d < 256u; ++d) {
+        if (gqh_mmq_e4m3_bits(d) != e4m3_ref[d >> 3][d & 7]) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(e4m3_closed_form_exact(),
+              "gqh_mmq_e4m3_bits no longer reproduces GQH_E4M3_LUT");
+
+// The tile scale multiplies by ratio/15. The generated table is single-rounded
+// (as numpy does it), which a true division reproduces exactly and a multiply by
+// the rounded reciprocal does NOT -- it double-rounds 6 of the 16 entries. Pin
+// that here so nobody "optimises" the division into a reciprocal.
+constexpr uint32_t ratio_ref[16][1] = GQH_RATIO_Q_INIT;
+constexpr bool ratio_division_exact() {
+    for (uint32_t r = 0; r < 16u; ++r) {
+        if (__builtin_bit_cast(uint32_t, (float) r / 15.0f) != ratio_ref[r][0]) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(ratio_division_exact(),
+              "(float) ratio / 15.0f no longer reproduces GQH_RATIO_Q");
+}  // namespace gqh_mmq_selfcheck
+
+static __device__ __forceinline__ float gqh_mmq_e4m3_to_f32(const uint32_t d) {
+    return __int_as_float((int) gqh_mmq_e4m3_bits(d));
+}
+
+// Select the int8 grid level for `code` out of the packed kernarg LUT. `code` is
+// divergent and `lut` is a kernarg array, which is exactly the case gqh.cu warns
+// spills to scratch or expands into a select tree -- so index it with CONSTANTS
+// and do the divergent part in the ALU: one select for the word, one variable
+// shift for the byte. No memory touched.
+static __device__ __forceinline__ uint32_t gqh_mmq_lut8(const gqh_mmq_params & p, const uint32_t code) {
+    const uint32_t w = (code & 4u) ? (uint32_t) p.lut[1] : (uint32_t) p.lut[0];
+    return (w >> (8*(code & 3u))) & 0xffu;
+}
+
+// GQH3 tile loader. 105-byte superblock, 256 weights along the row axis:
+//   [0]      E4M3 superblock scale
+//   [1:9]    16 uint4 sub-block ratios (ratio/15), low nibble = even sub-block
+//   [9:73]   low-2-bit code plane, 4 weights per byte
+//   [73:105] high-1-bit code plane, 8 weights per byte
+// One int32 of the x tile holds four consecutive weights, and those four always
+// come from ONE byte of the low plane and ONE nibble of the high plane, so a code
+// word costs exactly two byte loads. Consecutive lanes take consecutive words, so
+// both streams coalesce.
+//
+// The superblock stride is 105 bytes -- ODD -- so this must index bytes; there is
+// no aligned int load to be had. The same is true of every GQH rung (137/73) and
+// of the dequant path it replaces.
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_gqh3(
+        const char * __restrict__ x, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride,
+        const gqh_mmq_params gqh) {
+    constexpr int nwarps    = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = reinterpret_cast<int   *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_GQH3, mmq_y);
+    int   * x_qs = reinterpret_cast<int   *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + txs.qs);
+#endif
+
+    // ---- code words: 64 per row ----
+    constexpr int words_per_row   = GQH_SUPERBLOCK/4;      // 64
+    constexpr int threads_per_row = 32;
+    constexpr int words_per_lane  = words_per_row / threads_per_row;
+    constexpr int nrows           = warp_size / threads_per_row;
+    static_assert(words_per_row % threads_per_row == 0, "GQH3 MMQ loader wants 32 lanes per row");
+    static_assert(warp_size % threads_per_row == 0,     "GQH3 MMQ loader wants a multiple of 32 lanes");
+    static_assert(mmq_y % (nrows*nwarps) == 0,          "GQH3 MMQ loader wants mmq_y divisible by the row step");
+
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? (int) threadIdx.y
+                                 : (int) threadIdx.y*nrows + (int) threadIdx.x/threads_per_row);
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        const uint8_t * __restrict__ b =
+            reinterpret_cast<const uint8_t *>(x) + (size_t) (kbx0 + i*stride) * GQH3_SB_BYTES;
+
+#pragma unroll
+        for (int w0 = 0; w0 < words_per_lane; ++w0) {
+            const int w = txi + w0*threads_per_row;             // code word, 0..63
+            const uint32_t lo_byte = b[ 9 + w];
+            const uint32_t hi_byte = b[73 + (w >> 1)];
+            const uint32_t hi_shift = (w & 1) << 2;
+
+            uint32_t packed = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t lo   = (lo_byte >> (2*k)) & 0x03u;
+                const uint32_t hi   = (hi_byte >> (hi_shift + k)) & 0x01u;
+                packed |= gqh_mmq_lut8(gqh, lo | (hi << 2)) << (8*k);
+            }
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + w] = (int) packed;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + w] = (int) packed;
+#endif
+        }
+    }
+
+    // ---- sub-block scales: 16 per row ----
+    // The tile scale is the reference's own product with 1/127 folded in through
+    // dscale. The reference decode multiplies in a fixed order for bit-exactness;
+    // MMQ cannot be bit-exact anyway (the grid is curved and int8 perturbs every
+    // level), so this reassociates to keep the per-tensor factor on the host.
+    // The ratio uses true division, which reproduces GQH_RATIO_Q exactly where a
+    // multiply by the rounded reciprocal would not; see ratio_division_exact.
+    constexpr int scales_per_tile     = GQH_N_SUB;                   // 16
+    constexpr int scale_rows_per_warp = warp_size / scales_per_tile;
+    static_assert(warp_size % scales_per_tile == 0,               "GQH3 MMQ scale lanes");
+    static_assert(mmq_y % (nwarps*scale_rows_per_warp) == 0,      "GQH3 MMQ scale row step");
+    const int kscale = threadIdx.x % scales_per_tile;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*scale_rows_per_warp) {
+        int i = i0 + (int) threadIdx.y*scale_rows_per_warp + (int) threadIdx.x/scales_per_tile;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        const uint8_t * __restrict__ b =
+            reinterpret_cast<const uint8_t *>(x) + (size_t) (kbx0 + i*stride) * GQH3_SB_BYTES;
+
+        const uint32_t rb    = b[1 + (kscale >> 1)];
+        const uint32_t ratio = (kscale & 1) ? (rb >> 4) : (rb & 0x0fu);
+        const float    scale = gqh_mmq_e4m3_to_f32(b[0]) *
+                               ((float) ratio / (float) GQH_RATIO_MAX) * gqh.dscale;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q3_K + kscale] = scale;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kscale] = scale;
+#endif
+    }
+}
+
 // -------------------------------------------------------------------------------------------------------------------------------------
 
 template <int mmq_x, int mmq_y, bool need_check, ggml_type type>
@@ -4103,6 +4311,17 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q3_1_ROCMFP3_MIX> {
     static constexpr int              vdr          = VDR_ROCMFP3_Q8_1_MMQ;
     // The learned-codebook loader is called explicitly from
     // mul_mat_q_process_tile because it needs registry side data.
+    static constexpr load_tiles_mmq_t load_tiles   = nullptr;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_GQH3> {
+    static constexpr int              vdr          = VDR_Q3_K_Q8_1_MMQ;
+    // Same reason as the mix qtypes: the loader needs per-tensor state that no
+    // load_tiles_mmq_t signature carries, so mul_mat_q_process_tile calls it
+    // explicitly. vdr has no consumer; it is the Q3_K value for the shared tile.
     static constexpr load_tiles_mmq_t load_tiles   = nullptr;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
@@ -4248,7 +4467,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
         const nv_bfloat16 * __restrict__ mix_codebooks,
-        const uint8_t * __restrict__ mix_modes, const int mix_expert) {
+        const uint8_t * __restrict__ mix_modes, const gqh_mmq_params gqh,
+        const int mix_expert) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -4295,6 +4515,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             load_tiles_rocmfp3_mix<mmq_y, need_check>(
                 x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x,
                 mix_codebooks, mix_modes, mix_expert);
+        } else if constexpr (type == GGML_TYPE_GQH3) {
+            load_tiles_gqh3<mmq_y, need_check>(
+                x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, gqh);
         } else {
             load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         }
@@ -4375,7 +4598,7 @@ static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds,
         const nv_bfloat16 * __restrict__ mix_codebooks,
-        const uint8_t * __restrict__ mix_modes,
+        const uint8_t * __restrict__ mix_modes, const gqh_mmq_params gqh,
         float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -4466,7 +4689,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
-             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
+             mix_codebooks, mix_modes, gqh, fastdiv(zt, channel_ratio));
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4547,7 +4770,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
-             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
+             mix_codebooks, mix_modes, gqh, fastdiv(zt, channel_ratio));
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -4617,7 +4840,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
-         mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
+         mix_codebooks, mix_modes, gqh, fastdiv(zt, channel_ratio));
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -4761,7 +4984,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds;
-    const nv_bfloat16 * mix_codebooks; const uint8_t * mix_modes; float * dst;
+    const nv_bfloat16 * mix_codebooks; const uint8_t * mix_modes; gqh_mmq_params gqh; float * dst;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
@@ -4822,7 +5045,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             constexpr bool need_check = false;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds,
-                 args.mix_codebooks, args.mix_modes, args.dst, nullptr,
+                 args.mix_codebooks, args.mix_modes, args.gqh, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4831,7 +5054,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds,
-                 args.mix_codebooks, args.mix_modes, args.dst, nullptr,
+                 args.mix_codebooks, args.mix_modes, args.gqh, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4864,7 +5087,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         constexpr bool need_check = false;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds,
-             args.mix_codebooks, args.mix_modes, args.dst, tmp_fixup.ptr,
+             args.mix_codebooks, args.mix_modes, args.gqh, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4883,7 +5106,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         constexpr bool need_check = true;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds,
-             args.mix_codebooks, args.mix_modes, args.dst, tmp_fixup.ptr,
+             args.mix_codebooks, args.mix_modes, args.gqh, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -5007,6 +5230,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q2_0_ROCMFP2);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_1_ROCMFP2_MIX);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_0_ROCMFPX);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_1_ROCMFP3_MIX);
+extern DECL_MMQ_CASE(GGML_TYPE_GQH3);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);

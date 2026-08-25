@@ -6,6 +6,7 @@
 #include "mmid.cuh"
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
+#include "gqh.cuh"
 
 static thread_local size_t g_mmq_launch_count = 0;
 
@@ -120,6 +121,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q3_1_ROCMFP3_MIX:
             mul_mat_q_case<GGML_TYPE_Q3_1_ROCMFP3_MIX>(ctx, args, stream);
             break;
+        case GGML_TYPE_GQH3:
+            mul_mat_q_case<GGML_TYPE_GQH3>(ctx, args, stream);
+            break;
         case GGML_TYPE_Q3_0_ROCMFPX:
             mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, args, stream);
             break;
@@ -231,6 +235,16 @@ static void ggml_cuda_mul_mat_q_impl(
     } else if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
         GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
             src0->data, &mix_codebooks_raw, &mix_modes));
+    }
+    // GQH per-tensor header -> int8 grid LUT + tile-scale prefactor. Unlike the
+    // mix registries this needs no dispatch lock: the result is 20 bytes copied
+    // into the kernarg struct here, so nothing the kernel reads can be torn down
+    // underneath it. should_use_mmq plus ggml_cuda_gqh_mmq_eligible already
+    // refused every type/grid this cannot resolve, hence the assert.
+    gqh_mmq_params gqh_params = {};
+    if (ggml_cuda_gqh_mmq_type(src0->type)) {
+        GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+            src0->type, src0->data, gqh_params.lut, &gqh_params.dscale));
     }
     const nv_bfloat16 * mix_codebooks =
         reinterpret_cast<const nv_bfloat16 *>(mix_codebooks_raw);
@@ -349,7 +363,7 @@ static void ggml_cuda_mul_mat_q_impl(
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr,
-            mix_codebooks, mix_modes, dst_d,
+            mix_codebooks, mix_modes, gqh_params, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -375,6 +389,12 @@ static void ggml_cuda_mul_mat_q_impl(
                 pair_args.mix_codebooks =
                     reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
                 pair_args.mix_modes = pair_modes;
+            } else if (ggml_cuda_gqh_mmq_type(src0_pair->type)) {
+                // The pair shares nothing per-tensor: each projection has its own
+                // header, so re-resolve rather than reuse src0's.
+                GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+                    src0_pair->type, src0_pair->data,
+                    pair_args.gqh.lut, &pair_args.gqh.dscale));
             }
             ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
         }
@@ -451,7 +471,7 @@ static void ggml_cuda_mul_mat_q_impl(
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
-        mix_codebooks, mix_modes, dst_d,
+        mix_codebooks, mix_modes, gqh_params, dst_d,
         ne00, ne01, ne_get_rows, s01, n_routes_quantized, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
@@ -478,6 +498,10 @@ static void ggml_cuda_mul_mat_q_impl(
             pair_args.mix_codebooks =
                 reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
             pair_args.mix_modes = pair_modes;
+        } else if (ggml_cuda_gqh_mmq_type(src0_pair->type)) {
+            GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+                src0_pair->type, src0_pair->data,
+                pair_args.gqh.lut, &pair_args.gqh.dscale));
         }
         ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
     }
@@ -544,10 +568,17 @@ void ggml_cuda_op_mul_mat_q(
         GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
             src0_dd_i, &mix_codebooks_raw, &mix_modes));
     }
+    // The split-buffer op receives a ROW SLICE, which ggml_gqh_lookup resolves to
+    // its owning tensor (that is why it takes an interior pointer at all).
+    gqh_mmq_params gqh_params = {};
+    if (ggml_cuda_gqh_mmq_type(src0->type)) {
+        GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+            src0->type, src0_dd_i, gqh_params.lut, &gqh_params.dscale));
+    }
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr,
         reinterpret_cast<const nv_bfloat16 *>(mix_codebooks_raw), mix_modes,
-        dst_dd_i,
+        gqh_params, dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
@@ -740,6 +771,26 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
             mmq_supported = true;
+            break;
+        case GGML_TYPE_GQH3:
+            // GQH prefill used to dequantise the WHOLE weight set to fp16 for a
+            // cuBLAS GEMM: a fixed per-request cost set by the artifact, not the
+            // prompt (13.44 GB -> ~27 GB of fp16, measured as a steady 0.3 s per
+            // request against IQ4_XS's 0.1 s -- section 9 of
+            // docs/QWEN38_R9700_REPRO.md). MMQ removes the materialisation.
+            //
+            // This does not contest the narrow widths: ggml_cuda_gqh_mul_mat_vec
+            // owns 1..16 and wins decode there, and declines above GQH_MAX_COLS,
+            // so MMQ catches exactly the widths that used to fall to dequant.
+            //
+            // Arch gate mirrors ROCmFPX: the wave32 WMMA branch is what these
+            // tile shapes are validated on. n_experts > 1 declines because there
+            // is no expert-batched arm (see ggml_cuda_gqh_mmq_eligible), and the
+            // caller must ALSO pass that per-tensor check -- this signature has
+            // no tensor, so it cannot see an int8-unrepresentable grid.
+            mmq_supported = ggml_cuda_gqh_mmq_enabled() && n_experts <= 1 &&
+                            (GGML_CUDA_CC_IS_RDNA3_5(cc) ||
+                             GGML_CUDA_CC_IS_RDNA4(cc));
             break;
         case GGML_TYPE_Q2_0_ROCMFP2:
         case GGML_TYPE_Q3_0_ROCMFPX:

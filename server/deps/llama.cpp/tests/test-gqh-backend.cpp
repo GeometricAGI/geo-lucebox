@@ -20,16 +20,27 @@
 //      accumulates decode(W) * x in f32 and dst[i,j] IS the raw f32 decode,
 //      compared BITWISE against the f32 reference. gqh2_c has no fused kernel yet
 //      and falls back to path 1, so it skips this check.
+//   3. MMQ (the "mmqN" flag): the batched quantised matmul that REPLACES path 1
+//      for wide batches once GGML_GQH_MMQ=1. Not bit-exact and cannot be: the
+//      grid is curved and int8 perturbs every level. The bar is still tight,
+//      because one-hot columns make the ACTIVATION quantisation exact -- amax 1
+//      gives d = 1/127 and q = 127, so the dot has a single term and the only
+//      error left is one weight step. See the mmq block below.
 //
-// usage: test-gqh-backend <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> [nvec]
+// usage: test-gqh-backend <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32>
+//                        [nvec] [i8] [mmqN]
 //   nvec (default 8) must be <= GQH_MAX_COLS (16), or the hook declines and the
 //   fallback answers in fp16, failing every fused comparison. GQH is not gated
 //   on luce_mmvq_max_ncols; 8 is the DFlash2 default verify width.
+//   mmqN adds a SECOND wide multiply at ncols = N (N > 16) and requires that MMQ
+//   actually dispatched, which is what makes these cases a gate rather than a
+//   re-run of the fallback. Needs GGML_GQH_MMQ=1.
 // exit:  0 = bit-identical, 1 = mismatch/error, 77 = skipped (no GPU)
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cuda.h"   // ggml_backend_cuda_get_mmq_launch_count
 
 #include <cstdint>
 #include <cstdio>
@@ -84,8 +95,9 @@ static std::vector<uint8_t> read_file(const char * path) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 6 || argc > 8) {
-        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> [nvec] [i8]\n", argv[0]);
+    if (argc < 6) {
+        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32> "
+                        "[nvec] [i8] [mmqN]\n", argv[0]);
         return 1;
     }
     const std::string rung = argv[1];
@@ -130,9 +142,27 @@ int main(int argc, char ** argv) {
         return 77;
     }
 
-    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * 12 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    const int nvec = argc >= 7 ? atoi(argv[6]) : 8; // must be <= the fused hook's column cap
+    // Trailing tokens in any order: a bare integer is nvec, "i8" selects the int8
+    // activation arm's tolerances, "mmqN" adds the wide MMQ multiply at ncols = N.
+    int  nvec     = 8;   // must be <= the fused hook's column cap
+    bool i8_flag  = false;
+    int  nwide    = 0;
+    for (int a = 6; a < argc; ++a) {
+        const std::string tok = argv[a];
+        if (tok == "i8") {
+            i8_flag = true;
+        } else if (tok.rfind("mmq", 0) == 0) {
+            nwide = atoi(tok.c_str() + 3);
+        } else {
+            nvec = atoi(tok.c_str());
+        }
+    }
+    if (nwide < 0 || nwide > cols) {
+        fprintf(stderr, "mmq width %d must be in 1..cols (%d)\n", nwide, cols);
+        return 1;
+    }
     // "i8" selects the tolerances the int8 activation arm needs. The arm is NOT
     // bit-exact: both sides carry one symmetric int8 round (weights bake to int8
     // against a grid whose amax is exactly 1.0, activations quantise per group by
@@ -140,7 +170,8 @@ int main(int argc, char ** argv) {
     // harness also needs GGML_GQH_I8_MINWORK=0, because gqh_i8_shape_ok() floors the
     // arm at 16 Mi of in*rows and the largest case here is 64*1024 = 64 Ki -- 256x
     // under it. That floor, not the I8DOT knob, is why this path had no coverage.
-    const bool i8_mode = argc == 8 && std::string(argv[7]) == "i8";
+    const bool i8_mode  = i8_flag;
+    const bool mmq_mode  = nwide > 0;
     const bool has_fused = true;
 
     ggml_tensor * W  = ggml_new_tensor_2d(ctx, wtype, cols, rows);
@@ -156,11 +187,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    ggml_tensor * D  = ggml_mul_mat(ctx, W, X);  // (rows, cols): dequant->cuBLAS
-    ggml_tensor * D2 = ggml_mul_mat(ctx, W, X2); // (rows, 8):    fused matvec
+    // A THIRD multiply at a width that is not a tile multiple. D above already
+    // sweeps every one-hot position at ncols = cols, but cols is 256/512/1024 --
+    // all multiples of the mmq_x granularity, so the partial-tile j_max path never
+    // runs. 17/33 do run it, and this is also where the dense wide pass lives.
+    ggml_tensor * X3 = mmq_mode ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, nwide) : nullptr;
+
+    ggml_tensor * D  = ggml_mul_mat(ctx, W, X);  // (rows, cols): dequant->cuBLAS, or MMQ
+    ggml_tensor * D2 = ggml_mul_mat(ctx, W, X2); // (rows, nvec): fused matvec
+    ggml_tensor * D3 = X3 ? ggml_mul_mat(ctx, W, X3) : nullptr;
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, D);
     ggml_build_forward_expand(gf, D2);
+    if (D3) {
+        ggml_build_forward_expand(gf, D3);
+    }
 
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(galloc, gf)) {
@@ -180,6 +221,13 @@ int main(int argc, char ** argv) {
             onehot[(size_t) j * cols + j] = 1.0f;
         }
         ggml_backend_tensor_set(X2, onehot.data(), 0, onehot.size() * sizeof(float));
+        if (X3) {
+            std::vector<float> w0((size_t) cols * nwide, 0.0f);
+            for (int j = 0; j < nwide; ++j) {
+                w0[(size_t) j * cols + j] = 1.0f;
+            }
+            ggml_backend_tensor_set(X3, w0.data(), 0, w0.size() * sizeof(float));
+        }
     }
 
     // Register AFTER allocation: W->data is the device pointer the decode kernels
@@ -188,8 +236,20 @@ int main(int argc, char ** argv) {
         ggml_gqh_register(W->data, ggml_nbytes(W), tensor_scale, grid_code);
     }
 
+    // Prove which path ran. Without this the mmq cases would pass just as happily
+    // on the dequant fallback they are supposed to be replacing -- the tolerances
+    // below are looser than the fallback's error, so a silent decline reads as a
+    // pass. This is the only thing that makes them a gate.
+    const size_t mmq_before = ggml_backend_cuda_get_mmq_launch_count();
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "graph compute failed\n");
+        return 1;
+    }
+    const size_t mmq_launches = ggml_backend_cuda_get_mmq_launch_count() - mmq_before;
+    if (mmq_mode && mmq_launches < 2) {
+        fprintf(stderr, "MMQ did not dispatch: %zu launches for the two wide "
+                        "multiplies (need GGML_GQH_MMQ=1 and an eligible grid)\n",
+                mmq_launches);
         return 1;
     }
 
@@ -218,17 +278,56 @@ int main(int argc, char ** argv) {
         row_max[i] = mx;
         row_nrm[i] = std::sqrt(sq);
     }
-    // Single-term tolerance, and the dense relative bar. Both are inert at I8DOT=0.
+    // Single-term tolerance, and the dense relative bar. Both are inert at I8DOT=0
+    // and with no mmq flag.
+    //
+    // Why row_max/127 is a real bound and not a shrug: every gqh3/gqh4/gqh2_h grid
+    // has amax exactly 1.0, and the ratio quantiser gives the row's largest
+    // sub-block r = 15, so row_max IS the superblock scale d_real. A weight step is
+    // then d_real/127 and the rounding error at most half of it -- this bar carries
+    // 2x margin, while a mis-mapped tile is off by a whole weight (127 steps) or
+    // returns zero. It is a tight bar for the failure mode it guards.
     const double I8_DENSE_REL = 2e-2;
-    auto onehot_tol = [&](int i) {
-        return i8_mode ? std::max((double) row_max[i] / 127.0, 1e-6) : 0.0;
+    // MMQ's dense bar is its own and much tighter than the I8 activation arm's.
+    // Measured 5.3e-4 to 6.9e-4 across gqh3 1x256/4x512/64x1024 at n17/n33/n64,
+    // so 3e-3 is roughly 4x margin -- deliberately close, because a wide dense
+    // pass is the only thing here that sees accumulation order.
+    const double MMQ_DENSE_REL = 3e-3;
+    auto int8_step = [&](int i) {
+        return std::max((double) row_max[i] / 127.0, 1e-6);
     };
+    auto onehot_tol = [&](int i) {
+        return i8_mode ? int8_step(i) : 0.0;
+    };
+    // Path 1 at ncols = cols. With GGML_GQH_MMQ=1 this node IS the MMQ path -- the
+    // dequant->cuBLAS route it used to take is exactly what MMQ replaces -- so the
+    // expectation changes with it: no longer fp16(decode(W)) bitwise, but the
+    // int8-MMQ product within one weight step. The identity columns keep it a
+    // single-term dot, so nothing else enters the error.
+    //
+    // This is also the widest one-hot sweep in the harness: EVERY position 0..cols-1
+    // carries the nonzero in some column, so a tile that mis-maps any k is caught
+    // here at ncols up to 1024, not just past 15.
     size_t bad = 0;
     size_t ties = 0;
+    double max_onehot_abs = 0.0;
     for (int i = 0; i < rows; ++i) {
         for (int j = 0; j < cols; ++j) {
             const float ref = want[(size_t) i * cols + j];
             const float g = got[(size_t) j * rows + i];
+            if (mmq_mode) {
+                const double err = std::fabs((double) g - (double) ref);
+                if (err > max_onehot_abs) { max_onehot_abs = err; }
+                if (err > int8_step(i)) {
+                    if (bad < 5) {
+                        fprintf(stderr, "  mmq mismatch at [%d,%d]: got %a want %a "
+                                        "(err %.4g > step %.4g)\n",
+                                i, j, g, ref, err, int8_step(i));
+                    }
+                    ++bad;
+                }
+                continue;
+            }
             const float w = ggml_fp16_to_fp32(ggml_fp32_to_fp16(ref));
             if (memcmp(&g, &w, 4) != 0) {
                 if (fp16_tie_equivalent(ref, g)) {
@@ -347,6 +446,95 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // ---- MMQ at a width that is not a tile multiple ------------------------
+    // D above sweeps every one-hot position, but only at ncols = cols, and
+    // 256/512/1024 are all multiples of the mmq_x granularity, so the partial-tile
+    // write-back (the j_max bound) never executes there. nwide of 17 or 33 does
+    // execute it. The dense pass is here too: one-hot dots have a single term, so
+    // nothing before this point exercises accumulation ORDER at a wide batch.
+    size_t bad_mmq_off   = 0;
+    size_t bad_mmq_dense = 0;
+    double mmq_max_rel   = 0.0;
+    double mmq_max_abs   = 0.0;
+    int    n_mmq_off     = 0;
+    if (mmq_mode) {
+        std::vector<int> offs;
+        for (int o : { 0, nwide, 16, cols / 2, cols - nwide }) {
+            if (o >= 0 && o + nwide <= cols &&
+                std::find(offs.begin(), offs.end(), o) == offs.end()) {
+                offs.push_back(o);
+            }
+        }
+        n_mmq_off = (int) offs.size();
+        std::vector<float> x3((size_t) cols * nwide);
+        std::vector<float> g3((size_t) rows * nwide);
+        for (int off : offs) {
+            std::fill(x3.begin(), x3.end(), 0.0f);
+            for (int j = 0; j < nwide; ++j) {
+                x3[(size_t) j * cols + off + j] = 1.0f;
+            }
+            ggml_backend_tensor_set(X3, x3.data(), 0, x3.size() * sizeof(float));
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "graph compute failed at mmq offset %d\n", off);
+                return 1;
+            }
+            ggml_backend_tensor_get(D3, g3.data(), 0, g3.size() * sizeof(float));
+            for (int i = 0; i < rows; ++i) {
+                for (int j = 0; j < nwide; ++j) {
+                    const double gv  = (double) g3[(size_t) j * rows + i];
+                    const double wv  = (double) want[(size_t) i * cols + off + j];
+                    const double err = std::fabs(gv - wv);
+                    if (err > mmq_max_abs) { mmq_max_abs = err; }
+                    if (err > int8_step(i)) {
+                        if (bad_mmq_off < 5) {
+                            fprintf(stderr, "  mmq offset-onehot mismatch off=%d [%d,%d]: "
+                                            "got %.9g want %.9g (err %.4g > step %.4g)\n",
+                                    off, i, j, gv, wv, err, int8_step(i));
+                        }
+                        ++bad_mmq_off;
+                    }
+                }
+            }
+        }
+
+        uint32_t rs3 = 0x85ebca6bu;                    // deterministic, no <random>
+        for (size_t t = 0; t < x3.size(); ++t) {
+            rs3 = rs3 * 1664525u + 1013904223u;
+            x3[t] = (float) ((int32_t) ((rs3 >> 8) % 2001) - 1000) / 1024.0f;
+        }
+        ggml_backend_tensor_set(X3, x3.data(), 0, x3.size() * sizeof(float));
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "graph compute failed on mmq dense activations\n");
+            return 1;
+        }
+        ggml_backend_tensor_get(D3, g3.data(), 0, g3.size() * sizeof(float));
+        for (int i = 0; i < rows; ++i) {
+            for (int j = 0; j < nwide; ++j) {
+                double acc = 0.0;
+                double xsq = 0.0;
+                for (int k = 0; k < cols; ++k) {
+                    const double xv = x3[(size_t) j * cols + k];
+                    acc += (double) want[(size_t) i * cols + k] * xv;
+                    xsq += xv * xv;
+                }
+                const double gv  = (double) g3[(size_t) j * rows + i];
+                // Normalise by the dot's own scale. max(1, |acc|) would turn a
+                // quantisation-sized error on a near-zero accumulator into a
+                // meaningless ratio; both operands carry one int8 round.
+                const double den = std::max(1e-12, row_nrm[i] * std::sqrt(xsq));
+                const double rel = std::fabs(gv - acc) / den;
+                if (rel > mmq_max_rel) { mmq_max_rel = rel; }
+                if (rel > MMQ_DENSE_REL) {
+                    if (bad_mmq_dense < 5) {
+                        fprintf(stderr, "  mmq dense mismatch [%d,%d]: got %.9g want %.9g "
+                                        "rel %.3g\n", i, j, gv, acc, rel);
+                    }
+                    ++bad_mmq_dense;
+                }
+            }
+        }
+    }
+
     if (has_header) {
         ggml_gqh_unregister(W->data);
     }
@@ -377,14 +565,31 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (bad || bad2 || bad_off || bad_dense) {
-        printf("FAIL %s %dx%d [%s]: dequant %zu/%zu differ, fused %zu/%d differ, "
+    if (bad || bad2 || bad_off || bad_dense || bad_mmq_off || bad_mmq_dense) {
+        printf("FAIL %s %dx%d [%s]: wide %zu/%zu differ, fused %zu/%d differ, "
                "offset-onehot %zu differ over %d offsets, dense %zu differ "
-               "(max rel %.3g)\n",
+               "(max rel %.3g)",
                rung.c_str(), rows, cols, i8_mode ? "i8" : "f32",
                bad, n_elem, bad2, rows * nvec,
                bad_off, n_off, bad_dense, max_rel);
+        if (mmq_mode) {
+            printf(", mmq n%d: offset-onehot %zu differ over %d offsets "
+                   "(max abs %.4g), dense %zu differ (max rel %.3g)",
+                   nwide, bad_mmq_off, n_mmq_off, mmq_max_abs,
+                   bad_mmq_dense, mmq_max_rel);
+        }
+        printf("\n");
         return 1;
+    }
+    if (mmq_mode) {
+        printf("OK   %s %dx%d [mmq]: MMQ dispatched (%zu launches), wide n%d one-hot "
+               "within one weight step (max abs %.4g), n%d one-hot over %d offsets "
+               "(max abs %.4g), n%d dense max rel %.3g, fused matvec n%d "
+               "bit-identical (scale %.9g, grid %d)\n",
+               rung.c_str(), rows, cols, mmq_launches, cols, max_onehot_abs,
+               nwide, n_mmq_off, mmq_max_abs, nwide, mmq_max_rel, nvec,
+               tensor_scale, grid_code);
+        return 0;
     }
     printf("OK   %s %dx%d [%s]: dequant->BLAS matches the fp16-rounded reference%s, "
            "fused matvec %s the f32 reference over %d cols at %d "

@@ -3,6 +3,7 @@
 #include "../gqh.h"
 
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -5156,4 +5157,90 @@ void dequantize_gqh2c_to_fp16_cuda(const void * vx, half * y, int64_t k, cudaStr
 }
 void dequantize_gqh2c_to_fp32_cuda(const void * vx, float * y, int64_t k, cudaStream_t stream) {
     gqh2c_decode_cuda(vx, y, k / GQH_SUPERBLOCK, stream);
+}
+
+// ---- MMQ side-data resolution (host) --------------------------------------
+// See the MMQ side-data comment in gqh.cuh for why the GRID is quantised rather
+// than the weights, and why some grids are refused.
+
+bool ggml_cuda_gqh_mmq_type(ggml_type type) {
+    return type == GGML_TYPE_GQH3;
+}
+
+bool ggml_cuda_gqh_mmq_enabled(void) {
+    static const bool on = []() {
+        const char * e = getenv("GGML_GQH_MMQ");
+        return e ? atoi(e) != 0 : false;
+    }();
+    return on;
+}
+
+bool ggml_cuda_gqh_mmq_info(ggml_type type, const void * vx, int lut[4], float * dscale) {
+    if (!ggml_cuda_gqh_mmq_type(type)) {
+        return false;
+    }
+    float tensor_scale = 0.0f;
+    int   grid_code    = 0;
+    if (!ggml_gqh_lookup(vx, &tensor_scale, &grid_code)) {
+        return false;
+    }
+    if (grid_code < 0 || grid_code >= GQH_GRID_CODES) {
+        return false;
+    }
+
+    const uint32_t * grid = nullptr;
+    int nlev = 0;
+    switch (type) {
+        case GGML_TYPE_GQH3:   grid = GQH3_GRID [grid_code]; nlev =  8; break;
+        case GGML_TYPE_GQH4:   grid = GQH4_GRID [grid_code]; nlev = 16; break;
+        case GGML_TYPE_GQH2_H: grid = GQH2H_GRID[grid_code]; nlev =  4; break;
+        default: return false;
+    }
+
+    float amax = 0.0f;
+    float amin = INFINITY;
+    for (int i = 0; i < nlev; ++i) {
+        float v;
+        memcpy(&v, &grid[i], sizeof(v));
+        const float a = fabsf(v);
+        amax = fmaxf(amax, a);
+        if (a > 0.0f) {
+            amin = fminf(amin, a);
+        }
+    }
+    // THE GUARD. int8 spans 127:1, so a wider grid loses the innermost levels --
+    // gqh4 codes 10 and 11 round two of their sixteen levels to exactly zero, and
+    // 8/9 keep them only as a single count. Nothing downstream would notice, so
+    // refuse here and let the caller dequantise. The shipped artifact uses gqh3
+    // {3,4} (10.96:1) and gqh4 {2,3,4} (36.30:1), decoded from its
+    // geoquant.gqh.headers KV, so this rejects nothing it contains.
+    if (!(amax > 0.0f) || !(amin < INFINITY) || amax > 127.0f*amin) {
+        return false;
+    }
+
+    const float lut_scale = amax / 127.0f;
+    lut[0] = lut[1] = lut[2] = lut[3] = 0;
+    for (int i = 0; i < nlev; ++i) {
+        float v;
+        memcpy(&v, &grid[i], sizeof(v));
+        int q = (int) lrintf(v / lut_scale);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        lut[i >> 2] |= (int) ((uint32_t) (uint8_t) (int8_t) q << (8*(i & 3)));
+    }
+    *dscale = tensor_scale * lut_scale;
+    return true;
+}
+
+bool ggml_cuda_gqh_mmq_eligible(const ggml_tensor * src0) {
+    if (!src0 || !ggml_cuda_gqh_mmq_type(src0->type)) {
+        return false;
+    }
+    // Stage 1 builds no expert-batched arm: mul_mat_id would need one header
+    // lookup per expert slice and there is no GQH MoE artifact to validate it.
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) {
+        return false;
+    }
+    int   lut[4];
+    float dscale;
+    return ggml_cuda_gqh_mmq_info(src0->type, src0->data, lut, &dscale);
 }

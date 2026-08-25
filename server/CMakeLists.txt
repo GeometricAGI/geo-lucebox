@@ -1236,6 +1236,33 @@ if(DFLASH27B_TESTS)
                 set_tests_properties(test-gqh-backend-i8xs0-n16-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_I8_XSCALE=0")
             endif()
+            # WIDER THAN THE MATVEC: the MMQ path. Everything above stops at
+            # GQH_MAX_COLS (16) because that is where ggml_cuda_gqh_mul_mat_vec
+            # stops; past it the multiply used to dequantise the whole weight set
+            # to fp16 for cuBLAS, and MMQ is what replaces that. So these are the
+            # only cases that touch it, and the ONLY ones that touch the wide
+            # write-back at all.
+            #
+            # 17 is the first width past the matvec cap and 33 is the first past a
+            # 32-wide tile, so both leave a partial tile and run the j_max bound
+            # that 64 (and cols itself, always a multiple of the granularity)
+            # never does. Each case also asserts MMQ actually DISPATCHED -- the
+            # tolerances are looser than the dequant fallback's error, so without
+            # that assert a silent decline would read as a pass.
+            #
+            # GGML_GQH_MMQ=1 because the path is opt-in while the dequant route it
+            # is verified against remains the reference; GGML_GQH_I8DOT=0 keeps
+            # the narrow fused arm in the same run bit-exact.
+            if(GQH_RUNG STREQUAL "gqh3")
+                foreach(GQH_MMQN 17 33 64)
+                    add_test(NAME test-gqh-backend-mmq${GQH_MMQN}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                             COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                     "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32"
+                                     8 mmq${GQH_MMQN})
+                    set_tests_properties(test-gqh-backend-mmq${GQH_MMQN}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+                endforeach()
+            endif()
             # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
             set_tests_properties(test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                 PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")

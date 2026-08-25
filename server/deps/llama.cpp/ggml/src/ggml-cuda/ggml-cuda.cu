@@ -2963,6 +2963,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const int cc            = ggml_cuda_info().devices[id].cc;
             const int warp_size     = ggml_cuda_info().devices[id].warp_size;
             use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        // GQH carries per-tensor state (scale + grid code) out of band, so MMQ
+        // eligibility is a property of the TENSOR, not just the type:
+        // should_use_mmq's signature cannot see an unregistered tensor or a grid
+        // outside int8's range. Declining here keeps the dequant fallback.
+        use_mul_mat_q           = use_mul_mat_q             && (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0));
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -2971,6 +2976,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
         const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
         use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        // GQH carries per-tensor state (scale + grid code) out of band, so MMQ
+        // eligibility is a property of the TENSOR, not just the type:
+        // should_use_mmq's signature cannot see an unregistered tensor or a grid
+        // outside int8's range. Declining here keeps the dequant fallback.
+        use_mul_mat_q           = use_mul_mat_q             && (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0));
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -3210,7 +3220,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02) &&
+            (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0))) {
             log_dispatch("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -4003,7 +4014,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 node->ne[2] <= mmvq_mmid_max;
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
                 ggml_cuda_should_use_mmq(node->src[0]->type, cc,
-                                         node->src[1]->ne[2], node->src[0]->ne[2]);
+                                         node->src[1]->ne[2], node->src[0]->ne[2]) &&
+                (!ggml_cuda_gqh_mmq_type(node->src[0]->type) ||
+                 ggml_cuda_gqh_mmq_eligible(node->src[0]));
             // qtype-105 takes the stream-sync-free MoE path above (no host
             // synchronize), so it is safe to capture. Mirror that path's gate
             // exactly, incl. the registry check, so we never skip-disable while
