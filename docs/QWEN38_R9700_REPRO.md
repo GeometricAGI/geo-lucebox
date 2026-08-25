@@ -198,11 +198,9 @@ drafter, decode-only from the engine's own `[spec-decode]` timer:
 | #642 + IQ4_XS  |  8 | 126.96 | 108.75 |  7.57 |
 | #642 + IQ4_XS  | 16 | 157.18 | 125.90 | 12.18 |
 
-**SUPERSEDED by section 11 - GQH can now widen, and leads.** The standing below
-was true of the kernel as it existed on 2026-08-24: our best (GQH, block 8,
-154.35) was 2-5% BEHIND #642's best (IQ4_XS, block 16, 157.18-162.82), because
-GQH won per step at width 8 by 21.6% (154.35 vs 126.88) and could not widen.
-Section 11 removes that constraint; GQH block 16 now reads 182.07.
+**Honest standing: our best (GQH, block 8, 154.35) is 2-5% BEHIND #642's best
+(IQ4_XS, block 16, 157.18-162.82).** GQH wins per step at width 8 by 21.6%
+(154.35 vs 126.88) and loses overall because it cannot widen.
 
 Build flags are not the difference. Rebuilding with upstream's published flags
 (`-DGGML_HIP_MMQ_MFMA=ON -DGGML_HIP_NO_VMM=ON`, gfx1201 only,
@@ -255,8 +253,7 @@ GQH3 under the VGPR cliff but ran 94-101 tok/s against register-xshared's 104
 occupancy, which this kernel does not want.
 
 So widening GQH is not a config change and not a missing instantiation. It needs
-a wide-ncols path of its own - which section 11 is. Note that the reasoning in
-this section about *why* it was slow was wrong twice over; see section 11.
+a wide-ncols path that keeps row reuse without spilling.
 
 ## 9. Prefill: GQH has no MMQ path
 
@@ -306,6 +303,54 @@ to keep arms comparable. Workloads with shared prefixes amortise the fixed
 prefill cost, so the production penalty is smaller than these rows - but
 cold-prefill latency is real and it is what a first request feels.
 
+### Measured: the first MMQ rung makes prefill WORSE, not better
+
+The paragraph above was a prediction. GQH3 now has an MMQ path (`GGML_GQH_MMQ=1`,
+off by default) and it does not behave as predicted. Target only, no drafter,
+`--max-ctx 32768 --prefix-cache-slots 0`, prefill from the server timer, best of
+three warm requests per cell, arms interleaved 1/0/1 because this rig drifts
+upward (see §10):
+
+| prompt tokens | dequant prefill | GQH3-MMQ prefill | delta |
+|---:|---:|---:|---:|
+|   353 |  0.5 s |  0.5 s | below the timer's 0.1 s resolution |
+| 2,033 |  2.4 s |  2.5 s | +4.2% |
+| 8,703 | 10.9 s | 11.7 s | +6.2% |
+
+Both arms reproduced to 0.1 s across the interleave, so the sign is not drift.
+
+Two reasons this is not yet a refutation of the idea, and one that might be.
+
+**It is 35% of the artifact.** Only 139 of the 396 header-bearing tensors are
+GQH3; the other 257 are GQH4 and still dequantise. So the fp16 materialisation
+this was supposed to delete is still mostly happening, while the MMQ cost is
+paid in full on the GQH3 share. The fixed adder should have fallen by about a
+third, and at 353 tokens the timer cannot resolve that.
+
+**The loader is the naive one.** Stage 1 deliberately built the narrowest correct
+tile loader: byte loads (forced - the superblock stride is 105 bytes, odd), two
+code words per lane, no cooperative dword staging.
+
+**But the regression GROWS with prompt length**, monotonically, which neither of
+those explains. MMQ re-loads and re-decodes the weight tile once per output
+column tile: at `mmq_x` 128 that is ~16 re-decodes at 2K tokens and ~68 at 8.7K,
+where the dequant path unpacks once and lets cuBLAS stream fp16. This is the same
+effect the `lucebox_mmq_big_tile_take` comment in mmq.cu describes for the small
+tile ("at prefill widths the narrow x-tile re-streams the weights"), except GQH3
+cannot buy its way out with a bigger tile - it already uses the 128x128 shape,
+and `mmq_x` stops at 128. IQ4_XS survives that re-streaming because its unpack is
+a nibble and a `__byte_perm` LUT; GQH3's is bit-sliced planes plus a curved-grid
+select per code.
+
+That last point is a hypothesis about WHY, not a measurement - but its prediction
+(regression rising with N) is what the table shows, and it says the honest next
+step is to finish GQH4/GQH2_H and re-measure the whole artifact before spending
+anything on micro-optimising the loader. If the re-decode term dominates, an
+expensive-unpack format may want dequant-once-per-prefill rather than MMQ, and
+"MMQ is the highest-value remaining work" above is simply wrong for prefill. It
+may still be right for the ncols 13-16 verify widths, which this table does not
+touch.
+
 ## 10. Where the search runs
 
 The widening work is driven by the geo-evo kernel loop, target `gqh_wide_he`
@@ -340,63 +385,3 @@ gap that survived rebuilding with their exact flags - so a goal threshold must
 be calibrated on the box that will run the search. The 157-163 bar above is
 measured on lucebox6, which is also where every number in sections 8 and 9 was
 taken. Ratios port between boxes; thresholds do not.
-
-## 11. Result: the wide arm lands, and GQH leads
-
-`GQH_MULTICOL_SPEC_MAX` was 12, so widths 13..16 fell to the generic
-runtime-guarded instantiation. Every width a verify dispatches now has an
-exact-width arm (`SPEC_MAX` 12 -> 16 == `GQH_MAX_COLS`, plus a separate wide arm
-from `GQH_MULTICOL_WIDE_MIN` 13 at `GQH_WIDE_ROWS` 2). The generic instantiation
-survives only as the `GGML_GQH_MULTICOL=0` A/B control.
-
-Measured on lucebox6's R9700, one build, one harness, 10 HumanEval prompts under
-spec decode, decode-only from the engine's own `[spec-decode]` timer:
-
-| target | block | tok/s | avg_commit | control |
-|---|---:|---:|---:|---|
-| **GQH**    | **16** | **182.07** | 10.98 | was 56.40 |
-| GQH        |  8 | 154.03 |  7.23 | 154.35 unmoved |
-| IQ4_XS     | 16 | 160.54 | 12.18 | 161.94 unmoved |
-| IQ4_XS     |  8 | 127.19 |  7.57 | 126.88 unmoved |
-
-**3.23x on the targeted arm, and the three control arms do not move**, so the
-change is isolated to the widths it targets. Reproduced three times at 182.85 /
-182.26 / 182.30 (0.3% spread) against a baseline re-read three times at 56.41 /
-56.05 / 56.15 - both well outside the ~1.3% scorer floor.
-
-**Standing vs upstream: ours 182.07 at 13,440,110,432 B against #642's best
-IQ4_XS block 16 at 160.54 (15,567,824,480 B) - +13.4% throughput on 13.7% fewer
-bytes.** Section 8 had us 2-5% behind; that is now superseded. GQH gets there
-with *lower* acceptance than IQ4_XS (10.98 vs 12.18), so the whole margin is
-per-step cost.
-
-### Two wrong diagnoses, recorded so they are not repeated
-
-The cliff was blamed on register pressure (section 8's first version) and then
-on instruction issue (its correction). Both are refuted by measurement:
-
-* occupancy driven 16 -> 3 waves/SIMD moved the scored shape not at all;
-* a 14% instruction cut bought 2.5%.
-
-The arm is **memory-level-parallelism bound**. That is why giving the wide widths
-their own exact-width shape is what moved it, and why LDS staging - which buys
-occupancy - had already measured slower.
-
-### The correctness gate still has a hole
-
-`ctest -R gqh` passes, including the nvec 13 and 16 cases added in section 5.
-But those cases drive `x` with one-hot basis vectors (`onehot[j*cols+j]`), so
-under the wide lane map they exercise **lane 0 alone and are blind past
-activation position 15**. A gate that only sees one lane cannot catch a lane-map
-error, which is the most likely way a wide-ncols change goes wrong. A
-dense-activation probe (`scripts/gqh_probe/`) covers that and prices int8 error
-locally; keep using it alongside ctest, not instead of it.
-
-### Provenance
-
-Produced by the geo-evo loop, target `gqh_wide_he_remote` (agent on powerboat,
-GPU scored over ssh on lucebox6). The scoring box dropped off the tailnet for
-two of the six iterations, so the scored change is **iteration 4's**, measured
-late; iterations 5 and 6 were spent blocked rather than improving. A clean run
-may find more. Loop artifacts and the full A/B history are on geo-evo branch
-`gqh/evo-wide-01`.
