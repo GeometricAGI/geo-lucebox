@@ -198,9 +198,11 @@ drafter, decode-only from the engine's own `[spec-decode]` timer:
 | #642 + IQ4_XS  |  8 | 126.96 | 108.75 |  7.57 |
 | #642 + IQ4_XS  | 16 | 157.18 | 125.90 | 12.18 |
 
-**Honest standing: our best (GQH, block 8, 154.35) is 2-5% BEHIND #642's best
-(IQ4_XS, block 16, 157.18-162.82).** GQH wins per step at width 8 by 21.6%
-(154.35 vs 126.88) and loses overall because it cannot widen.
+**SUPERSEDED by section 11 - GQH can now widen, and leads.** The standing below
+was true of the kernel as it existed on 2026-08-24: our best (GQH, block 8,
+154.35) was 2-5% BEHIND #642's best (IQ4_XS, block 16, 157.18-162.82), because
+GQH won per step at width 8 by 21.6% (154.35 vs 126.88) and could not widen.
+Section 11 removes that constraint; GQH block 16 now reads 182.07.
 
 Build flags are not the difference. Rebuilding with upstream's published flags
 (`-DGGML_HIP_MMQ_MFMA=ON -DGGML_HIP_NO_VMM=ON`, gfx1201 only,
@@ -253,7 +255,8 @@ GQH3 under the VGPR cliff but ran 94-101 tok/s against register-xshared's 104
 occupancy, which this kernel does not want.
 
 So widening GQH is not a config change and not a missing instantiation. It needs
-a wide-ncols path that keeps row reuse without spilling.
+a wide-ncols path of its own - which section 11 is. Note that the reasoning in
+this section about *why* it was slow was wrong twice over; see section 11.
 
 ## 9. Prefill: GQH has no MMQ path
 
@@ -337,3 +340,63 @@ gap that survived rebuilding with their exact flags - so a goal threshold must
 be calibrated on the box that will run the search. The 157-163 bar above is
 measured on lucebox6, which is also where every number in sections 8 and 9 was
 taken. Ratios port between boxes; thresholds do not.
+
+## 11. Result: the wide arm lands, and GQH leads
+
+`GQH_MULTICOL_SPEC_MAX` was 12, so widths 13..16 fell to the generic
+runtime-guarded instantiation. Every width a verify dispatches now has an
+exact-width arm (`SPEC_MAX` 12 -> 16 == `GQH_MAX_COLS`, plus a separate wide arm
+from `GQH_MULTICOL_WIDE_MIN` 13 at `GQH_WIDE_ROWS` 2). The generic instantiation
+survives only as the `GGML_GQH_MULTICOL=0` A/B control.
+
+Measured on lucebox6's R9700, one build, one harness, 10 HumanEval prompts under
+spec decode, decode-only from the engine's own `[spec-decode]` timer:
+
+| target | block | tok/s | avg_commit | control |
+|---|---:|---:|---:|---|
+| **GQH**    | **16** | **182.07** | 10.98 | was 56.40 |
+| GQH        |  8 | 154.03 |  7.23 | 154.35 unmoved |
+| IQ4_XS     | 16 | 160.54 | 12.18 | 161.94 unmoved |
+| IQ4_XS     |  8 | 127.19 |  7.57 | 126.88 unmoved |
+
+**3.23x on the targeted arm, and the three control arms do not move**, so the
+change is isolated to the widths it targets. Reproduced three times at 182.85 /
+182.26 / 182.30 (0.3% spread) against a baseline re-read three times at 56.41 /
+56.05 / 56.15 - both well outside the ~1.3% scorer floor.
+
+**Standing vs upstream: ours 182.07 at 13,440,110,432 B against #642's best
+IQ4_XS block 16 at 160.54 (15,567,824,480 B) - +13.4% throughput on 13.7% fewer
+bytes.** Section 8 had us 2-5% behind; that is now superseded. GQH gets there
+with *lower* acceptance than IQ4_XS (10.98 vs 12.18), so the whole margin is
+per-step cost.
+
+### Two wrong diagnoses, recorded so they are not repeated
+
+The cliff was blamed on register pressure (section 8's first version) and then
+on instruction issue (its correction). Both are refuted by measurement:
+
+* occupancy driven 16 -> 3 waves/SIMD moved the scored shape not at all;
+* a 14% instruction cut bought 2.5%.
+
+The arm is **memory-level-parallelism bound**. That is why giving the wide widths
+their own exact-width shape is what moved it, and why LDS staging - which buys
+occupancy - had already measured slower.
+
+### The correctness gate still has a hole
+
+`ctest -R gqh` passes, including the nvec 13 and 16 cases added in section 5.
+But those cases drive `x` with one-hot basis vectors (`onehot[j*cols+j]`), so
+under the wide lane map they exercise **lane 0 alone and are blind past
+activation position 15**. A gate that only sees one lane cannot catch a lane-map
+error, which is the most likely way a wide-ncols change goes wrong. A
+dense-activation probe (`scripts/gqh_probe/`) covers that and prices int8 error
+locally; keep using it alongside ctest, not instead of it.
+
+### Provenance
+
+Produced by the geo-evo loop, target `gqh_wide_he_remote` (agent on powerboat,
+GPU scored over ssh on lucebox6). The scoring box dropped off the tailnet for
+two of the six iterations, so the scored change is **iteration 4's**, measured
+late; iterations 5 and 6 were spent blocked rather than improving. A clean run
+may find more. Loop artifacts and the full A/B history are on geo-evo branch
+`gqh/evo-wide-01`.
