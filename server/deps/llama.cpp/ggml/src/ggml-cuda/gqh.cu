@@ -405,6 +405,45 @@ void ggml_cuda_gqh2c_decode(const void * wire, float * dst,
 #if !defined(GQH_WIRE_DEPTH2)
 #  define GQH_WIRE_DEPTH2 0  /* <-- A/B: flip THIS line to 1 for the 2-deep wire arm */
 #endif
+// GQH_WIRE_DEPTH2W: the same size axis, for the SB2 arm's WIDE wire stage. It is a
+// separate flag because GQH_WIRE_DEPTH2 CANNOT REACH THIS ARM: its rotate-and-refill
+// branch precedes the SB2 branch in the refill chain and stages `gqh_wire`, so with both
+// on, the prefetch would refill the narrow `wire[]` while the SB2 consumer drains
+// `wirew[]` -- a dead prefetch and a wrong result. DEPTH2W stages `gqh_wire_wide`, which
+// is what SB2 actually reads.
+//
+// MEASURED ON THE SCORING BOX AND SHIPPED OFF (iteration 7). This is the first time the
+// size axis has been testable on the SB2 arm at all -- DEPTH2 could never reach it -- and
+// the answer is that it does not pay: **181.45 tok/s against a 181.80-181.99 clean base,
+// i.e. -0.24%**, one scored run each.
+//
+// Read that number together with the register table, because the pair of them is worth
+// more than either. On the SCORING box a second wide stage is not the ~ROWS x 4 VGPRs the
+// struct suggests -- the scheduler widens the whole trip around it -- and it lands at
+// 130 / 127 / 99 VGPRs (gqh4 / gqh2_h / gqh3) against 97 / 100 / 99, i.e. 12 -> 10
+// waves/SIMD with NO spill. So this arm gave up 17% of its resident waves, doubled the
+// weight-wire bytes in flight, and came out flat. Two things follow, and iteration 7's
+// other experiment is what makes them safe to state:
+//
+//   * RESIDENT WAVES IN THE 10-16 BAND ARE NOT WHAT THIS ARM IS SHORT OF. Forcing the
+//     other direction (amdgpu_waves_per_eu(16), 96 VGPRs, 12 -> 16 waves) cost -6.3% of
+//     HumanEval and -6.4% of the CODE axis -- but 96 is only reachable on the scoring
+//     box by spilling 2-8 B/lane INSIDE the superblock loop. Against this flag's flat
+//     result at 10 waves, that -6.3% is the SPILL, not the occupancy.
+//   * THE WEIGHT WIRE IS NOT THE EXPOSED LATENCY. Doubling its depth is free and buys
+//     nothing, so whatever the arm waits on is elsewhere -- the 16 b128 activation loads
+//     per trip, VALU issue, or DRAM itself. Note the wire is only ~34 B/lane/row of the
+//     ~290 B/lane a trip reads.
+//
+// Flipping this to 1 costs nothing when off: every line it adds is `if constexpr`-dead,
+// verified with scripts/gqh_isa/res_compare.py on BOTH toolchains (0 of 845 kernels move).
+//
+// Rotation, clamping and bit-exactness are DEPTH2's, unchanged: register copy rather than
+// a parity index, the last trips re-read the final trip (an L2 hit) instead of splitting
+// the body across basic blocks, and the same bytes fold into acc[] in the same order.
+#if !defined(GQH_WIRE_DEPTH2W)
+#  define GQH_WIRE_DEPTH2W 0  /* <-- A/B: flip THIS line to 1 for the 2-deep wide wire */
+#endif
 #define GQH_MATVEC_WARPS   4
 #define GQH_PER_LANE       (GQH_SUPERBLOCK / GQH_WARP)   // 8
 // Columns handled by one pass over the weights. The weight matrix is the whole
@@ -701,16 +740,80 @@ void ggml_cuda_gqh2c_decode(const void * wire, float * dst,
 //     waves/SIMD, i.e. exactly one round -- but at ROWS == 2 they are 2560 waves against
 //     ~2048, 1.25 rounds. That one is an argument FOR 4 and it is why this is a macro and
 //     not a literal: it is the first thing to A/B.
+//
+// **ALL THREE OF THOSE TIE-BREAKS ARE NOW GONE, AND ncols == 16 TAKES 4.** Read them
+// against iteration 7, which measured the resident-wave axis directly on the scoring box:
+//   - Tie-break 1 and 3 are RESIDENT-WAVE arguments, and waves in the 10-16 band are
+//     measured free on this arm. Forcing 12 -> 16 waves cost -6.3% of HumanEval and every
+//     bit of that was the SPILL it needed; giving back 12 -> 10 waves with no spill
+//     measured FLAT. So "16 waves" is not a reason for 2 and "exactly one occupancy round"
+//     is not a reason for 4. What replaces both: the scoring box has ~55 free VGPRs at 10
+//     waves, and spending them costs nothing PROVIDED nothing spills into the loop.
+//   - Tie-break 2 -- the reduce-scatter epilogue switching off at ROWS * NCOLS_MAX == 64
+//     and costing 260 non-loop instructions per row against 187 -- was a property of the
+//     EPILOGUE'S GATE, not of ROWS. That gate now runs K = ROWS * NCOLS_MAX / GQH_WARP
+//     independent passes over disjoint column slices, so 64 accumulators cost exactly what
+//     two lots of 32 cost: 187 per row at ROWS == 4 as well. See the #if GQH_RS_REDUCE
+//     block, which is where the argument for this constant now lives.
+// What is left is the first column of the sweep, unopposed: ROWS == 4 is 6.8% fewer loop
+// instructions per row at ncols 16, and -- the reason it is worth more than 6.8% here --
+// it halves the ACTIVATION stream per unit work. A trip reads ~290 B/lane of which 256 are
+// the 16 b128 int8 activation loads, and those are paid ONCE per trip however many rows
+// the warp owns. Iteration 7 eliminated the weight wire as the exposed latency and left
+// that load group as the one big untouched one.
+//
+// Scoped to NCOLS == GQH_MAX_COLS, and that is deliberate on two counts. Measurement:
+// ncols 16 is 99.2% of the scored run's wide dispatches, so it is the only width this
+// change can be held to account for. Correctness: 4 * 16 is a multiple of GQH_WARP and
+// 4 * 13, 4 * 14, 4 * 15 are not, so 13..15 would fall off the reduce-scatter onto the
+// butterfly -- a slower epilogue on widths nothing measures. They keep GQH_WIDE_ROWS and
+// byte-identical codegen. This is the per-width table gqh_wide_rows() was templated for.
 #ifndef GQH_WIDE_ROWS
 #define GQH_WIDE_ROWS 2
 #endif
 
-// ROWS for one wide width. Templated on NCOLS so a later per-width table has somewhere to
-// go; constant for now.
+// ROWS at the widest verify width, separately settable so the A/B is one -D. Must keep
+// ROWS * GQH_MAX_COLS a multiple of GQH_WARP to hold the reduce-scatter epilogue (2 and 4
+// both do; the static_assert in gqh_wide_rows spells the constraint out).
+#ifndef GQH_WIDE_ROWS16
+#define GQH_WIDE_ROWS16 4
+#endif
+
+// ROWS for one wide width. Templated on NCOLS because the widest width now differs: see
+// the sweep above.
 template <int NCOLS>
+// **ROWS == 8 IS DEAD, BY THE ONE GATE THAT HAS EVER PREDICTED THIS ARM: SPILL.** The
+// static_asserts below permit it (8 * 16 == 4 * GQH_WARP, power of two) and the
+// multi-pass epilogue handles it at K == 4 for free, so it was the top unscreened item
+// after iteration 8. It never needed a GPU. `dump_isa.sh -DGQH_WIDE_ROWS16=8
+// -Rpass-analysis=kernel-resource-usage`, the six ncols-16 SB2 arms this tree dispatches:
+//
+//   rung            ROWS 4 (shipped)        ROWS 8
+//   gqh2_h(108)     167 VGPR / 0 spill      192 VGPR / 125 spill / 328 B scratch
+//   gqh3  (109)     166      / 0            192       / 102       / 292 B
+//   gqh4  (111)     169      / 0            192       / 110       / 336 B
+//
+// `acc[8][16]` alone is 128 VGPRs against ROWS 4's 64 and there is nowhere to put them.
+// Iteration 7 priced in-loop scratch at ~-0.8% of HE per byte per lane; 292-336 B/lane is
+// not a candidate, it is a different kernel. 24 kernels spill at ROWS 8 and 0 do at ROWS 4.
+//
+// **AND THE SAME SCREEN KILLS BUYING OCCUPANCY AT THIS ROWS.** Iteration 9's trace found
+// the out == 5120 dispatches launch 1280 waves == EXACTLY 10 per SIMD against an occupancy
+// of 8, i.e. 1.25 rounds with the tail round a quarter full, so `amdgpu_waves_per_eu(10)`
+// (VGPRs <= 152) looks like it should erase the tail outright. It does not fit: the
+// compiler lands on 144 VGPRs and **spills 20-21 registers on every rung** (98 kernels
+// spill tree-wide, against 0). The kernel genuinely wants ~167. So occupancy 10 at
+// ROWS == 4 is not free -- it is available only to a candidate that first frees ~25 VGPRs
+// of REAL live state, and the obvious donor is the activation block (`int4 xqw[16]` is 64
+// VGPRs of the ~167; two 8-column halves per trip would hold 32 and cost +16 b128 loads).
+// That is a change to the column loop, not a launch-bounds attribute.
+//
 static constexpr int gqh_wide_rows() {
     static_assert(NCOLS >= 9 && NCOLS <= GQH_MAX_COLS, "wide arm covers 9..GQH_MAX_COLS");
-    return GQH_WIDE_ROWS;
+    static_assert(GQH_WIDE_ROWS16 * GQH_MAX_COLS % GQH_WARP == 0,
+                  "ROWS16 must keep the widest arm on the reduce-scatter epilogue");
+    static_assert((GQH_WIDE_ROWS16 & (GQH_WIDE_ROWS16 - 1)) == 0, "ROWS16 must be 2^k");
+    return NCOLS == GQH_MAX_COLS ? GQH_WIDE_ROWS16 : GQH_WIDE_ROWS;
 }
 
 // Activation base POINTERS the exact-width arm carries; every further column is addressed
@@ -2285,6 +2388,26 @@ static __global__ void gqh_matvec_kernel(
                 wire2[r] = gqh_wire_load<RUNG>(rowbase[r], sb1_off, woff);
             }
         }
+        // The SB2 arm's second WIDE stage, see GQH_WIRE_DEPTH2W. `!DEPTH2` is belt and
+        // braces rather than a real case (GQH_WIRE_DEPTH2 ships 0), but the two stages
+        // share the refill chain below and only one of them may own it.
+        //
+        // A trip is SBPT superblocks wide on this arm, so the second stage holds the
+        // NEXT TRIP -- superblock SBPT, not superblock 1 -- and the in-loop refill below
+        // steps by 2*SBPT for the same reason. Clamped like DEPTH2's fill: the launcher
+        // guarantees nsb % SBPT == 0, so nsb - SBPT is the last real trip and a tensor
+        // with a single trip re-reads trip 0 into a stage it never drains.
+        constexpr bool DEPTH2W = GQH_WIRE_DEPTH2W && SB2 && !DEPTH2;
+        gqh_wire_wide wirew2[DEPTH2W ? ROWS : 1];
+        if constexpr (DEPTH2W) {
+            const uint32_t sb1w_off =
+                (uint32_t) (nsb > SBPT ? SBPT : 0) * (uint32_t) sb_bytes;
+    #pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                wirew2[r] = gqh_wire_load_wide<RUNG>(
+                    rowbase[r], sb1w_off, (uint32_t) sb_bytes, woff);
+            }
+        }
         // Batch-1 carries the activations through the same pipeline stage as the wire.
         // loadcnt retires in issue order, so as long as ANY load in the body is consumed
         // in the iteration that issues it, the partial wait that consumes it also drains
@@ -2617,6 +2740,15 @@ static __global__ void gqh_matvec_kernel(
             const uint32_t sbn2_off_raw = (uint32_t) sbn2 * (uint32_t) sb_bytes;
             const uint32_t sbn2_off = I8DOT
                 ? (uint32_t) gqh_uniform((int) sbn2_off_raw) : sbn2_off_raw;
+            // The 2-deep WIDE arm prefetches the trip after next, i.e. sb + 2*SBPT, and
+            // clamps to the last real trip start. Dead off that arm (SBPT == 1 and
+            // DEPTH2W == false fold this to sbn2's own expression with no user), which is
+            // why it sits here beside sbn2 rather than under an if constexpr: the same
+            // dead-code contract sbn2 has already relies on.
+            const int sbn2w = sb + 2 * SBPT < nsb ? sb + 2 * SBPT : nsb - SBPT;
+            const uint32_t sbn2w_off_raw = (uint32_t) sbn2w * (uint32_t) sb_bytes;
+            const uint32_t sbn2w_off = I8DOT
+                ? (uint32_t) gqh_uniform((int) sbn2w_off_raw) : sbn2w_off_raw;
             // Every row's wire load is issued here, in one group, so the wave holds ROWS
             // independent DRAM requests in flight instead of one. That is the whole point
             // of ROWS > 1: bytes-in-flight per wave is the axis this kernel is bound on.
@@ -2628,6 +2760,13 @@ static __global__ void gqh_matvec_kernel(
                     // dead as a wire stage.
                     wire[r]  = wire2[r];
                     wire2[r] = gqh_wire_load<RUNG>(rowbase[r], sbn2_off, woff);
+                } else if constexpr (DEPTH2W) {
+                    // Same rotate-then-refill as DEPTH2, staging the wide wire. The copy
+                    // is of registers already dead as a stage: wirew[r] was drained into
+                    // codes/codes_hi/rb/hi1w/d above, exactly as wire[r] is on that arm.
+                    wirew[r]  = wirew2[r];
+                    wirew2[r] = gqh_wire_load_wide<RUNG>(
+                        rowbase[r], sbn2w_off, (uint32_t) sb_bytes, woff);
                 } else if constexpr (SB2) {
                     wirew[r] = gqh_wire_load_wide<RUNG>(
                         rowbase[r], sbn_off, (uint32_t) sb_bytes, woff);
@@ -2739,6 +2878,39 @@ static __global__ void gqh_matvec_kernel(
                         acc[r][c] += s * dot;
                     }
     #else
+                    // **THE SHIPPED ARM'S INSTRUCTION BUDGET, READ OFF THE ISA (iteration 9),
+                    // and it is why the next step on this arm is WMMA and not another knob.**
+                    // gqh4, ncols 16 / ROWS 4 / SB2, the hot trip: **779 instructions, of
+                    // which 256 are `v_dot4_i32_iu8`** -- 3.04 issued per useful dot, 2.4 of
+                    // them VALU. The rest: 161 SALU (86 of those `s_delay_alu` / `s_wait_*`),
+                    // 102 bitops and 32 `ds_load_u16` for the weight decode, 64
+                    // `v_cvt_f32_i32` + 64 fma for the scale, 16 `b128` activation loads.
+                    // gqh2_h is 899 with the same 256 dots (its unpack is 66 bitops dearer).
+                    //
+                    // Every block in that 523-instruction remainder is at or near its floor:
+                    // the cvt+fma pair is TWO VALU per (output, superblock) and cannot be
+                    // hoisted, because `s_row` is per (row, superblock) and every trip brings
+                    // a new one -- there is no window over which an int accumulator could
+                    // stay integer. The decode is 2.1 instructions per weight amortised over
+                    // all 16 columns. So the dp4a formulation is spent: 64 outputs x 6 VALU
+                    // is 384 of the 779, and shaving the other 395 is what iterations 4-8 did.
+                    //
+                    // The step change is the DOT ITSELF. `v_wmma_i32_16x16x16_iu8` retires
+                    // 4096 MACs per instruction against dp4a's 128, so this trip's 32768 MACs
+                    // are 8 instructions instead of 256 -- a ~32% cut in trip instructions
+                    // that lands on the useful ones. It also collapses the accumulators: a
+                    // 16x16 int32 D tile is 8 VGPRs per lane, so SIXTEEN output rows cost 8
+                    // where ROWS == 4 spends 64, which is the register room every idea in
+                    // this file has run out of. The price is layout: WMMA wants lane L holding
+                    // row (L%16) at k = 8*(L/16), i.e. 16 rows in flight per wave against this
+                    // arm's one-row-per-wave-slice read, so the coalesced global read has to
+                    // be staged through LDS and transposed. That is a new kernel, not an edit.
+                    //
+                    // Amdahl, from the same trace (decode window only, prefill excluded):
+                    // gqh_matvec is 45.5% of decode GPU busy and 36.5% of the decode WALL --
+                    // 21% of that wall is GPU-idle and 15% is the draft's `mul_mat_q`. So a
+                    // 32% cut in matvec instructions is worth ~4% of HE at iteration 4's
+                    // measured ~1/4 instruction-to-time conversion, not 32%.
     #pragma unroll
                     for (int c = 0; c < NCOLS_MAX; ++c) {
                         // FOUR dp4a into ONE int accumulator on the SB2 arm, for one cvt,
@@ -2855,58 +3027,101 @@ static __global__ void gqh_matvec_kernel(
     // output ROWS, which are consecutive floats in y -- so the 32 lane-0 dwords become
     // ONE wave-wide `global_store_b32` covering eight 16-byte runs.
     //
-    // Gated on the accumulator count being exactly the wave width, which is the whole
-    // reason it closes. The generic (`ncols < NCOLS_MAX`) and batch-1 arms keep the old
-    // network untouched -- the generic one is the same-binary A/B control and its codegen
-    // must not move -- and so does anything whose ROWS is not a power of two.
+    // ONE PASS consumes exactly GQH_WARP accumulators, because "the survivor lands in
+    // lane k" is a statement about a wave's worth of them. A shape with K * GQH_WARP
+    // accumulators therefore runs K INDEPENDENT passes over disjoint COLUMN SLICES --
+    // K x 31 exchanges and K x 31 adds for K x 32 outputs, i.e. the SAME per-output cost
+    // as K == 1, against the butterfly's K x 5 x 32 plus K x 32 one-lane stores. That is
+    // what makes ROWS == 4 affordable at ncols == 16: the ROWS sweep at GQH_WIDE_ROWS
+    // priced 4 as "6.8% fewer loop instructions, but the epilogue goes 187 -> 260
+    // instructions per row", and the second half of that trade is this block's absence,
+    // not a property of ROWS. With K passes it is 187 per row at either ROWS.
+    //
+    // Slicing by COLUMN and not by row is what keeps the store coalesced: within a pass
+    // consecutive lanes still walk consecutive output ROWS (`k == c * ROWS + r`), so each
+    // pass's store is one wave-wide `global_store_b32` over GQH_WARP/ROWS runs of
+    // ROWS*4 bytes -- at ROWS == 4, eight 16-byte runs, the same shape K == 1 had.
+    //
+    // K > 1 IS SCOPED TO THE WIDE ARM ON PURPOSE. Widening the gate to "any multiple of
+    // GQH_WARP" alone would also turn this on for the ncols == 8 / ROWS == 8 member of
+    // the runtime-selectable {3, 4, 6, 8} set at GQH_MULTICOL_ROWS_WIDE (8 * 8 == 64),
+    // which is `gqh_n8_he`'s scored arm and is not what this iteration measured. The
+    // NCOLS_MAX >= GQH_MULTICOL_WIDE_MIN clause holds that codegen byte-identical; the
+    // K == 1 clause leaves every arm that already took this block exactly as it was.
+    //
+    // The generic (`ncols < NCOLS_MAX`) and batch-1 arms keep the old network untouched --
+    // the generic one is the same-binary A/B control and its codegen must not move -- and
+    // so does anything whose ROWS is not a power of two.
 #if GQH_RS_REDUCE
-    if constexpr (XSHARED && ROWS * NCOLS_MAX == GQH_WARP && (ROWS & (ROWS - 1)) == 0) {
+    // Columns one pass covers, and how many passes the accumulator block needs. RS_GROUPS
+    // is 0 when there are fewer than GQH_WARP accumulators, which is what the >= 1 test
+    // below rejects; the multiply-back is the divisibility check.
+    constexpr int RS_COLS   = ROWS <= GQH_WARP ? GQH_WARP / ROWS : 0;
+    constexpr int RS_GROUPS = ROWS * NCOLS_MAX / GQH_WARP;
+    constexpr bool RS_OK =
+        XSHARED && (ROWS & (ROWS - 1)) == 0 && RS_GROUPS >= 1
+        && ROWS * NCOLS_MAX == RS_GROUPS * GQH_WARP
+        && (RS_GROUPS == 1 || NCOLS_MAX >= GQH_MULTICOL_WIDE_MIN);
+    if constexpr (RS_OK) {
         const int rlane = gqh_lane_id();
-        // Pure register renaming: every index is a compile-time constant, so the flatten
-        // itself emits nothing.
-        float v[GQH_WARP];
+        // NOTHING is hoisted out of the pass loop -- not the lane -> (row, column) map,
+        // not the clamp -- even though both are pass-invariant and CSE folds them anyway.
+        // The point is the K == 1 arms: at RS_GROUPS == 1 this body must be the block it
+        // replaces STATEMENT FOR STATEMENT, because ncols == 8 / ROWS == 4 is a member of
+        // `gqh_n8_he`'s runtime-selectable set and this iteration does not measure it.
+        // Hoisting them is the same code and it is not the same codegen -- measured:
+        // computing the map before the reduce-scatter levels instead of after moved those
+        // arms 95 -> 96 and 93 -> 92 VGPRs (occupancy unchanged, no spill). Harmless
+        // looking, and exactly the kind of drift iteration 7 caught being invisible here
+        // and -6.3% there. Written this way, res_compare reports 0 moved.
 #pragma unroll
-        for (int c = 0; c < NCOLS_MAX; ++c) {
+        for (int g = 0; g < RS_GROUPS; ++g) {
+            // Pure register renaming: every index is a compile-time constant, so the
+            // flatten itself emits nothing. At RS_GROUPS == 1 this is `v[c * ROWS + r] =
+            // acc[r][c]` over every column, statement for statement what it replaces.
+            float v[GQH_WARP];
 #pragma unroll
-            for (int r = 0; r < ROWS; ++r) {
-                v[c * ROWS + r] = acc[r][c];
+            for (int c = 0; c < RS_COLS; ++c) {
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    v[c * ROWS + r] = acc[r][g * RS_COLS + c];
+                }
             }
-        }
-        // Same five levels in the same order as the butterfly, so v[0] is bit-for-bit
-        // the float lane 0 used to store for accumulator `lane`.
-        gqh_rs_level<GQH_WARP / 2>(v, rlane);
-        gqh_rs_level<8>(v, rlane);
-        gqh_rs_level<4>(v, rlane);
-        gqh_rs_level<2>(v, rlane);
-        gqh_rs_level<1>(v, rlane);
+            // Same five levels in the same order as the butterfly, so v[0] is bit-for-bit
+            // the float lane 0 used to store for accumulator `lane`.
+            gqh_rs_level<GQH_WARP / 2>(v, rlane);
+            gqh_rs_level<8>(v, rlane);
+            gqh_rs_level<4>(v, rlane);
+            gqh_rs_level<2>(v, rlane);
+            gqh_rs_level<1>(v, rlane);
 
-        static_assert((ROWS & (ROWS - 1)) == 0, "the lane -> (row, col) map needs ROWS 2^k");
-        const int r_out = rlane & (ROWS - 1);
-        const int c_out = rlane / ROWS;
-        // Wave-uniform SGPR base + a 32-bit lane BYTE offset, for the SADDR reason in
-        // gqh_wire_offsets: the lane-0 form's address was uniform and therefore SGPRs,
-        // and this is the spelling that keeps the per-lane form to one 32-bit VGPR
-        // instead of a 64-bit VALU pair plus its s_wait_alu hazards.
-        //
-        // The 32-bit offset cannot wrap on this arm: ROWS * NCOLS_MAX == GQH_WARP with
-        // ROWS a power of two admits ncols 4 / 8 / 16, so c_out ranges 0..15 at the widest.
-        // **ncols == 16 at ROWS == 2 IS now instantiated** -- gqh_wide_rows() gives the wide
-        // arm ROWS > 1, which is what first makes this epilogue reachable at 16 columns; the
-        // note that used to sit here ("no instantiation pairs 16 with ROWS == 2") is false as
-        // of that change. Widest live shape out == 17408, so the bound to clear is
-        // 15 * 17408 * 4 + 4 = 1 044 484 bytes, comfortably inside 32 bits.
-        //
-        // Nothing else in the map cares how wide c_out got: the survivor for accumulator
-        // `k == c * ROWS + r` lands in lane k, so `r_out = rlane & (ROWS-1)` /
-        // `c_out = rlane / ROWS` inverts the flatten at any (ROWS, NCOLS_MAX) whose product
-        // is GQH_WARP, and the tail clamp below is a statement about `row + r_out` alone.
-        const uint32_t yoff =
-            ((uint32_t) c_out * (uint32_t) y_col_stride + (uint32_t) r_out) * 4u;
-        // The row clamp, unchanged in meaning: a tail warp recomputed row out-1 in slot
-        // r > 0 and must not write it back. One wave-wide compare instead of ROWS
-        // scalar branches.
-        if (r_out == 0 || row + r_out < out) {
-            *(float *) ((char *) (y_base + row) + yoff) = v[0];
+            static_assert((ROWS & (ROWS - 1)) == 0,
+                          "the lane -> (row, col) map needs ROWS 2^k");
+            // The survivor for accumulator `k == c * ROWS + r` lands in lane k, so this
+            // inverts the flatten; `c_out` is the column WITHIN the pass and `g * RS_COLS`
+            // is the slice base. At RS_GROUPS == 1 the slice base is 0 and c_out is the
+            // column outright, which is what this said before there were passes.
+            const int r_out = rlane & (ROWS - 1);
+            const int c_out = rlane / ROWS;
+            // Wave-uniform SGPR base + a 32-bit lane BYTE offset, for the SADDR reason in
+            // gqh_wire_offsets: the lane-0 form's address was uniform and therefore SGPRs,
+            // and this is the spelling that keeps the per-lane form to one 32-bit VGPR
+            // instead of a 64-bit VALU pair plus its s_wait_alu hazards.
+            //
+            // The 32-bit offset cannot wrap on this arm: the column index is bounded by
+            // NCOLS_MAX <= GQH_MAX_COLS == 16, and the widest live shape is out == 17408,
+            // so the bound to clear is 15 * 17408 * 4 + 4 = 1 044 484 bytes, comfortably
+            // inside 32 bits. That bound is set by NCOLS_MAX alone and so is unmoved by
+            // K > 1, which only changes how the same 0..NCOLS_MAX-1 range is walked.
+            const uint32_t yoff =
+                ((uint32_t) (g * RS_COLS + c_out) * (uint32_t) y_col_stride
+                 + (uint32_t) r_out) * 4u;
+            // The row clamp, unchanged in meaning: a tail warp recomputed row out-1 in
+            // slot r > 0 and must not write it back. One wave-wide compare instead of
+            // ROWS scalar branches.
+            if (r_out == 0 || row + r_out < out) {
+                *(float *) ((char *) (y_base + row) + yoff) = v[0];
+            }
         }
         return;
     }
@@ -3549,6 +3764,26 @@ static void gqh_n8_tile_launch(
 // or the workgroup-per-CU cap, which only binds at warps == 1 (32 workgroups needed for 32
 // resident waves against a cap of 16, i.e. 8 waves/SIMD -- a diagnostic point, and it is
 // duly the worst local cell).
+// **THE WARPS AXIS IS CLOSED, AND IT WAS CLOSED ON THE BOX THAT SCORES.** Iteration 9
+// swept this knob against the SHIPPED ROWS == 4 binary -- no rebuild, one env var, arms
+// interleaved over two passes -- and every value loses to the shipped GQH_MATVEC_WARPS:
+//
+//   warps        he_tok_s (pass 1 / pass 2)      mean vs 4
+//     4         194.8613  194.8613               --      <- shipped
+//     8         193.8914  193.7161            -0.52%
+//     2         193.8475  193.8475            -0.52%
+//    16         191.8514  191.7655            -1.59%
+//     3         190.7412  190.4444            -2.20%
+//     6         190.4021  190.1487            -2.42%
+//
+// Both passes of every arm agree to <=0.1% and three of the six are bit-identical across
+// passes, so the ordering is not noise: the greedy decode is deterministic and only the
+// clock moves. Non-powers-of-two are the worst cells, which is block granularity against
+// a 64-CU dispatch, not occupancy -- total waves is out / ROWS and does not depend on
+// warps at all (see below). **Do not re-sweep this without a reason that names something
+// other than the knob**; the +0.60%-here / -1.21%-there per-shape table iteration 6
+// measured is the same axis and it also lost there.
+//
 static int gqh_wide_warps_forced() {
     static const int forced = []() {
         const char * e = getenv("GGML_GQH_WIDE_WARPS");
@@ -4205,14 +4440,13 @@ static void gqh_exact_launch(
 // (ROWS * NCOLS_MAX == GQH_WARP), and `ctest -R gqh` runs the f32 arm at nvec 16, so the
 // new lane -> (row, column) map is checked BITWISE against the geo-quant reference rather
 // than argued for.
-template <ggml_type RUNG, int NCOLS, bool PAIRED>
-static void gqh_wide_launch(
+template <ggml_type RUNG, int NCOLS, bool PAIRED, int ROWS>
+static void gqh_wide_launch_rows(
         bool i8, bool xshared_scale, bool sb2, cudaStream_t stream,
         const uint8_t * a, float * ya, const uint8_t * b, float * yb,
         const float * x, int in, int out,
         float scale_a, gqh_grid16 grid_a, float scale_b, gqh_grid16 grid_b,
         int64_t x_col_stride, int64_t y_col_stride, gqh_qx_view qxv) {
-    constexpr int ROWS = gqh_wide_rows<NCOLS>();
     const int warps = gqh_verify_warps(NCOLS, PAIRED ? 2 * out : out, i8);
     const int rows_per_block = warps * ROWS;
     const dim3 threads(GQH_WARP * warps, 1, 1);
@@ -4261,6 +4495,79 @@ static void gqh_wide_launch(
             stream, a, ya, b, yb, x, in, out, scale_a, grid_a, scale_b, grid_b,
             x_col_stride, y_col_stride);
     }
+}
+
+// ROWS on the widest verify width, as a RUNTIME choice, for the same reason
+// GGML_GQH_WIDE_WARPS exists and stated in the same place: **"a change to what the kernel
+// COMPUTES can be ranked locally, and a change to how work is DISTRIBUTED cannot. Grid
+// geometry, warps, ROWS, and anything reasoned from occupancy rounds must be A/B'd on the
+// scoring box before it ships."** ROWS is named in that sentence. Without a knob, pricing
+// it is a full rsync + rebuild + measure per point (~10 min); with one it is a ~90 s ssh
+// loop against the already-built binary, which is what makes a ROWS x warps sweep
+// affordable at all.
+//
+// Bit-identical at either value, and for a stronger reason than the warps knob's: ROWS is
+// how many output rows ONE WARP owns, no accumulator crosses a warp, and the reduce-scatter
+// epilogue is a wave-width property (see the #if GQH_RS_REDUCE block). So this moves which
+// warp computes a given output row and nothing about how it is computed -- the same claim
+// `ctest -R gqh` checks bitwise at nvec 16 against the geo-quant reference.
+//
+// 2 and 4 only: both keep ROWS * GQH_MAX_COLS a multiple of GQH_WARP, which is what holds
+// the widest arm on the reduce-scatter epilogue. 0 / unset takes the shipped compile-time
+// GQH_WIDE_ROWS16, so this is inert unless it is asked for.
+//
+// **OPT-IN AT COMPILE TIME, BECAUSE IT IS DEAD WEIGHT -- NOT BECAUSE A COST IS PROVEN.**
+// Iteration 8 built the knob ON and read its ROWS16=2 arm at 180.54 / 180.31 against a
+// frozen base of 181.99 whose own four measurements span 181.80-182.30: 0.9% low on a
+// build that reproduces the base's geometry, with 24 extra kernels (869 against 845) the
+// only difference. That looked like a code-size tax -- but the shipped AB=0 build then
+// scored 194.817, statistically identical to the SAME A/B build's ROWS16=4 arm
+// (194.60-195.71). If there were a 0.9% tax, ROWS == 4 does not pay it, and the ROWS16=2
+// gap is unexplained. **Do not quote "the knob costs 0.9%" as a fact.** What is measured
+// is that the ROWS16=2 ARM of an AB=1 build reads low. Keeping the set opt-in is justified
+// by 24 kernels of dead weight on a shipped binary; every line of it is
+// `if constexpr`-dead at ROWS16=4 with the flag off.
+//
+// So the A/B set is behind GQH_WIDE_ROWS16_AB, defaulted 0, exactly like GQH_WIRE_DEPTH2W.
+// The shipped binary carries ONE ROWS per width and pays nothing; pricing ROWS is one
+// rebuild with -DGQH_WIDE_ROWS16_AB=1 and then a ~90 s ssh loop per point, which is still
+// the cheap way to sweep it. **Never read a shipped number off an AB=1 build** -- its HE
+// is ~0.9% low across the board, so ratios inside it port and absolutes do not.
+#ifndef GQH_WIDE_ROWS16_AB
+#define GQH_WIDE_ROWS16_AB 0
+#endif
+
+static int gqh_wide_rows16_forced() {
+    static const int forced = []() {
+        const char * e = getenv("GGML_GQH_WIDE_ROWS16");
+        const int v = e ? atoi(e) : 0;
+        return v == 2 || v == 4 ? v : 0;
+    }();
+    return forced;
+}
+
+template <ggml_type RUNG, int NCOLS, bool PAIRED>
+static void gqh_wide_launch(
+        bool i8, bool xshared_scale, bool sb2, cudaStream_t stream,
+        const uint8_t * a, float * ya, const uint8_t * b, float * yb,
+        const float * x, int in, int out,
+        float scale_a, gqh_grid16 grid_a, float scale_b, gqh_grid16 grid_b,
+        int64_t x_col_stride, int64_t y_col_stride, gqh_qx_view qxv) {
+    // Scoped to the WIDE INT8 arm at the widest width, exactly like gqh_verify_warps'
+    // knob: the f32 exact arm is what `ctest` runs and every other width is shipped
+    // codegen this iteration does not measure, so neither can move even with the env set.
+    if constexpr (GQH_WIDE_ROWS16_AB && NCOLS == GQH_MAX_COLS
+                  && gqh_wide_rows<GQH_MAX_COLS>() != 2) {
+        if (i8 && gqh_wide_rows16_forced() == 2) {
+            gqh_wide_launch_rows<RUNG, NCOLS, PAIRED, 2>(
+                i8, xshared_scale, sb2, stream, a, ya, b, yb, x, in, out,
+                scale_a, grid_a, scale_b, grid_b, x_col_stride, y_col_stride, qxv);
+            return;
+        }
+    }
+    gqh_wide_launch_rows<RUNG, NCOLS, PAIRED, gqh_wide_rows<NCOLS>()>(
+        i8, xshared_scale, sb2, stream, a, ya, b, yb, x, in, out,
+        scale_a, grid_a, scale_b, grid_b, x_col_stride, y_col_stride, qxv);
 }
 
 // Binds the runtime pair-table choice to the kernel's PAIRLUT template parameter, so
