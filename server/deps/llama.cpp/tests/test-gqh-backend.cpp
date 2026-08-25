@@ -217,9 +217,6 @@ int main(int argc, char ** argv) {
     ggml_context * ctx = ggml_init(ip);
     const bool i8_mode  = i8_flag;
     const bool mmq_mode  = nwide > 0;
-    // Only an ACCEPTED grid produces int8 numerics. A refused one falls back to
-    // dequant->cuBLAS, whose answer is fp16-exact -- see the bitwise arms below.
-    const bool mmq_numeric = mmq_mode && !expect_refuse;
     const bool has_fused = true;
 
     ggml_tensor * W  = ggml_new_tensor_2d(ctx, wtype, cols, rows);
@@ -294,17 +291,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const size_t mmq_launches = ggml_backend_cuda_get_mmq_launch_count() - mmq_before;
+
+    // Which of the two wide multiplies took MMQ. The graph holds exactly two of
+    // them -- D at ncols = cols and D3 at ncols = nwide -- so the count is 0, 1
+    // or 2, and because the width gate is an UPPER bound and nwide <= cols, a
+    // count of 1 can only be the narrower one. That lets each numeric
+    // expectation below follow the path that actually ran instead of assuming
+    // one, which matters now that a gate can split the two nodes apart.
+    const bool wide_took_mmq  = mmq_launches >= 2;
+    const bool probe_took_mmq = mmq_launches >= 1;
     if (mmq_mode && expect_refuse && mmq_launches != 0) {
-        fprintf(stderr, "GUARD FAILED: MMQ dispatched %zu times on grid %d, which "
-                        "int8 cannot represent -- it must decline and leave the "
+        fprintf(stderr, "REFUSAL FAILED: MMQ dispatched %zu times at ncols %d / %d "
+                        "on grid %d, but this case requires it to decline (either "
+                        "the int8 range guard or the width gate) and leave the "
                         "multiply to the dequant path\n",
-                mmq_launches, grid_code);
+                mmq_launches, cols, nwide, grid_code);
         return 1;
     }
-    if (mmq_mode && !expect_refuse && mmq_launches < 2) {
-        fprintf(stderr, "MMQ did not dispatch: %zu launches for the two wide "
-                        "multiplies (need GGML_GQH_MMQ=1 and an eligible grid)\n",
-                mmq_launches);
+    if (mmq_mode && !expect_refuse && !probe_took_mmq) {
+        fprintf(stderr, "MMQ did not dispatch at ncols %d: %zu launches (needs "
+                        "GGML_GQH_MMQ=1, an int8-representable grid, and "
+                        "GGML_GQH_MMQ_MAX_NE11 >= %d)\n",
+                nwide, mmq_launches, nwide);
         return 1;
     }
 
@@ -371,7 +379,7 @@ int main(int argc, char ** argv) {
         for (int j = 0; j < cols; ++j) {
             const float ref = want[(size_t) i * cols + j];
             const float g = got[(size_t) j * rows + i];
-            if (mmq_numeric) {
+            if (wide_took_mmq) {
                 const double err = std::fabs((double) g - (double) ref);
                 if (err > max_onehot_abs) { max_onehot_abs = err; }
                 // A NON-ZERO weight must not come back as EXACTLY zero. This is
@@ -561,7 +569,7 @@ int main(int argc, char ** argv) {
                     const double err = std::fabs(gv - wv);
                     if (err > mmq_max_abs) { mmq_max_abs = err; }
                     bool differs;
-                    if (mmq_numeric) {
+                    if (probe_took_mmq) {
                         if (wf != 0.0f && gf == 0.0f) {
                             if (collapsed < 5) {
                                 fprintf(stderr, "  COLLAPSED TO ZERO off=%d [%d,%d]: "
@@ -582,7 +590,7 @@ int main(int argc, char ** argv) {
                             fprintf(stderr, "  mmq offset-onehot mismatch off=%d [%d,%d]: "
                                             "got %.9g want %.9g (err %.4g, step %.4g, %s)\n",
                                     off, i, j, gv, wv, err, int8_step(i),
-                                    mmq_numeric ? "int8 bound" : "fp16 bitwise");
+                                    probe_took_mmq ? "int8 bound" : "fp16 bitwise");
                         }
                         ++bad_mmq_off;
                     }
@@ -677,20 +685,21 @@ int main(int argc, char ** argv) {
     }
     if (mmq_mode) {
         if (expect_refuse) {
-            printf("OK   %s %dx%d [mmq-refused]: the int8 range guard DECLINED grid %d "
-                   "(%zu MMQ launches, must be 0) and the dequant path answered "
-                   "fp16-exact at ncols %d and %d over %d offsets%s (scale %.9g)\n",
-                   rung.c_str(), rows, cols, grid_code, mmq_launches, cols, nwide,
-                   n_mmq_off,
+            printf("OK   %s %dx%d [mmq-refused]: MMQ DECLINED (0 launches) at ncols %d "
+                   "and %d on grid %d, and the dequant path answered fp16-exact over "
+                   "%d offsets%s (scale %.9g)\n",
+                   rung.c_str(), rows, cols, nwide, grid_code, n_mmq_off,
                    ties ? (", " + std::to_string(ties) + " exact fp16 ties").c_str() : "",
                    tensor_scale);
             return 0;
         }
-        printf("OK   %s %dx%d [mmq]: MMQ dispatched (%zu launches), wide n%d one-hot "
+        printf("OK   %s %dx%d [mmq]: MMQ dispatched (%zu launches, wide node on %s), "
+               "wide n%d one-hot "
                "within one weight step (max abs %.4g), n%d one-hot over %d offsets "
                "(max abs %.4g), n%d dense max rel %.3g, no level collapsed to "
                "zero, fused matvec n%d bit-identical (scale %.9g, grid %d%s)\n",
-               rung.c_str(), rows, cols, mmq_launches, cols, max_onehot_abs,
+               rung.c_str(), rows, cols, mmq_launches,
+               wide_took_mmq ? "MMQ" : "dequant (width-gated)", cols, max_onehot_abs,
                nwide, n_mmq_off, mmq_max_abs, nwide, mmq_max_rel, nvec,
                tensor_scale, grid_code, grid_force >= 0 ? ", forced" : "");
         return 0;

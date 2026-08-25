@@ -685,6 +685,39 @@ static int64_t mix_mmq_max_ne11(int cc) {
     return GGML_CUDA_CC_IS_RDNA4(cc) ? 1024 : 256;
 }
 
+// GQH's two effects point opposite ways, so this is a width gate, not a switch.
+// MMQ deletes the fp16 materialisation but re-decodes the weight tile once per
+// OUTPUT COLUMN TILE, and GQH's unpack is expensive (bit-sliced planes or uint4
+// codes, plus a curved-grid select per code, off an odd superblock stride that
+// forbids aligned loads). So it wins by 2-4x narrow and loses by up to 1.8x wide.
+//
+// The threshold is measured, not guessed: gqh-mmq-sweep on the three shapes that
+// carry the artifact, 60 iterations, warm-up pass discarded, spreads under 1%
+// except where noted. MMQ/dequant time ratio, so under 1.00 is an MMQ win:
+//
+//   ncols                          160    192    256    320
+//   GQH3 5120x17408 (130 tensors)  0.56   0.60   0.74   1.15
+//   GQH4 17408x5120 ( 61 tensors)  0.89   1.03   1.10   1.22
+//   GQH4 6144x5120  ( 61 tensors)  0.86   0.89   0.95   1.02
+//
+// GQH4 17408x5120 crosses first, between 160 and 192, so 160 is the widest bound
+// at which EVERY shape in the artifact is still a win. It is not a round number
+// chosen for looking tidy - 192 already costs that shape 3%.
+//
+// Widths below 17 never reach here: ggml_cuda_gqh_mul_mat_vec owns 1..16 and
+// returns before this is consulted, so the gate is purely an upper bound.
+static int64_t gqh_mmq_max_ne11(int cc) {
+    static const int64_t override_value = []() -> int64_t {
+        const char * value = getenv("GGML_GQH_MMQ_MAX_NE11");
+        return value ? strtoll(value, nullptr, 10) : -1;
+    }();
+    if (override_value >= 0) {
+        return override_value;
+    }
+    GGML_UNUSED(cc);
+    return 160;
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -792,7 +825,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // is no expert-batched arm (see ggml_cuda_gqh_mmq_eligible), and the
             // caller must ALSO pass that per-tensor check -- this signature has
             // no tensor, so it cannot see an int8-unrepresentable grid.
+            // Width-gated: see gqh_mmq_max_ne11 for the measured crossover and
+            // why a single all-or-nothing switch cannot serve both effects.
             mmq_supported = ggml_cuda_gqh_mmq_enabled() && n_experts <= 1 &&
+                            ne11 <= gqh_mmq_max_ne11(cc) &&
                             (GGML_CUDA_CC_IS_RDNA3_5(cc) ||
                              GGML_CUDA_CC_IS_RDNA4(cc));
             break;

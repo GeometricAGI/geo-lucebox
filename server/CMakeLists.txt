@@ -1173,7 +1173,7 @@ if(DFLASH27B_TESTS)
     # libstdc++ (undefined operator new / __gxx_personality_v0).
     set(GQH_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/tests")
     if(EXISTS "${GQH_TEST_DIR}/test-gqh-cpu-decode.cpp")
-        foreach(GQH_SRC test-gqh-cpu-decode test-gqh-backend)
+        foreach(GQH_SRC test-gqh-cpu-decode test-gqh-backend gqh-mmq-sweep)
             add_executable(${GQH_SRC} "${GQH_TEST_DIR}/${GQH_SRC}.cpp")
             target_link_libraries(${GQH_SRC} PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
             target_include_directories(${GQH_SRC} PRIVATE
@@ -1310,6 +1310,43 @@ if(DFLASH27B_TESTS)
                     set_tests_properties(${GQH_GUARD_NAME}
                         PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
                 endforeach()
+            endif()
+            # THE WIDTH GATE. MMQ wins narrow and loses wide for GQH (see
+            # gqh_mmq_max_ne11 in mmq.cu for the measured crossover), so dispatch
+            # is width-bounded -- and a gate that never declines is
+            # indistinguishable from no gate. These cases assert both sides of it
+            # using the launch counter, on the only shape wide enough to straddle
+            # the default bound.
+            #
+            # in160/out161 PIN THE THRESHOLD to exactly 160: one requires MMQ at
+            # 160, the other requires it to decline at 161. Move the default in
+            # either direction and one of them fails. They also prove the
+            # comparison is <= rather than <.
+            #
+            # knob-in64/knob-out65 do the same for GGML_GQH_MMQ_MAX_NE11, so the
+            # override is covered independently of whatever the compiled default
+            # happens to be.
+            if(GQH_COLS GREATER 161 AND (GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4"))
+                add_test(NAME test-gqh-backend-gate-in160-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq160)
+                set_tests_properties(test-gqh-backend-gate-in160-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+                add_test(NAME test-gqh-backend-gate-out161-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq161 refuse)
+                set_tests_properties(test-gqh-backend-gate-out161-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+                add_test(NAME test-gqh-backend-gate-knob-in64-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq64)
+                set_tests_properties(test-gqh-backend-gate-knob-in64-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1;GGML_GQH_MMQ_MAX_NE11=64")
+                add_test(NAME test-gqh-backend-gate-knob-out65-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq65 refuse)
+                set_tests_properties(test-gqh-backend-gate-knob-out65-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1;GGML_GQH_MMQ_MAX_NE11=64")
             endif()
             # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
             # GGML_GQH_MMQ=0 is pinned on every case above that asserts the DEQUANT
