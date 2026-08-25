@@ -704,6 +704,29 @@ static int64_t mix_mmq_max_ne11(int cc) {
 // at which EVERY shape in the artifact is still a win. It is not a round number
 // chosen for looking tidy - 192 already costs that shape 3%.
 //
+// Re-measured on a second R9700 / gfx1201 box the curve keeps its shape but
+// shifts OUTWARD: GQH4 17408x5120, still the shape that crosses first, reads
+// 0.83 at 160 and 0.87 at 192 there and does not cross until between 256 (0.94)
+// and 320 (1.05); the other two cross around 512. So 160 is conservative on
+// that box rather than wrong - it is the widest bound that is a win on BOTH.
+//
+// The other leg of the justification is the WORKLOAD, which the kernel curve
+// cannot supply: a crossover says where MMQ stops paying, not whether anything
+// ever dispatches there. GGML_GQH_NE11_LOG=1 (the census in ggml-cuda.cu) over a
+// DFlash2 verify at --draft-block-size 16 plus a 7.3k-token prefill:
+//
+//   ne11        GQH mul_mat calls   past the matvec (gate-visible)
+//   16                     40280                                0
+//   39..104                 4323                             4323
+//   512                     5502                             5502
+//
+// Verify at block 16 never reaches the gate -- the matvec owns it and returns
+// first. Every call the gate CAN see is either <= 104, where MMQ wins 1.5-2.7x,
+// or exactly the 512-wide prefill chunk, where it loses ~1.2x. Nothing lands in
+// 105..511, so every threshold in that window dispatches identically and the
+// exact value is not load-bearing. What IS load-bearing is that the gate
+// declines 512: lifting it costs ~7% of prefill throughput end to end.
+//
 // Widths below 17 never reach here: ggml_cuda_gqh_mul_mat_vec owns 1..16 and
 // returns before this is consulted, so the gate is purely an upper bound.
 static int64_t gqh_mmq_max_ne11(int cc) {
