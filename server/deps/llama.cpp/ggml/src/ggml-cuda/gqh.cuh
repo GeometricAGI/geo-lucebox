@@ -117,10 +117,23 @@ bool ggml_cuda_gqh_mmq_info(ggml_type type, const void * vx, int lut[4], float *
 // different loader than the three header-bearing rungs share.
 bool ggml_cuda_gqh_mmq_type(ggml_type type);
 
-// GGML_GQH_MMQ=1 opts in. While the MMQ path is being brought up the
-// dequant->cuBLAS route stays the reference it is verified against, so this is
-// the same-binary A/B switch the other GQH and mix hooks already use
-// (GGML_GQH_FUSED, DFLASH_MIX_FUSED, LUCE_MMQ_BIG_PREFILL).
+// ON by default; GGML_GQH_MMQ=0 opts back out. It stays the same-binary A/B
+// switch the other GQH and mix hooks use (GGML_GQH_FUSED, DFLASH_MIX_FUSED,
+// LUCE_MMQ_BIG_PREFILL), because the dequant->cuBLAS route is still the
+// reference every MMQ case is verified against.
+//
+// The default flipped on measured evidence, not on the path being finished.
+// Dispatch is width-gated (gqh_mmq_max_ne11 in mmq.cu), so MMQ now runs only
+// where it wins; ungated it costs ~7% of prefill. On-vs-off, order-balanced to
+// cancel a run-order thermal drift worth ~1%: prefill +1.0%, decode +1.1%, with
+// an IQ4_XS control flat to 0.3% and provably inert (its ne11 census records no
+// GQH mul_mat at all).
+//
+// Enabling it DOES change generated tokens -- MMQ is int8 where the dequant path
+// is fp16, and the ragged sub-chunk prefill widths take MMQ. On HumanEval+ at
+// greedy that changed 12 of 164 completions textually and 0 of 164 verdicts:
+// pass@1 145/164 in both arms, the identical pass SET item for item, reproduced
+// twice per arm on an instrument whose same-arm churn is 0.
 bool ggml_cuda_gqh_mmq_enabled(void);
 
 // Whether this specific tensor may take MMQ: registered, an MMQ rung, an int8

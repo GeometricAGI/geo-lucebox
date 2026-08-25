@@ -1250,9 +1250,12 @@ if(DFLASH27B_TESTS)
             # tolerances are looser than the dequant fallback's error, so without
             # that assert a silent decline would read as a pass.
             #
-            # GGML_GQH_MMQ=1 because the path is opt-in while the dequant route it
-            # is verified against remains the reference; GGML_GQH_I8DOT=0 keeps
-            # the narrow fused arm in the same run bit-exact.
+            # GGML_GQH_MMQ=1 is pinned explicitly rather than inherited: MMQ is
+            # on by default now, but these cases assert MMQ DISPATCHED, so they
+            # must not silently become no-ops if the default is ever flipped
+            # back. The dequant route stays the reference they are verified
+            # against. GGML_GQH_I8DOT=0 keeps the narrow fused arm in the same
+            # run bit-exact.
             if(GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4")
                 foreach(GQH_MMQN 17 33 64)
                     add_test(NAME test-gqh-backend-mmq${GQH_MMQN}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}

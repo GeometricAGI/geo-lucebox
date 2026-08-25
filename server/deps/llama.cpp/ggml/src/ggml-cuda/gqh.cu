@@ -5174,7 +5174,7 @@ bool ggml_cuda_gqh_mmq_type(ggml_type type) {
 bool ggml_cuda_gqh_mmq_enabled(void) {
     static const bool on = []() {
         const char * e = getenv("GGML_GQH_MMQ");
-        return e ? atoi(e) != 0 : false;
+        return e ? atoi(e) != 0 : true;
     }();
     return on;
 }
