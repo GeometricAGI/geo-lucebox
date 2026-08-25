@@ -303,53 +303,102 @@ to keep arms comparable. Workloads with shared prefixes amortise the fixed
 prefill cost, so the production penalty is smaller than these rows - but
 cold-prefill latency is real and it is what a first request feels.
 
-### Measured: the first MMQ rung makes prefill WORSE, not better
+### Measured: MMQ loses prefill at length and wins the code workload
 
-The paragraph above was a prediction. GQH3 now has an MMQ path (`GGML_GQH_MMQ=1`,
-off by default) and it does not behave as predicted. Target only, no drafter,
-`--max-ctx 32768 --prefix-cache-slots 0`, prefill from the server timer, best of
-three warm requests per cell, arms interleaved 1/0/1 because this rig drifts
-upward (see §10):
+The "one fix" paragraph above was a prediction. Both GQH rungs the artifact
+contains now have an MMQ path (`GGML_GQH_MMQ=1`, off by default) and the
+prediction is measurably wrong where it was most confident and right where it
+was most cautious.
 
-| prompt tokens | dequant prefill | GQH3-MMQ prefill | delta |
+A decision rule was written down before measuring, and is reported against
+verbatim below so the result cannot be rationalised after the fact.
+
+#### Prefill: MMQ loses, and loses more the longer the prompt
+
+Target only, no drafter, `--max-ctx 32768 --prefix-cache-slots 0`, prefill from
+the server timer, three warm requests per cell, arms interleaved because this rig
+drifts upward (§10). Stage 1 had GQH3 only on MMQ (139 of 396 header-bearing
+tensors); Stage 2 has GQH3 and GQH4, i.e. all 396.
+
+| prompt tokens | dequant | MMQ, GQH3 only | MMQ, both rungs |
 |---:|---:|---:|---:|
-|   353 |  0.5 s |  0.5 s | below the timer's 0.1 s resolution |
-| 2,033 |  2.4 s |  2.5 s | +4.2% |
-| 8,703 | 10.9 s | 11.7 s | +6.2% |
+|   353 |  0.5 s |  0.5 s |  0.5 s |
+| 2,033 |  2.4 s |  2.5 s (+4.2%) |  2.6-2.7 s (+8.3 to +12.5%) |
+| 8,703 | 10.9 s | 11.7 s (+6.2%) | 12.2-12.5 s (+11.9 to +13.8%) |
 
-Both arms reproduced to 0.1 s across the interleave, so the sign is not drift.
+Each arm reproduced to 0.1 s within a run. 353 tokens is below the timer's
+resolution warm; its COLD first request is the other way round and repeatably so,
+1.3 s on MMQ against 1.8 s on dequant, which is the fixed adder this section
+opened with - though a first request also carries warm-up, so treat it as
+suggestive.
 
-Two reasons this is not yet a refutation of the idea, and one that might be.
-
-**It is 35% of the artifact.** Only 139 of the 396 header-bearing tensors are
-GQH3; the other 257 are GQH4 and still dequantise. So the fp16 materialisation
-this was supposed to delete is still mostly happening, while the MMQ cost is
-paid in full on the GQH3 share. The fixed adder should have fallen by about a
-third, and at 353 tokens the timer cannot resolve that.
-
-**The loader is the naive one.** Stage 1 deliberately built the narrowest correct
-tile loader: byte loads (forced - the superblock stride is 105 bytes, odd), two
-code words per lane, no cooperative dword staging.
-
-**But the regression GROWS with prompt length**, monotonically, which neither of
-those explains. MMQ re-loads and re-decodes the weight tile once per output
-column tile: at `mmq_x` 128 that is ~16 re-decodes at 2K tokens and ~68 at 8.7K,
-where the dequant path unpacks once and lets cuBLAS stream fp16. This is the same
-effect the `lucebox_mmq_big_tile_take` comment in mmq.cu describes for the small
-tile ("at prefill widths the narrow x-tile re-streams the weights"), except GQH3
-cannot buy its way out with a bigger tile - it already uses the 128x128 shape,
-and `mmq_x` stops at 128. IQ4_XS survives that re-streaming because its unpack is
-a nibble and a `__byte_perm` LUT; GQH3's is bit-sliced planes plus a curved-grid
+**Verdict against the pre-registered rule: third branch. MMQ still loses, and is
+still worse at 8.7K than at 2K.** The re-decode mechanism is confirmed, now by
+two independent predictions rather than one: the regression grows with prompt
+length, AND it roughly doubled when MMQ's share of the artifact went from 35% to
+100%. MMQ re-loads and re-decodes the weight tile once per output column tile -
+at `mmq_x` 128 that is ~16 re-decodes at 2K tokens and ~68 at 8.7K - where the
+dequant path unpacks once and lets cuBLAS stream fp16. GQH cannot buy its way out
+with a bigger tile: it already uses the 128x128 shape and `mmq_x` stops at 128.
+IQ4_XS survives the same re-streaming because its unpack is a nibble and a
+`__byte_perm` LUT; GQH's is bit-sliced planes or uint4 codes plus a curved-grid
 select per code.
 
-That last point is a hypothesis about WHY, not a measurement - but its prediction
-(regression rising with N) is what the table shows, and it says the honest next
-step is to finish GQH4/GQH2_H and re-measure the whole artifact before spending
-anything on micro-optimising the loader. If the re-decode term dominates, an
-expensive-unpack format may want dequant-once-per-prefill rather than MMQ, and
-"MMQ is the highest-value remaining work" above is simply wrong for prefill. It
-may still be right for the ncols 13-16 verify widths, which this table does not
-touch.
+#### But the code workload gains 20%, and that flips the conclusion
+
+`final_table.sh`, two readings per arm. IQ4_XS cannot be affected by
+`GGML_GQH_MMQ` and is the machine control.
+
+| arm | metric | MMQ off | MMQ on | delta |
+|---|---|---:|---:|---:|
+| GQH b16 | he_tok_s (HE-10, decode only) | 194.02 / 195.98 | 191.25 / 191.25 | -1.4 to -2.4% |
+| GQH b16 | code_e2e_tok_s | 115.90 / 116.85 | 140.14 / 140.64 | **+20.6%** |
+| GQH b16 | code_decode_tok_s | 138.06 / 139.33 | 152.74 / 153.42 | **+10.5%** |
+| GQH b8 | code_e2e_tok_s | 112.26 / 112.42 | 131.27 / 130.53 | **+16.5%** |
+| IQ4_XS b16 | he_tok_s | 159.97 / 160.36 | 159.29 / 160.09 | -0.3% |
+| IQ4_XS b16 | code_e2e_tok_s | 119.26 / 119.63 | 119.27 / 118.93 | -0.3% |
+| IQ4_XS b8 | code_e2e_tok_s | 101.79 / 101.97 | 101.83 / 101.71 | -0.1% |
+
+The control is flat to 0.3% on every metric and both repeats, so the GQH code-axis
+movements are real. `avg_commit` is identical to four decimals in both arms, so
+this is not an acceptance-length effect.
+
+Consequence for the comparison this document exists to settle: on the code
+workload GQH went from LOSING to IQ4_XS (116.85 against 119.63) to beating it by
+17.9% (140.64 against 119.27).
+
+`code_decode_tok_s` excludes prefill and still gains 10.5%, so not all of this is
+the fixed adder - part of it is inside the decode loop. The plausible mechanism is
+the one §9 predicted for the verify widths: a verify batch wider than
+`GQH_MAX_COLS` used to fall through to dequant->GEMM, which the fused-matvec
+comment already calls pathological, and now takes MMQ instead. That is a
+hypothesis; it has not been instrumented.
+
+#### Decode moved, slightly, and it is not yet explained
+
+`he_tok_s` on GQH b16 fell about 2% (191.25 against 194.02-195.98, where the off
+arm's own run-to-run spread is 1.0% and the control moved 0.3%). That is at or
+just above the ~1.3% scorer floor, so it is a small real effect rather than noise.
+Nothing in the MMQ path should touch a width the matvec still owns. The suspect is
+that `ggml_cuda_should_use_mmq` returning true for GQH also feeds the
+graph-capture eligibility predicate and `supports_op`, so enabling it can change
+capture or fusion decisions on subgraphs whose arithmetic never changes.
+Unverified.
+
+#### Where this leaves MMQ
+
+Not killed, and not on by default either. The shape that fits the measurements is
+a WIDTH-GATED dispatch: MMQ for the wide-verify band just past `GQH_MAX_COLS`,
+where it replaces a dequant->GEMM fallback that is pathological, and
+dequant->cuBLAS kept for true prefill widths, where re-decode per column tile
+loses to unpacking once. There is precedent for exactly this in the same file -
+the mix qtypes already decline wide batches via `mix_mmq_max_ne11`. Finding that
+crossover is the next measurement, and until it exists `GGML_GQH_MMQ` stays
+opt-in.
+
+Note on hardware coverage: everything above is gfx1201, where the WMMA branch
+executes and the dp4a arm is dead code. The dp4a tile indices in the GQH loaders
+are unverified and nothing runnable on this box tests them.
 
 ## 10. Where the search runs
 
