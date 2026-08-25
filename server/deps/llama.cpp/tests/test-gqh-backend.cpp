@@ -35,6 +35,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -209,6 +211,97 @@ int main(int argc, char ** argv) {
         }
     }
 
+
+    // ---- Wide-lane coverage -------------------------------------------------
+    // The one-hot pass above puts every nonzero activation at position j < nvec,
+    // so with cols >= 256 it NEVER drives an activation past position 15. A wide
+    // lane map that mis-indexes the reduction beyond 15 -- exactly what the wide
+    // verify arms introduce -- is invisible to it. Two further passes close that,
+    // and neither weakens the bitwise claim above:
+    //
+    //   A. offset-swept one-hot. Column j is e_(off+j), so the dot product still
+    //      has a SINGLE term and stays bit-exact, but the nonzero lands anywhere
+    //      in the reduction. A kernel that drops or mis-maps k >= 16 returns 0.
+    //   B. dense activations. Every k is nonzero, so term count and accumulation
+    //      order are exercised -- things no single-term probe can see. Summation
+    //      makes this one tolerance-based rather than bitwise.
+    size_t bad_off = 0;
+    size_t bad_dense = 0;
+    double max_rel = 0.0;
+    int n_off = 0;
+    if (has_fused) {
+        std::vector<int> offs;
+        for (int o : { nvec, 16, cols / 2, cols - nvec }) {
+            if (o > 0 && o + nvec <= cols &&
+                std::find(offs.begin(), offs.end(), o) == offs.end()) {
+                offs.push_back(o);
+            }
+        }
+        n_off = (int) offs.size();
+        std::vector<float> xoff((size_t) cols * nvec);
+        std::vector<float> g((size_t) rows * nvec);
+        for (int off : offs) {
+            std::fill(xoff.begin(), xoff.end(), 0.0f);
+            for (int j = 0; j < nvec; ++j) {
+                xoff[(size_t) j * cols + off + j] = 1.0f;
+            }
+            ggml_backend_tensor_set(X2, xoff.data(), 0, xoff.size() * sizeof(float));
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "graph compute failed at activation offset %d\n", off);
+                return 1;
+            }
+            ggml_backend_tensor_get(D2, g.data(), 0, g.size() * sizeof(float));
+            for (int i = 0; i < rows; ++i) {
+                for (int j = 0; j < nvec; ++j) {
+                    float gv = g[(size_t) j * rows + i];
+                    float wv = want[(size_t) i * cols + off + j];
+                    if (gv == 0.0f) { gv = 0.0f; }   // normalise -0.0, as above
+                    if (wv == 0.0f) { wv = 0.0f; }
+                    if (memcmp(&gv, &wv, 4) != 0) {
+                        if (bad_off < 5) {
+                            fprintf(stderr, "  offset-onehot mismatch off=%d [%d,%d]: "
+                                            "got %a want %a\n", off, i, j, gv, wv);
+                        }
+                        ++bad_off;
+                    }
+                }
+            }
+        }
+
+        std::vector<float> xd((size_t) cols * nvec);
+        uint32_t rs = 0x9e3779b9u;                     // deterministic, no <random>
+        for (size_t t = 0; t < xd.size(); ++t) {
+            rs = rs * 1664525u + 1013904223u;
+            xd[t] = (float) ((int32_t) ((rs >> 8) % 2001) - 1000) / 1024.0f;
+        }
+        ggml_backend_tensor_set(X2, xd.data(), 0, xd.size() * sizeof(float));
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "graph compute failed on dense activations\n");
+            return 1;
+        }
+        ggml_backend_tensor_get(D2, g.data(), 0, g.size() * sizeof(float));
+        for (int i = 0; i < rows; ++i) {
+            for (int j = 0; j < nvec; ++j) {
+                double acc = 0.0;
+                for (int k = 0; k < cols; ++k) {
+                    acc += (double) want[(size_t) i * cols + k] *
+                           (double) xd[(size_t) j * cols + k];
+                }
+                const double gv  = (double) g[(size_t) j * rows + i];
+                const double den = std::max(1.0, std::fabs(acc));
+                const double rel = std::fabs(gv - acc) / den;
+                if (rel > max_rel) { max_rel = rel; }
+                if (rel > 1e-4) {
+                    if (bad_dense < 5) {
+                        fprintf(stderr, "  dense mismatch [%d,%d]: got %.9g want %.9g "
+                                        "rel %.3g\n", i, j, gv, acc, rel);
+                    }
+                    ++bad_dense;
+                }
+            }
+        }
+    }
+
     if (has_header) {
         ggml_gqh_unregister(W->data);
     }
@@ -236,15 +329,19 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (bad || bad2) {
-        printf("FAIL %s %dx%d: dequant %zu/%zu differ, fused %zu/%d differ\n",
-               rung.c_str(), rows, cols, bad, n_elem, bad2, rows * nvec);
+    if (bad || bad2 || bad_off || bad_dense) {
+        printf("FAIL %s %dx%d: dequant %zu/%zu differ, fused %zu/%d differ, "
+               "offset-onehot %zu differ over %d offsets, dense %zu differ "
+               "(max rel %.3g)\n",
+               rung.c_str(), rows, cols, bad, n_elem, bad2, rows * nvec,
+               bad_off, n_off, bad_dense, max_rel);
         return 1;
     }
     printf("OK   %s %dx%d: dequant->BLAS matches the fp16-rounded reference%s, "
-           "fused matvec bit-identical to the f32 reference over %d cols (scale %.9g, grid %d)\n",
+           "fused matvec bit-identical to the f32 reference over %d cols at %d "
+           "activation offsets, dense max rel %.3g (scale %.9g, grid %d)\n",
            rung.c_str(), rows, cols,
            ties ? (" apart from " + std::to_string(ties) + " exact fp16 ties").c_str() : "",
-           nvec, tensor_scale, grid_code);
+           nvec, n_off + 1, max_rel, tensor_scale, grid_code);
     return 0;
 }
