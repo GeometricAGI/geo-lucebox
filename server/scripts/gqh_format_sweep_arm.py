@@ -20,17 +20,43 @@ import json, os, re, subprocess, sys, time, urllib.request
 
 ARM      = sys.argv[1]              # "gqh" | "iq4xs"
 READING  = sys.argv[2]             # "r1" | "r2"
-OUT_DIR  = os.path.expanduser("~/bench-out")
+# Each sweep gets its own subdirectory. Without this the "gqh" arm of the
+# format sweep and the "gqh" arm of the MMQ control write the same filename and
+# the second silently overwrites the first.
+RUN      = os.environ.get("GQH_SWEEP_RUN", "default")
+OUT_DIR  = os.path.join(os.path.expanduser("~/bench-out"), RUN)
 ROOT     = os.path.expanduser("~/lb-upstream")
 BIN      = f"{ROOT}/server/build-wide/dflash_server"
-DRAFTER  = os.path.expanduser("~/bench-models/Qwen3.8-27B-DFlash2-Q8_0.gguf")
+# The CANONICAL drafter. The earlier value here was Qwen3.8-27B-DFlash2-Q8_0.gguf
+# (2,056,414,752 B), which is NOT the canonical artifact -- accept-rate readings
+# taken against it are not comparable with anything else. Override only to
+# deliberately re-measure the drafter axis.
+DRAFTER  = os.environ.get(
+    "GQH_SWEEP_DRAFTER",
+    os.path.expanduser("~/bench-models/qwen38-dflash2-q8_0-canonical.gguf"))
 TARGETS  = {
     "gqh":   os.path.expanduser("~/bench-models/qwen38-gqh-shaped.gguf"),
     "iq4xs": os.path.expanduser("~/bench-models/Qwen3.8-27B-IQ4_XS.gguf"),
 }
+# An arm is a (target, server-env) pair. Holding the target fixed and moving only
+# GGML_GQH_MMQ gives the MMQ on/off control; holding the env fixed and moving the
+# target gives the format-vs-format comparison. Both run through this one driver
+# so neither can drift from the other in prompts, cache flags or geometry.
+ARMS = {
+    "gqh":        {"target": "gqh",   "env": {}},
+    "iq4xs":      {"target": "iq4xs", "env": {}},
+    "gqh_mmqoff": {"target": "gqh",   "env": {"GGML_GQH_MMQ": "0"}},
+    "gqh_mmqon":  {"target": "gqh",   "env": {"GGML_GQH_MMQ": "1"}},
+}
+# Census mode asks the library for the ne11 histogram instead of a clean timing.
+# It is a SEPARATE run: the atomic increments are cheap but not free, and the
+# table is only flushed by an atexit handler, which needs a graceful shutdown
+# rather than the SIGKILL a timing run ends with.
+CENSUS = os.environ.get("GQH_SWEEP_CENSUS", "") not in ("", "0")
 PORT = 18080
 TAG  = f"{ARM}_{READING}"
 LOG  = f"{OUT_DIR}/timing_{TAG}.log"
+os.makedirs(OUT_DIR, exist_ok=True)
 
 # Caches OFF. These three flags are the whole point: without them a second
 # reading of the same arm could be answered out of a cache rather than measured.
@@ -44,18 +70,53 @@ N_PREFILL = 5     # prefill readings per prompt size
 DECODE_MAX_TOKENS = 256
 
 
+# GPU 0 idle baseline on this box, measured at handover and re-measured after the
+# restore: 60,030,976 B (60.0 MB) with no KFD PIDs. VRAM% alone cannot police a
+# shared box -- it is an integer percent of 34 GB, so a whole 342 MB co-tenant
+# rounds to 0. The absolute byte figure is what makes contention visible.
+VRAM_IDLE_BASELINE_B = 60_030_976
+VRAM_CONTENTION_SLACK_B = 64 * 1024 * 1024
+
+
 def smi():
-    """Edge temp (C) and VRAM% for GPU 0, plus a raw concise dump for auditing."""
+    """Edge temp (C), VRAM% AND absolute VRAM bytes for GPU 0, plus raw dumps."""
     out = subprocess.run(["rocm-smi", "--showtemp", "--showmemuse"],
                          capture_output=True, text=True).stdout
     temp = vram = None
+    # This sensor intermittently reports N/A or omits the line entirely on this
+    # card. A reading is not worth aborting a run over, so parse defensively --
+    # an uncaught ValueError here would kill the measurement, not just the sample.
     for line in out.splitlines():
         if "GPU[0]" in line and "Sensor edge" in line:
-            temp = float(line.split(":")[-1].strip())
+            try:
+                temp = float(line.split(":")[-1].strip())
+            except ValueError:
+                temp = None
         if "GPU[0]" in line and "VRAM%" in line:
-            vram = float(line.split(":")[-1].strip())
+            try:
+                vram = float(line.split(":")[-1].strip())
+            except ValueError:
+                vram = None
+    mem = subprocess.run(["rocm-smi", "--showmeminfo", "vram"],
+                         capture_output=True, text=True).stdout
+    used_b = None
+    for line in mem.splitlines():
+        if "GPU[0]" in line and "VRAM Total Used Memory" in line:
+            try:
+                used_b = int(line.split(":")[-1].strip())
+            except ValueError:
+                pass
     concise = subprocess.run(["rocm-smi"], capture_output=True, text=True).stdout
-    return {"edge_c": temp, "vram_pct": vram, "t": time.time(), "concise": concise}
+    return {"edge_c": temp, "vram_pct": vram, "vram_used_b": used_b,
+            "t": time.time(), "concise": concise, "meminfo": mem}
+
+
+def idle_vram_clean(rec_smi):
+    """True if GPU 0 VRAM is at our known idle baseline (nobody else resident)."""
+    b = rec_smi.get("vram_used_b")
+    if b is None:
+        return None
+    return b <= VRAM_IDLE_BASELINE_B + VRAM_CONTENTION_SLACK_B
 
 
 def other_gpu_procs():
@@ -145,7 +206,8 @@ def read_spec_lines(path, seen):
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    target = TARGETS[ARM]
+    spec   = ARMS[ARM]
+    target = TARGETS[spec["target"]]
     rec = {
         "arm": ARM, "reading": READING,
         "target": target, "target_bytes": os.path.getsize(target),
@@ -154,17 +216,51 @@ def main():
         "cache_flags": CACHE_OFF,
         "git_head": subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"],
                                    capture_output=True, text=True).stdout.strip(),
-        "env_note": "shipping defaults: GGML_GQH_MMQ unset (on), "
-                    "GGML_GQH_MMQ_MAX_NE11 unset (gate=160)",
+        "run": RUN,
+        "arm_env": spec["env"],
+        "census": CENSUS,
+        "env_note": ("shipping defaults except where arm_env overrides: "
+                     "GGML_GQH_MMQ unset (=on), GGML_GQH_MMQ_MAX_NE11 unset "
+                     "(gate=160), no --specla, no --draft-block-size "
+                     "(drafter metadata block_size=8)"),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     rec["smi_pre"] = smi()
     rec["pids_pre"] = other_gpu_procs()
+    # A co-tenant already resident before we launch invalidates the reading just
+    # as surely as one that appears mid-run, so record the verdict up front.
+    rec["gpu_clean_pre"] = idle_vram_clean(rec["smi_pre"])
+    rec["vram_idle_baseline_b"] = VRAM_IDLE_BASELINE_B
+
+    # Refuse to measure a contended GPU. This box is shared, and a co-tenant
+    # resident before launch has two consequences, both bad: the reading is
+    # worthless (it competes for bandwidth, and if VRAM is short the load simply
+    # OOMs and every figure comes back 0.0/None), and launching anyway piles a
+    # second big model onto somebody else's job. Recording an explicit error is
+    # what keeps a contended reading out of the report instead of averaging it
+    # in -- silent zeros are exactly the failure mode that makes a sweep lie.
+    if rec["gpu_clean_pre"] is False and os.environ.get(
+            "GQH_SWEEP_ALLOW_CONTENDED", "") in ("", "0"):
+        rec["error"] = (
+            "GPU 0 not idle before launch: %s B resident vs %s B baseline "
+            "(co-tenant present; reading refused, not measured)"
+            % (rec["smi_pre"].get("vram_used_b"), VRAM_IDLE_BASELINE_B))
+        rec["contended"] = True
+        rec["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        path = f"{OUT_DIR}/timing_{TAG}.json"
+        with open(path, "w") as f:
+            json.dump(rec, f, indent=2)
+        print(f"WROTE {path}")
+        print("REFUSED:", rec["error"])
+        return 1
 
     env = dict(os.environ)
     env["HIP_VISIBLE_DEVICES"] = "0"
-    for k in ("GGML_GQH_MMQ", "GGML_GQH_MMQ_MAX_NE11"):
-        env.pop(k, None)          # shipping defaults, not an override
+    for k in ("GGML_GQH_MMQ", "GGML_GQH_MMQ_MAX_NE11", "GGML_GQH_NE11_LOG"):
+        env.pop(k, None)          # start from shipping defaults, not inherited state
+    env.update(spec["env"])       # then the one variable this arm moves
+    if CENSUS:
+        env["GGML_GQH_NE11_LOG"] = "1"
     cmd = [BIN, target, "--draft", DRAFTER, "--port", str(PORT), *CACHE_OFF]
     rec["cmd"] = cmd
     log = open(LOG, "w")
@@ -265,14 +361,62 @@ def main():
     return finish(rec, proc)
 
 
-def finish(rec, proc):
+CENSUS_RE = re.compile(r"^CENSUS\s+(>?\s*\d+)\s+(\d+)\s+(\d+)\s*$", re.M)
+CENSUS_HDR = re.compile(
+    r"=== GQH ne11 census: (\d+) GQH mul_mat calls, (\d+) past the matvec ===")
+
+
+def read_census(path):
+    """Parse the atexit-flushed ne11 histogram. Returns None if it never flushed,
+    which is itself a result worth seeing rather than a silent zero."""
+    try:
+        text = open(path, errors="replace").read()
+    except OSError:
+        return None
+    hdr = CENSUS_HDR.search(text)
+    if not hdr:
+        if "no GQH mul_mat calls" in text:
+            return {"total_calls": 0, "total_past_matvec": 0, "rows": []}
+        return None
+    rows = []
+    for m in CENSUS_RE.finditer(text):
+        rows.append({"ne11": m.group(1).replace(" ", ""),
+                     "calls": int(m.group(2)),
+                     "past_matvec": int(m.group(3))})
+    return {"total_calls": int(hdr.group(1)),
+            "total_past_matvec": int(hdr.group(2)),
+            "rows": rows}
+
+
+def shutdown(proc, graceful):
+    """Stop OUR server only, by pid/pgroup -- never by name, this box is shared.
+
+    Census mode needs the atexit handler to run, so it asks politely first and
+    only escalates if the process will not leave."""
+    if graceful:
+        for sig in (2, 15):        # SIGINT then SIGTERM
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except Exception:
+                return
+            for _ in range(60):
+                if proc.poll() is not None:
+                    return
+                time.sleep(1)
     try:
         os.killpg(os.getpgid(proc.pid), 9)
     except Exception:
         pass
+
+
+def finish(rec, proc):
+    shutdown(proc, CENSUS)
     proc.wait()
     time.sleep(5)
+    if CENSUS:
+        rec["ne11_census"] = read_census(LOG)
     rec["smi_after_kill"] = smi()
+    rec["gpu_clean_after"] = idle_vram_clean(rec["smi_after_kill"])
     rec["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     path = f"{OUT_DIR}/timing_{TAG}.json"
     with open(path, "w") as f:
@@ -289,7 +433,20 @@ def finish(rec, proc):
         print(f"  prefill {lbl:5s} n={rows[0]['prefilled_tokens']}: "
               f"{[r['prefill_tok_s'] for r in rows]}")
     print(f"  e2e avg tok/s     : {rec.get('e2e_avg_tok_s')}")
+    cen = rec.get("ne11_census")
+    if CENSUS:
+        if cen is None:
+            print("  ne11 census       : NOT FLUSHED (no clean exit)")
+        else:
+            print(f"  ne11 census       : {cen['total_calls']} calls, "
+                  f"{cen['total_past_matvec']} past matvec")
+            for r in cen["rows"]:
+                print(f"    ne11={r['ne11']:>6s} calls={r['calls']:<10d} "
+                      f"past_matvec={r['past_matvec']}")
     print(f"  edge C pre/post   : {rec['smi_pre']['edge_c']} -> {rec['smi_post_e2e']['edge_c']}")
+    print(f"  vram B pre/after  : {rec['smi_pre'].get('vram_used_b')} -> "
+          f"{rec['smi_after_kill'].get('vram_used_b')} "
+          f"(clean_pre={rec.get('gpu_clean_pre')} clean_after={rec.get('gpu_clean_after')})")
     return 0
 
 
