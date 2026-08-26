@@ -3311,6 +3311,20 @@ extern "C" {
     GGML_API void ggml_gqh_register(const void * base, size_t nbytes, float tensor_scale, int grid_code);
     GGML_API void ggml_gqh_unregister(const void * base);
 
+    // The int8 weight-LUT denominator for a rung's level grid, and the level error
+    // it leaves. Every GQH grid's amax is exactly 1.0, so baking the codebook to
+    // int8 with a denominator of 127 wastes resolution on grids whose levels sit
+    // badly against the k/127 lattice; ggml_gqh_q8_denom returns the N in 1..127
+    // that minimises the uniform-prior rms ABSOLUTE level error instead, and the
+    // int8 arms fold the compensating 127/N into their per-tensor weight scale at
+    // zero runtime cost. See the derivation in gqh.cpp. maxe is the largest
+    // |q/N - level| over the grid, which is what bounds a single-term dot's error;
+    // rms is the objective's own value. All three return 0 for a type or grid code
+    // that has no level grid.
+    GGML_API int   ggml_gqh_q8_denom(enum ggml_type type, int grid_code);
+    GGML_API float ggml_gqh_q8_maxe (enum ggml_type type, int grid_code);
+    GGML_API float ggml_gqh_q8_rms  (enum ggml_type type, int grid_code);
+
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);
 
     // ggml threadpool
