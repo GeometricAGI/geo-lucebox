@@ -448,18 +448,43 @@ are unverified and nothing runnable on this box tests them.
 ## 10. Where the search runs
 
 The widening work is driven by the geo-evo kernel loop, target `gqh_wide_he`
-(geo-evo branch `geo-loop/gqh-wide-verify`). It reuses the `gqh_n8_he` adapter
-with three env overrides - `GQH_HE_BLOCK_SIZE=16`, `GQH_HE_AL_MIN=10.5`,
-`GQH_HE_GOAL_TPS=163.0` - so the narrow target is unchanged when they are unset.
+(geo-evo branch `geo-loop/gqh-wide-verify`), reusing the `gqh_n8_he` adapter
+with `GQH_HE_BLOCK_SIZE=16` so the narrow target is unchanged when it is unset.
 
-The AL floor is the gate that makes the search honest, and it is validated
-against real logs rather than assumed. At 10.5:
+**The block-16 arm is now at 195.84 tok/s** (R9700, canonical drafter, 10
+HumanEval prompts, decode-only from the engine's own `[spec-decode]` timer),
+which is the 3.47x recorded in section 8. Any goal below that is already met,
+so a search aimed at it scores every candidate as passing on its first
+iteration and ranks on nothing.
 
-    block-8  (narrow): he_tok_s = 154.19  avg_commit =  7.22  -> REJECTED
-    block-16 (wide)  : he_tok_s =  55.97  avg_commit = 10.98  -> accepted
+    GQH_HE_GOAL_TPS=205.0
 
-The narrow arm is 2.75x faster and is still rejected. Without that floor the
-loop's best move is to abandon wide verify, which is the thing being optimised.
+205 rather than 196: the scorer's floor is ~1.3% and nothing under ~2-3% is a
+result (below), so a goal has to sit clear of the noise around the number it is
+trying to beat. 205 is about 4.7% above 195.84. It is a threshold chosen from
+the current best and the noise floor, not a measurement -- recalibrate it after
+any move that shifts the best, and recalibrate it **on the box that will run
+the search**, per the closing note in this section.
+
+    DO NOT USE: GQH_HE_GOAL_TPS=163.0, GQH_HE_AL_MIN=10.5
+
+Both are stale and both are stale in the same way -- they were set when the
+block-16 arm ran at 56 tok/s:
+
+* `163.0` was a bar the wide arm could not reach. It is now beaten by 20%.
+* `GQH_HE_AL_MIN=10.5` was the gate that made the search honest, because at
+  the time the throughput ranking alone preferred abandoning wide verify:
+
+      block-8  (narrow): he_tok_s = 154.19  avg_commit =  7.22  -> REJECTED
+      block-16 (wide)  : he_tok_s =  55.97  avg_commit = 10.98  -> accepted
+
+  The narrow arm was 2.75x faster and was rejected anyway. That is no longer
+  the trade: the wide arm now wins on throughput as well (195.84 against
+  154.19, +27%), so the AL floor no longer buys the search anything it would
+  not choose on its own, and leaving it in only narrows the space. Keep an AL
+  floor if you want a guard against a candidate that silently reverts to
+  narrow verify -- but set it from the arm you are actually measuring and say
+  which, rather than inheriting 10.5 because it is written here.
 
 Two measurement disciplines carried over from the earlier `gqh_mtp_multicol`
 run on this same kernel, both learned the hard way there:
@@ -476,6 +501,6 @@ boxes are single-R9700, and a co-tenant benchmark makes every number arguable.
 Absolute tok/s is NOT portable between them - our IQ4_XS block-16 decode is
 162.8 here against upstream's published 208.1 on the same file and drafter, a
 gap that survived rebuilding with their exact flags - so a goal threshold must
-be calibrated on the box that will run the search. The 157-163 bar above is
-measured on lucebox6, which is also where every number in sections 8 and 9 was
-taken. Ratios port between boxes; thresholds do not.
+be calibrated on the box that will run the search. The 195.84 the bar above is
+derived from is measured on lucebox6, which is also where every number in
+sections 8 and 9 was taken. Ratios port between boxes; thresholds do not.
