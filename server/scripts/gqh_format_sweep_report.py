@@ -7,9 +7,16 @@ Nothing is carried in from another box, another drafter, or another day.
 """
 import glob, hashlib, json, os, sys
 
-D = os.path.expanduser("~/bench-out")
-ARMS = ["gqh", "iq4xs"]
-LABEL = {"gqh": "GQH (qwen38-gqh-shaped)", "iq4xs": "IQ4_XS (vendor quant)"}
+# Which sweep to collate, and which two arms. Defaults reproduce the original
+# format-vs-format call; the MMQ control passes "gqh gqh_mmqoff".
+#   GQH_SWEEP_RUN=<label>  report.py [ARM_A] [ARM_B]
+RUN = os.environ.get("GQH_SWEEP_RUN", "default")
+D = os.path.join(os.path.expanduser("~/bench-out"), RUN)
+ARMS = sys.argv[1:3] if len(sys.argv) > 2 else ["gqh", "iq4xs"]
+LABEL = {"gqh": "GQH (qwen38-gqh-shaped)",
+         "iq4xs": "IQ4_XS (vendor quant)",
+         "gqh_mmqoff": "GQH, GGML_GQH_MMQ=0",
+         "gqh_mmqon": "GQH, GGML_GQH_MMQ=1"}
 
 
 def spread(vals):
@@ -59,6 +66,13 @@ for arm in ARMS:
             "edge_c_pre": rec["smi_pre"]["edge_c"],
             "edge_c_post": rec["smi_post_e2e"]["edge_c"],
             "load_s": rec["load_s"],
+            "drafter": os.path.basename(rec["drafter"]),
+            "drafter_bytes": rec["drafter_bytes"],
+            "arm_env": rec.get("arm_env"),
+            "gpu_clean_pre": rec.get("gpu_clean_pre"),
+            "gpu_clean_after": rec.get("gpu_clean_after"),
+            "vram_used_b_pre": rec["smi_pre"].get("vram_used_b"),
+            "ne11_census": rec.get("ne11_census"),
         }
     # across the two readings: this is the order-balanced spread a reader should trust
     good = [v for v in per_reading.values() if "error" not in v]
@@ -132,7 +146,8 @@ for arm in ARMS:
     out["quality"][arm] = entry
 
 # cross-arm: do the two formats fail on the same items?
-if all("error" not in out["quality"].get(a, {"error": 1}) for a in ARMS):
+if (set(ARMS) == {"gqh", "iq4xs"}
+        and all("error" not in out["quality"].get(a, {"error": 1}) for a in ARMS)):
     g, _, _ = load_scores(f"{D}/hep_scores_gqh_r1.json")
     q, _, _ = load_scores(f"{D}/hep_scores_iq4xs_r1.json")
     gf = {i for i in g if not g[i]}
@@ -144,5 +159,7 @@ if all("error" not in out["quality"].get(a, {"error": 1}) for a in ARMS):
         "fail_iq4xs_only": sorted(qf - gf),
     }
 
+out["run"] = RUN
+out["arms"] = ARMS
 json.dump(out, open(f"{D}/summary.json", "w"), indent=2)
 print(json.dumps(out, indent=2))
