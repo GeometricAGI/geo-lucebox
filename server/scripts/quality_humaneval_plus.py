@@ -57,7 +57,7 @@ CONFIGS = {
     },
 }
 
-PORT     = 8765
+PORT     = int(os.environ.get("PFLASH_PORT", "8765"))
 TARGET   = os.environ.get("PFLASH_TARGET", "/home/peppi/models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf")
 DRAFT    = os.environ.get("PFLASH_DRAFT",  "/home/peppi/models/qwen3.6-27b-dflash/model.safetensors")
 SERVER_BIN = os.environ.get("DFLASH_SERVER_BIN", str(PROJECT_ROOT / "dflash/build/dflash_server"))
