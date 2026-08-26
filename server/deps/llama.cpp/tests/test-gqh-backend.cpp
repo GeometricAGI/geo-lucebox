@@ -761,7 +761,7 @@ int main(int argc, char ** argv) {
             printf("OK   %s %dx%d [mmq-refused]: MMQ DECLINED (0 launches) at ncols %d "
                    "and %d on grid %d, and the dequant path answered fp16-exact over "
                    "%d offsets%s (scale %.9g)\n",
-                   rung.c_str(), rows, cols, nwide, grid_code, n_mmq_off,
+                   rung.c_str(), rows, cols, cols, nwide, grid_code, n_mmq_off,
                    ties ? (", " + std::to_string(ties) + " exact fp16 ties").c_str() : "",
                    tensor_scale);
             return 0;
