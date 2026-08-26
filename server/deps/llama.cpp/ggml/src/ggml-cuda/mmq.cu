@@ -844,14 +844,27 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // so MMQ catches exactly the widths that used to fall to dequant.
             //
             // Arch gate mirrors ROCmFPX: the wave32 WMMA branch is what these
-            // tile shapes are validated on. n_experts > 1 declines because there
-            // is no expert-batched arm (see ggml_cuda_gqh_mmq_eligible), and the
-            // caller must ALSO pass that per-tensor check -- this signature has
-            // no tensor, so it cannot see an int8-unrepresentable grid.
+            // tile shapes are validated on. The dp4a arm in both GQH tile
+            // loaders is UNVALIDATED -- on every arch reached here the WMMA
+            // branch is what compiles and runs, dp4a is dead code, and there is
+            // no build switch to force it, so its tile indices have never been
+            // exercised by a single test. amd_wmma_available(cc) is what keeps
+            // it unreachable: it is not a relaxation of the allowlist below but
+            // a hard invariant on top of it, so that adding an arch to the
+            // validated list can never silently arm dp4a instead. The allowlist
+            // stays the list of arches these tile shapes were measured on --
+            // notably NOT RDNA3.0, which amd_wmma_available admits but which
+            // was never validated here.
+            //
+            // n_experts > 1 declines because there is no expert-batched arm
+            // (see ggml_cuda_gqh_mmq_eligible), and the caller must ALSO pass
+            // that per-tensor check -- this signature has no tensor, so it
+            // cannot see an int8-unrepresentable grid.
             // Width-gated: see gqh_mmq_max_ne11 for the measured crossover and
             // why a single all-or-nothing switch cannot serve both effects.
             mmq_supported = ggml_cuda_gqh_mmq_enabled() && n_experts <= 1 &&
                             ne11 <= gqh_mmq_max_ne11(cc) &&
+                            amd_wmma_available(cc) &&
                             (GGML_CUDA_CC_IS_RDNA3_5(cc) ||
                              GGML_CUDA_CC_IS_RDNA4(cc));
             break;
