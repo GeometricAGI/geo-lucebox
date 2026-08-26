@@ -5,6 +5,81 @@ Everything below was re-derived from scratch on a clean machine (lucebox6) on
 part that matters: get it wrong and acceptance length collapses from ~6 to ~1.7,
 which makes every throughput number meaningless.
 
+## Results
+
+One configuration, measured once, on the canonical drafter. **Every number below
+comes from this setup and nothing else appears in this section.**
+
+* R9700 (gfx1201), lucebox6, ROCm 7.2.4, `server/build-wide`
+* drafter `qwen38-dflash2-q8_0-canonical.gguf`, 2,045,471,776 B, md5
+  `a98fb401578886f082315c7031f419a2` -- verified loaded in every server log
+* shipping defaults: MMQ on, width gate 160, draft block 8, prefix and prefill
+  caches off
+* two readings per arm, order-balanced ABBA, co-tenant checked against an exact
+  VRAM baseline before and after every reading
+
+| | GQH-Q3KXL | IQ4_XS | delta |
+|---|---:|---:|---:|
+| file bytes | 13,440,110,432 | 15,567,824,480 | **-13.67%** |
+| HumanEval+ pass@1 | **145/164 = 0.8841** | **145/164 = 0.8841** | **identical** |
+| decode tok/s | 95.42 - 95.46 | 81.60 - 82.46 | **+16%** |
+| decode ms/step | 47.56 - 47.78 | 52.25 - 53.50 | **-10%** |
+| prefill tok/s, 119-token prompt | 526.8 - 530.2 | 875.8 - 891.8 | -40% |
+| prefill tok/s, 6,850-token prompt | 771.4 - 773.3 | 1073.2 - 1074.5 | -28% |
+| end-to-end tok/s, 10 HumanEval prompts | 118.83 - 118.88 | 115.84 - 116.55 | **+2.6%** |
+| accept % / avg_commit, prose | 56.9 / 4.56 | 54.2 / 4.33 | GQH higher |
+| accept % / avg_commit, code | 91.7 / 7.34 | 88.5 / 7.08 | GQH higher |
+
+**In one line: 13.7% smaller, indistinguishable quality, decodes about 16%
+faster, prefills slower, net slightly ahead end-to-end.**
+
+### What the quality number does and does not say
+
+pass@1 is **identical**, and that is a stronger statement than the totals alone.
+Determinism was established first: with the harness pinned to `temperature: 0,
+top_k: 1`, both readings of each arm returned **164/164 byte-identical replies**,
+so the same-arm floor is **0 items** and a one-item difference would have been
+real. There is none.
+
+Item-by-item the arms are not the same model: 140 items pass in both, 14 fail in
+both, and **10 items are discordant -- 5 each way** (GQH passes 40, 77, 97, 115,
+163; IQ4_XS passes 1, 59, 83, 134, 140). McNemar exact, two-sided:
+**p = 1.0000**. Only 54 of 164 replies are byte-identical between the arms, so
+the two emit different tokens on 110 items and still land on the same score.
+
+Read that as *no measurable quality difference on this benchmark*, not as *the
+arms are interchangeable*.
+
+### Where the speed comes from, and what it costs
+
+The decode win is real per-step work, not an acceptance artefact: **47.6 ms/step
+against 52.3-53.5**, a ~10% narrower step at equal geometry. Acceptance is also
+slightly better at the shipping block width, on both prose and code.
+
+The prefill loss is the honest cost. GQH weights cannot be streamed to a GEMM the
+way an fp16-friendly quant can, so a prefill pays either a dequantise or a
+per-tile decode. MMQ recovers the narrow chunks (see the MMQ section) but the
+wide ones stay with dequant, and IQ4_XS keeps a substantial prefill advantage at
+both prompt lengths. On short-prompt serving the decode win dominates and the net
+is positive; on a prefill-heavy workload it will not be.
+
+### Two traps for anyone reproducing this
+
+**Use the canonical drafter.** Three other DFlash2-shaped drafters are floating
+around and all of them load. `Qwen3.8-27B-DFlash2-Q8_0.gguf` (2,056,414,752) is
+the vendor file and shifts acceptance; `qwen38-dflash2-q8_0.gguf` (1,838,540,000)
+was built by a converter that silently drops DFlash2's 23 conv and
+candidate-selector tensors. Two drivers in `server/scripts/` were found pointing
+at the wrong one. Check the md5 above.
+
+**`avg_commit` is not comparable across draft block widths.** It is
+`accept% x verify_cap`, and `verify_cap` is the block size, so the same model
+reads 4.56 at block 8 and 6.83 at block 16. Comparing figures taken at different
+widths produced an apparent accept-rate reversal in our own earlier notes that
+was purely this. Quote accept % with its block width, or quote both.
+
+---
+
 ## 0. Hardware / toolchain
 
     GPU     AMD Radeon AI PRO R9700, gfx1201, 31.86 GiB usable
@@ -121,63 +196,12 @@ Same-arm floor across two full repeats: 0.2% or better.
 
 If your AL is below ~5 on HumanEval prompts, the drafter is wrong. Go back to §2.
 
-## 7. Tuned head-to-head vs upstream #642 (R9700, lucebox6, 2026-08-24)
+## 7. Superseded: the ddtree-budget head-to-head
 
-Each arm tuned independently on `--ddtree-budget`; HumanEval 10 prompts,
-`--specla --n-gen 128`, canonical drafter from §2, greedy.
-
-| budget | #642 + IQ4_XS | ours + IQ4_XS | ours + GQH |
-|---:|---:|---:|---:|
-| 3  | 68.21 (AL 3.46) | - | - |
-| 4  | 76.37 (AL 3.95) | 76.39 (AL 3.95) | 65.14 (AL 3.80) |
-| 5  | 83.80 (AL 4.40) | - | - |
-| 6  | 89.76 (AL 4.79) | 89.92 (AL 4.79) | 65.06 (AL 4.62) |
-| 7  | 94.13 (AL 5.17) | - | 100.47 (AL 5.10) |
-| 8  | **96.79 (AL 5.83)** | **96.33 (AL 5.83)** | 101.69 (AL 5.10) |
-| 16 | 78.22 (AL 5.76) | - | 101.77 (AL 5.10) |
-| 22 | 76.34 (AL 5.84) | 76.27 (AL 5.84) | **101.82 (AL 5.10)** |
-| 32 | 73.38 (AL 5.99) | 73.41 (AL 5.99) | - |
-| 48 | 65.98 (AL 6.03) | - | 101.76 (AL 5.10) |
-
-**SUPERSEDED - see section 8.** This table tunes only the ddtree budget, which
-leaves both arms at the drafter's trained block width of 8. The real lever is
-the draft block size, and upstream gains far more from it than we do. Best vs
-best at the trained width was ours+GQH 101.82 vs #642+IQ4_XS 96.79 (+5.2%);
-once both arms may widen, that advantage disappears. Do not quote +5.2%.
-
-Two things this table is for.
-
-**The gain is the format, not the stack.** Our arm on IQ4_XS peaks at 96.33 vs
-#642's 96.79 - a 0.5% difference, i.e. the two stacks are equivalent and all of
-the win comes from the GQH artifact. Matched-budget rows agree even more closely
-(76.27 vs 76.34 at 22; 89.92 vs 89.76 at 6; 76.39 vs 76.37 at 4).
-
-**Never compare these two at a single budget.** The arms have opposite tuning
-curves. IQ4_XS peaks sharply at 8 and decays hard (96.79 -> 65.98 by 48); GQH is
-flat from 7 upward because it self-caps at `ncols=8`, but falls off a cliff
-*below* 7 (100.47 at 7, 65.14 at 4) where the fused kernel is not filled. So:
-
-* at the default budget 22, GQH looks **+33%** ahead - flattering, wrong
-* at budget 4, GQH looks **15% behind** - unflattering, also wrong
-* tuned per arm, the honest figure is **+5.2%**
-
-An independent check: the campaign status doc records +7% on the same pairing
-from a separate run, so +5.2% is in family.
-
-### Reproducing exactly this table
-
-    for b in 3 4 5 6 7 8 16 22 32 48; do
-      DFLASH_BIN=<arm>/server/build-bench/test_dflash \
-      DFLASH_TARGET=<target.gguf> \
-      DFLASH_DRAFT=qwen38-dflash2-q8_0.gguf \
-      HIP_VISIBLE_DEVICES=0 TMPDIR=$HOME/tmp \
-      python3 server/scripts/bench_he.py --specla --n-gen 128 \
-        --ddtree-budget $b --skip-tokenize
-    done
-
-Patch `test_dflash.cpp` in the upstream arm first (§5) or every run aborts.
-Same-arm floor measured over two full repeats: 0.2% or better (56.06/56.17 and
-101.78/101.77), so the 5.2% gap is well outside it.
+Removed. That table tuned only `--ddtree-budget`, which leaves both arms at the
+drafter's trained block width of 8, so it measured the wrong lever and its own
+footnote said not to quote it. The draft block width is the lever (section 8),
+and the head-to-head that supersedes it is the Results table at the top.
 
 ## 8. The real lever: draft block width (and where GQH stops)
 
@@ -211,7 +235,13 @@ their published 208.1 on the same file and drafter is therefore box or
 environment, not build configuration, and is unresolved. Note our prefill
 matches theirs closely (below), so the gap is decode-specific.
 
-### Why GQH cannot widen: the cliff is immediately after ncols 8
+### The cliff immediately after ncols 8 -- since fixed
+
+This section records the cliff as originally found. It is no longer a
+property of the kernel: giving every dispatched verify width its own
+exact-width arm, then giving width 16 its own ROWS, took the block-16 arm
+from 56.4 to 195.8 tok/s (3.47x). Read the table below as the diagnosis
+that motivated that work, not as current behaviour.
 
 The spec cap is `1 + n_nodes`, so a cap of 7 means the kernel runs at **ncols 8**.
 Sweeping GQH by width (`gqh_cap_spec_ddtree_budget`, `gqh_headers.cpp:65`, caps
@@ -255,7 +285,7 @@ occupancy, which this kernel does not want.
 So widening GQH is not a config change and not a missing instantiation. It needs
 a wide-ncols path that keeps row reuse without spilling.
 
-## 9. Prefill: GQH has no MMQ path
+## 9. Prefill and the MMQ path
 
 GQH registers only the ggml converter hooks (`dequantize_gqh3_to_fp16_cuda` ->
 `gqh_convert` -> `gqh3_decode_cuda`). There is **no MMQ kernel for the GQH types**
@@ -289,19 +319,34 @@ For scale: our IQ4_XS prefill of 1018 tok/s at 1K tokens is in line with
 upstream's published 945 tok/s at 1.4K, so prefill is not where this box differs
 from theirs.
 
-### The two problems have one fix
+### One fix for both problems -- half right, and the half that failed
 
-An MMQ path for the GQH types removes the dequant from prefill **and** gives
-ncols 13-16 a batched quantised kernel instead of the generic matvec that
-collapses decode. MMQ tiles read weights cooperatively through LDS, which is
-precisely the register-pressure escape the matvec comment could not find. That
-makes GQH MMQ the highest-value remaining work: it is the only route past
-#642's 157-163, and it fixes the prefill penalty on the way.
+The prediction here was that an MMQ path would remove the dequant from prefill
+**and** give the wide verify widths a batched quantised kernel. **The second half
+was right; the first was wrong, and it was measured wrong twice.**
 
-Caveat on all end-to-end numbers here: everything ran `--prefix-cache-slots 0`
-to keep arms comparable. Workloads with shared prefixes amortise the fixed
-prefill cost, so the production penalty is smaller than these rows - but
-cold-prefill latency is real and it is what a first request feels.
+MMQ re-decodes the weight tile once per output column tile -- about 16 times at a
+2K prompt and 68 at 8.7K -- where dequant unpacks once and streams fp16. So MMQ
+*loses* at prefill widths, and loses harder as the prompt grows: +4.2% at 2K and
++6.2% at 8.7K with one rung converted, roughly doubling to +8.3..13.8% once both
+rungs were. The regression scaling with both prompt length and MMQ's share of the
+artifact is what confirmed the mechanism rather than a coding error.
+
+What MMQ does win is the narrow chunks. An `ne11` census over a real verify plus
+a 6,850-token prefill puts 9,039 of 85,839 GQH `mul_mat` calls (24.7% of those
+that get past the matvec) inside the gate, and there MMQ is **1.68x** on a
+119-token prefill. Decode never reaches it at all -- the matvec owns widths 1..16
+and returns first -- so **MMQ can be credited for prefill and never for decode.**
+
+Hence the dispatch is width-gated (`gqh_mmq_max_ne11()`, default 160) rather than
+all-or-nothing. The threshold turns out not to be load-bearing: the workload's
+widths are bimodal with a hole, clustering at 8, 39-119 and 512, so nothing lands
+between 105 and 511 and any threshold in that window dispatches identically.
+
+Caveat on all end-to-end numbers here: everything ran `--prefix-cache-slots 0` to
+keep arms comparable. Workloads with shared prefixes amortise the fixed prefill
+cost, so the production penalty is smaller than these rows -- but cold-prefill
+latency is real and it is what a first request feels.
 
 ### Measured: MMQ loses prefill at length and wins the code workload
 
