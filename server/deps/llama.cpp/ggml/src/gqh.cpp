@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -154,6 +155,22 @@ gqh_q8_fit gqh_q8_fit_grid(const uint32_t * grid, int nlev) {
     return best;
 }
 
+// The level grid itself, so an error can be evaluated at ANY denominator and not
+// only at the derived optimum. Needed by ggml_gqh_q8_maxe_at, which is what lets a
+// harness state the bound for the denominator actually in force.
+bool gqh_grid_levels(enum ggml_type type, int grid_code,
+                     const uint32_t ** grid, int * nlev) {
+    if (grid_code < 0 || grid_code >= GQH_GRID_CODES) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_GQH3:   *grid = GQH3_GRID [grid_code]; *nlev =  8; return true;
+        case GGML_TYPE_GQH4:   *grid = GQH4_GRID [grid_code]; *nlev = 16; return true;
+        case GGML_TYPE_GQH2_H: *grid = GQH2H_GRID[grid_code]; *nlev =  4; return true;
+        default:               return false;
+    }
+}
+
 const gqh_q8_fit * gqh_q8_fit_for(enum ggml_type type, int grid_code) {
     struct table {
         gqh_q8_fit gqh3[GQH_GRID_CODES];
@@ -193,6 +210,91 @@ float ggml_gqh_q8_maxe(enum ggml_type type, int grid_code) {
 float ggml_gqh_q8_rms(enum ggml_type type, int grid_code) {
     const gqh_q8_fit * f = gqh_q8_fit_for(type, grid_code);
     return f ? f->rms : 0.0f;
+}
+
+// maxe at an ARBITRARY denominator, not only at the derived optimum. Same
+// arithmetic as the search above -- gqh_q8_round is the float32 / round-to-nearest
+// chain the device runs -- just evaluated at the N it is handed instead of the N
+// that minimises rms. ggml_gqh_q8_maxe(type, code) is exactly this at
+// ggml_gqh_q8_denom(type, code).
+//
+// This exists so a bound can be stated for the denominator ACTUALLY IN FORCE.
+// A bound pinned to the derived optimum while the kernel runs some other N is not
+// a bound at all, it is a comparison of two different quantisers -- useful as a
+// deliberate negative control and wrong as an ordinary assertion.
+float ggml_gqh_q8_maxe_at(enum ggml_type type, int grid_code, int n) {
+    const uint32_t * grid = NULL;
+    int              nlev = 0;
+    if (n < 1 || n > 127 || !gqh_grid_levels(type, grid_code, &grid, &nlev)) {
+        return 0.0f;
+    }
+    double mx = 0.0;
+    for (int i = 0; i < nlev; ++i) {
+        const float  lv = gqh_f32(grid[i]);
+        const double e  = (double) gqh_q8_round(lv, n) / (double) n - (double) lv;
+        if (fabs(e) > mx) { mx = fabs(e); }
+    }
+    return (float) mx;
+}
+
+// ---- which denominator is ACTUALLY IN FORCE --------------------------------
+//
+// THE DEFAULT IS THE FLAT 127, i.e. per-grid optimal-s is OPT-IN.
+//
+// The per-grid denominators above are a real fidelity gain (weight rms 1.35x-3.96x
+// better across the grids this artifact uses) at zero runtime cost, but they were
+// gated on HumanEval+ and did not earn the default. Four readings, order-balanced
+// ABBA, canonical drafter, R9700, greedy and byte-identical within each arm:
+//
+//   derived N   144/164, 144/164
+//   flat 127    145/164, 145/164
+//
+// Same-arm floor is 0 items in BOTH arms, so the 1-item deficit is reproducible
+// rather than noise. It is NOT statistically separable -- the arms are discordant
+// on 5 items, 3 to 2 (McNemar exact two-sided p ~ 1.0) -- so this is not evidence
+// of harm. But the measured throughput gain was also nil (193.76/191.21 tok/s
+// derived against 194.33/195.13 flat, inside the arm own 1.33% spread and under
+// the rig ~1.3% floor), and a change that alters generated tokens for no
+// measurable benefit does not get to be the default.
+//
+// GGML_GQH_Q8N selects:
+//   unset                       -> the flat 127 above
+//   1..127                      -> that flat denominator
+//   0, "opt", "derived", "auto" -> the per-grid derived optimum (opt in)
+//   anything else               -> the per-grid derived optimum
+//
+// THIS FUNCTION IS THE ONLY DEFINITION OF THAT POLICY. It lives here, in the
+// library both the kernel and the test harness link, rather than in the CUDA
+// translation unit, precisely so a harness can assert against the denominator in
+// force instead of hardcoding a copy of the default and drifting from it. The
+// previous arrangement kept the default private to gqh.cu and left
+// test-gqh-backend pinned to the derived table, which meant flipping the default
+// broke 35 ordinary cases that had nothing wrong with them.
+//
+// Reconsider the default if a workload appears where the extra weight precision
+// shows up in an output metric.
+#define GQH_Q8N_FLAT_DEFAULT 127
+
+static int gqh_q8n_env() {
+    // Read once. getenv mid-run would let two dispatches in one process disagree
+    // about the denominator, and the compensating 127/N rides the weight scale.
+    static const int n = []() {
+        const char * e = getenv("GGML_GQH_Q8N");
+        if (!e || !*e) {
+            return GQH_Q8N_FLAT_DEFAULT;
+        }
+        if (!strcmp(e, "opt") || !strcmp(e, "derived") || !strcmp(e, "auto")) {
+            return 0;   // 0 == per-grid derived
+        }
+        const int v = atoi(e);
+        return (v >= 1 && v <= 127) ? v : 0;
+    }();
+    return n;
+}
+
+int ggml_gqh_q8_denom_eff(enum ggml_type type, int grid_code) {
+    const int forced = gqh_q8n_env();
+    return forced > 0 ? forced : ggml_gqh_q8_denom(type, grid_code);
 }
 
 static void gqh_header_or_abort(const void * vx, int64_t k, size_t sb_bytes,

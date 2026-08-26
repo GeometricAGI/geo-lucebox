@@ -88,6 +88,41 @@ static bool fp16_tie_equivalent(float ref, float got) {
     return false;
 }
 
+// GQH_TEST_BOUND_N: build the per-grid weight-LUT bound at THIS denominator,
+// whatever the kernel is actually using.
+//
+//   unset / empty              -> follow the kernel, i.e. ggml_gqh_q8_denom_eff.
+//                                 An ordinary case is then SELF-CONSISTENT and
+//                                 passes whichever way the shipping default is set.
+//   1..127                     -> that flat denominator.
+//   0 / "opt" / "derived"      -> the per-grid derived optimum, ggml_gqh_q8_denom.
+//
+// This is the ONLY way to get a deliberate mismatch, and a deliberate mismatch is
+// the whole negative control: set the kernel to one denominator and the bound to a
+// tighter one and the case MUST fail. The bound used to be pinned to the derived
+// table unconditionally, which made the negative control a side effect of what the
+// default happened to be -- so the moment the default moved to the flat 127, every
+// ordinary i8 case failed and the control passed for the wrong reason. Returns -1
+// for "follow the kernel" and 0 for "the per-grid derived optimum".
+static int bound_denom_request() {
+    const char * e = getenv("GQH_TEST_BOUND_N");
+    if (!e || !*e) {
+        return -1;
+    }
+    if (!strcmp(e, "opt") || !strcmp(e, "derived") || !strcmp(e, "auto")) {
+        return 0;
+    }
+    const int v = atoi(e);
+    if (v == 0) {
+        return 0;
+    }
+    if (v < 1 || v > 127) {
+        fprintf(stderr, "GQH_TEST_BOUND_N=%s is not 1..127, 0 or derived\n", e);
+        exit(1);
+    }
+    return v;
+}
+
 static std::vector<uint8_t> read_file(const char * path) {
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
@@ -376,17 +411,38 @@ int main(int argc, char ** argv) {
     // |q(L,N)/N - L|. Every grid's amax is exactly 1.0 and the uint4 ratio
     // quantiser puts the row's largest sub-block at r = 15, so d_real there IS
     // max|w_row| -- and the bound is row_max times the largest absolute level error
-    // the grid leaves at its derived N, which is exactly ggml_gqh_q8_maxe.
+    // the grid leaves AT THE DENOMINATOR IN FORCE, which is exactly
+    // ggml_gqh_q8_maxe_at(type, code, that denominator).
     //
-    // It reads ggml_gqh_q8_denom / ggml_gqh_q8_maxe, NOT the GGML_GQH_Q8N override.
-    // That is what makes it a gate rather than a tautology: GGML_GQH_Q8N=127 puts
-    // the old flat denominator back in the kernel and leaves this bar where the
-    // derivation says it belongs, so the case MUST fail -- see the q8n127 cases in
-    // server/CMakeLists.txt. It is also the only thing here that proves the int8
-    // arm DISPATCHED at all: if it silently declined, the f32 arm would answer
-    // bit-exactly, err would be 0, and every bound in this file would pass.
-    const int    q8_denom = i8_mode ? ggml_gqh_q8_denom(wtype, grid_code) : 0;
-    const double q8_maxe  = i8_mode ? (double) ggml_gqh_q8_maxe(wtype, grid_code) : 0.0;
+    // WHICH denominator the bound is built at is decided in exactly one place, and
+    // it is NOT "whatever the shipping default happens to be". Two numbers:
+    //
+    //   kern_denom  = ggml_gqh_q8_denom_eff -- the denominator the kernel IS using.
+    //                 One definition, in ggml/src/gqh.cpp, read by the int8 arms and
+    //                 by this harness, so it already accounts for GGML_GQH_Q8N and
+    //                 for the shipping default (currently the flat 127).
+    //   bound_denom = the same thing UNLESS GQH_TEST_BOUND_N says otherwise.
+    //
+    // With GQH_TEST_BOUND_N unset the two agree and the bound is a real statement
+    // about the quantiser that ran: an ordinary i8 case is self-consistent and
+    // passes with the default set either way. With GQH_TEST_BOUND_N set they can be
+    // made to disagree ON PURPOSE, and a bound tighter than the kernel can meet is
+    // the negative control -- see the negctl cases in server/CMakeLists.txt. A gate
+    // that only ever passes proves nothing about whether it can see the thing it
+    // claims to measure, so that control is not optional.
+    //
+    // This bar is also the only thing here that proves the int8 arm DISPATCHED at
+    // all: if it silently declined, the f32 arm would answer bit-exactly, err would
+    // be 0, and every bound in this file would pass.
+    const int q8_denom = i8_mode ? ggml_gqh_q8_denom_eff(wtype, grid_code) : 0;
+    const int bound_req = bound_denom_request();
+    const int bound_denom = !i8_mode ? 0
+                          : bound_req <  0 ? q8_denom
+                          : bound_req == 0 ? ggml_gqh_q8_denom(wtype, grid_code)
+                          :                  bound_req;
+    const double q8_maxe = i8_mode
+        ? (double) ggml_gqh_q8_maxe_at(wtype, grid_code, bound_denom) : 0.0;
+    const bool bound_mismatch = i8_mode && bound_denom != q8_denom;
     // Slack over the ideal, and it is not a shrug: it covers the ratio quantiser
     // rounding a sub-block scale ABOVE its own amax (d_real can then exceed
     // row_max), plus the fp32 rounding of the d_real * ratio * qxs chain. MEASURED
@@ -394,13 +450,13 @@ int main(int argc, char ** argv) {
     // five of them, so this is a cushion for fp32 rounding rather than a fudge
     // factor -- the bound is the real quantity. The "slack used" number printed in
     // every OK line IS that measurement, so a drift shows up without anyone
-    // re-deriving anything, and the q8n127 negative control fails at 1.18 on the
-    // narrowest case.
+    // re-deriving anything, and the GQH_TEST_BOUND_N negative control fails at 1.18
+    // on the narrowest case.
     const double GRID_MAXE_SLACK = 1.05;
     auto grid_step = [&](int i) {
         return std::max((double) row_max[i] * q8_maxe * GRID_MAXE_SLACK, 1e-7);
     };
-    const bool grid_bound_live = i8_mode && q8_denom > 0 && q8_maxe > 0.0;
+    const bool grid_bound_live = i8_mode && bound_denom > 0 && q8_maxe > 0.0;
     size_t bad_grid       = 0;
     double max_grid_slack = 0.0;   // observed |e| / (row_max * maxe): the slack USED
     auto grid_check = [&](int i, int j, double gv, double wv,
@@ -417,10 +473,11 @@ int main(int argc, char ** argv) {
             if (bad_grid < 5) {
                 fprintf(stderr, "  %s off=%d [%d,%d] OVER THE PER-GRID BOUND: got %a "
                                 "want %a (err %.4g > %.4g = row_max %.4g * maxe %.4g "
-                                "* slack %.2f; grid %d, derived N=%d)\n",
+                                "* slack %.2f; grid %d, bound N=%d, kernel N=%d%s)\n",
                         where, off, i, j, gv, wv, err, grid_step(i),
                         (double) row_max[i], q8_maxe, GRID_MAXE_SLACK,
-                        grid_code, q8_denom);
+                        grid_code, bound_denom, q8_denom,
+                        bound_mismatch ? " -- DELIBERATE MISMATCH" : "");
             }
             ++bad_grid;
         }
@@ -740,12 +797,14 @@ int main(int argc, char ** argv) {
         printf("FAIL %s %dx%d [%s]: wide %zu/%zu differ, fused %zu/%d differ, "
                "offset-onehot %zu differ over %d offsets, dense %zu differ "
                "(max rel %.3g), %zu over the per-grid weight-LUT bound "
-               "(grid %d, derived N=%d, maxe %.4g, slack used %.3f vs %.2f allowed)",
+               "(grid %d, bound N=%d, kernel N=%d%s, maxe %.4g, "
+               "worst level error %.4g, slack used %.3f vs %.2f allowed)",
                rung.c_str(), rows, cols, i8_mode ? "i8" : "f32",
                bad, n_elem, bad2, rows * nvec,
                bad_off, n_off, bad_dense, max_rel,
-               bad_grid, grid_code, q8_denom, q8_maxe,
-               max_grid_slack, GRID_MAXE_SLACK);
+               bad_grid, grid_code, bound_denom, q8_denom,
+               bound_mismatch ? " DELIBERATE MISMATCH" : "", q8_maxe,
+               max_grid_slack * q8_maxe, max_grid_slack, GRID_MAXE_SLACK);
         if (mmq_mode) {
             printf(", mmq n%d: offset-onehot %zu differ over %d offsets "
                    "(max abs %.4g), dense %zu differ (max rel %.3g), "
@@ -785,9 +844,15 @@ int main(int argc, char ** argv) {
            i8_mode ? "within the int8 bound of" : "bit-identical to",
            nvec, n_off + 1, max_rel, tensor_scale, grid_code);
     if (grid_bound_live) {
-        printf(", per-grid weight-LUT bound held: derived N=%d, grid maxe %.4g, "
-               "slack used %.3f of %.2f", q8_denom, q8_maxe,
-               max_grid_slack, GRID_MAXE_SLACK);
+        // slack used is measured AGAINST the bound, so it moves with the
+        // denominator; max|e|/row_max is the level error itself and is the number
+        // to compare across denominators. maxe is constant within a run, so the
+        // argmax is the same item and the product is exact.
+        printf(", per-grid weight-LUT bound held: bound N=%d, kernel N=%d%s, "
+               "grid maxe %.4g, worst level error %.4g, slack used %.3f of %.2f",
+               bound_denom, q8_denom,
+               bound_mismatch ? " (MISMATCHED ON PURPOSE)" : "", q8_maxe,
+               max_grid_slack * q8_maxe, max_grid_slack, GRID_MAXE_SLACK);
     }
     printf("\n");
     return 0;

@@ -3973,54 +3973,25 @@ static int gqh_pairlut_mode() {
     return mode;
 }
 
-// GGML_GQH_Q8N: force the int8 weight-LUT denominator for EVERY grid, instead of
-// taking ggml_gqh_q8_denom's per-grid optimum. It exists for the negative control:
-// test-gqh-backend's per-grid max|e| bound is built from ggml_gqh_q8_denom and does
-// NOT read this variable, so GGML_GQH_Q8N=127 restores the old flat denominator and
-// the bound must then FAIL. A gate that only ever passes proves nothing about
-// whether it can see the thing it claims to measure.
+// GGML_GQH_Q8N: force the int8 weight-LUT denominator for EVERY grid instead of
+// taking ggml_gqh_q8_denom per-grid optimum. THE DEFAULT IS THE FLAT 127, i.e.
+// per-grid optimal-s is opt-in -- see ggml_gqh_q8_denom_eff in ggml/src/gqh.cpp
+// for the HumanEval+ readings that decided that and for the accepted spellings.
+//
+// The policy DELIBERATELY does not live here. It used to, and test-gqh-backend
+// built its per-grid max|e| bound from the derived table without reading this
+// variable, which made the bound a statement about a quantiser that was not
+// necessarily the one running: flipping the default to 127 turned 35 ordinary i8
+// cases red without anything being wrong with them. Kernel and harness now read
+// the same ggml_gqh_q8_denom_eff, and the negative control states its mismatch
+// explicitly through GQH_TEST_BOUND_N instead of relying on what the default
+// happens to be.
 //
 // Both the LUT fill and the compensating weight scale read the value this returns,
 // via grid.q8n, so an override stays self-consistent -- it degrades accuracy, it
 // does not corrupt the reconstruction.
-static int gqh_q8_denom_override() {
-    static const int n = []() {
-        const char * e = getenv("GGML_GQH_Q8N");
-        if (!e) {
-            // DEFAULT IS THE FLAT 127, i.e. per-grid optimal-s is OPT-IN.
-            //
-            // The per-grid denominators are a real fidelity gain (weight rms
-            // 1.35x-3.96x better across the grids this artifact uses) at zero
-            // runtime cost, but they were gated on HumanEval+ and did not earn
-            // the default. Four readings, order-balanced ABBA, canonical
-            // drafter, R9700, greedy and byte-identical within each arm:
-            //
-            //   derived N   144/164, 144/164
-            //   flat 127    145/164, 145/164
-            //
-            // Same-arm floor is 0 items in BOTH arms, so the 1-item deficit is
-            // reproducible rather than noise. It is NOT statistically separable
-            // -- the arms are discordant on 5 items, 3 to 2 (McNemar exact
-            // two-sided p ~ 1.0) -- so this is not evidence of harm. But the
-            // measured throughput gain was also nil (193.76/191.21 tok/s derived
-            // against 194.33/195.13 flat, inside the arm's own 1.33% spread and
-            // under the rig's ~1.3% floor), and a change that alters generated
-            // tokens for no measurable benefit does not get to be the default.
-            //
-            // Set GGML_GQH_Q8N to a per-grid value to opt in. Reconsider the
-            // default if a workload appears where the extra weight precision
-            // shows up in an output metric.
-            return 127;
-        }
-        const int v = atoi(e);
-        return (v >= 1 && v <= 127) ? v : 0;
-    }();
-    return n;
-}
-
 static int gqh_q8_denom_eff(ggml_type type, int grid_code) {
-    const int forced = gqh_q8_denom_override();
-    return forced > 0 ? forced : ggml_gqh_q8_denom(type, grid_code);
+    return ggml_gqh_q8_denom_eff(type, grid_code);
 }
 
 // GGML_GQH_I8DOT: N=8 FMA uses codebook->int8 + v_sudot4 (gfx1201). Default ON.
