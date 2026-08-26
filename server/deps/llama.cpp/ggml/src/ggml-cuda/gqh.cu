@@ -3987,7 +3987,30 @@ static int gqh_q8_denom_override() {
     static const int n = []() {
         const char * e = getenv("GGML_GQH_Q8N");
         if (!e) {
-            return 0;
+            // DEFAULT IS THE FLAT 127, i.e. per-grid optimal-s is OPT-IN.
+            //
+            // The per-grid denominators are a real fidelity gain (weight rms
+            // 1.35x-3.96x better across the grids this artifact uses) at zero
+            // runtime cost, but they were gated on HumanEval+ and did not earn
+            // the default. Four readings, order-balanced ABBA, canonical
+            // drafter, R9700, greedy and byte-identical within each arm:
+            //
+            //   derived N   144/164, 144/164
+            //   flat 127    145/164, 145/164
+            //
+            // Same-arm floor is 0 items in BOTH arms, so the 1-item deficit is
+            // reproducible rather than noise. It is NOT statistically separable
+            // -- the arms are discordant on 5 items, 3 to 2 (McNemar exact
+            // two-sided p ~ 1.0) -- so this is not evidence of harm. But the
+            // measured throughput gain was also nil (193.76/191.21 tok/s derived
+            // against 194.33/195.13 flat, inside the arm's own 1.33% spread and
+            // under the rig's ~1.3% floor), and a change that alters generated
+            // tokens for no measurable benefit does not get to be the default.
+            //
+            // Set GGML_GQH_Q8N to a per-grid value to opt in. Reconsider the
+            // default if a workload appears where the extra weight precision
+            // shows up in an output metric.
+            return 127;
         }
         const int v = atoi(e);
         return (v >= 1 && v <= 127) ? v : 0;
