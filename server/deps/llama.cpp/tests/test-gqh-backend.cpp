@@ -362,6 +362,69 @@ int main(int argc, char ** argv) {
     auto onehot_tol = [&](int i) {
         return i8_mode ? int8_step(i) : 0.0;
     };
+    // ---- the per-grid weight-LUT bound (int8 arm) ---------------------------
+    // int8_step above stays LITERALLY max|w_row|/127 and must. It bounds "did a
+    // tile land on the wrong weight", and reparameterising it by whatever
+    // denominator is in force would make the tolerance move with the very thing it
+    // measures. It stays a fixed bar that the measurement now clears by a wide
+    // margin, which is what turns it into a real measurement.
+    //
+    // This is a SECOND, much tighter bar, and it is the one that certifies
+    // optimal-s. A one-hot dot on the int8 arm has exactly ONE term and its
+    // activation side is exact (amax 1 -> d = 1/127, q = 127), so what comes back
+    // differs from the reference by the weight LUT error alone: d_real times
+    // |q(L,N)/N - L|. Every grid's amax is exactly 1.0 and the uint4 ratio
+    // quantiser puts the row's largest sub-block at r = 15, so d_real there IS
+    // max|w_row| -- and the bound is row_max times the largest absolute level error
+    // the grid leaves at its derived N, which is exactly ggml_gqh_q8_maxe.
+    //
+    // It reads ggml_gqh_q8_denom / ggml_gqh_q8_maxe, NOT the GGML_GQH_Q8N override.
+    // That is what makes it a gate rather than a tautology: GGML_GQH_Q8N=127 puts
+    // the old flat denominator back in the kernel and leaves this bar where the
+    // derivation says it belongs, so the case MUST fail -- see the q8n127 cases in
+    // server/CMakeLists.txt. It is also the only thing here that proves the int8
+    // arm DISPATCHED at all: if it silently declined, the f32 arm would answer
+    // bit-exactly, err would be 0, and every bound in this file would pass.
+    const int    q8_denom = i8_mode ? ggml_gqh_q8_denom(wtype, grid_code) : 0;
+    const double q8_maxe  = i8_mode ? (double) ggml_gqh_q8_maxe(wtype, grid_code) : 0.0;
+    // Slack over the ideal, and it is not a shrug: it covers the ratio quantiser
+    // rounding a sub-block scale ABOVE its own amax (d_real can then exceed
+    // row_max), plus the fp32 rounding of the d_real * ratio * qxs chain. MEASURED
+    // at 1.000 or below on all nine vector shapes, and attained EXACTLY (1.000) on
+    // five of them, so this is a cushion for fp32 rounding rather than a fudge
+    // factor -- the bound is the real quantity. The "slack used" number printed in
+    // every OK line IS that measurement, so a drift shows up without anyone
+    // re-deriving anything, and the q8n127 negative control fails at 1.18 on the
+    // narrowest case.
+    const double GRID_MAXE_SLACK = 1.05;
+    auto grid_step = [&](int i) {
+        return std::max((double) row_max[i] * q8_maxe * GRID_MAXE_SLACK, 1e-7);
+    };
+    const bool grid_bound_live = i8_mode && q8_denom > 0 && q8_maxe > 0.0;
+    size_t bad_grid       = 0;
+    double max_grid_slack = 0.0;   // observed |e| / (row_max * maxe): the slack USED
+    auto grid_check = [&](int i, int j, double gv, double wv,
+                          const char * where, int off) {
+        if (!grid_bound_live) {
+            return;
+        }
+        const double err   = std::fabs(gv - wv);
+        const double ideal = (double) row_max[i] * q8_maxe;
+        if (ideal > 0.0 && err / ideal > max_grid_slack) {
+            max_grid_slack = err / ideal;
+        }
+        if (err > grid_step(i)) {
+            if (bad_grid < 5) {
+                fprintf(stderr, "  %s off=%d [%d,%d] OVER THE PER-GRID BOUND: got %a "
+                                "want %a (err %.4g > %.4g = row_max %.4g * maxe %.4g "
+                                "* slack %.2f; grid %d, derived N=%d)\n",
+                        where, off, i, j, gv, wv, err, grid_step(i),
+                        (double) row_max[i], q8_maxe, GRID_MAXE_SLACK,
+                        grid_code, q8_denom);
+            }
+            ++bad_grid;
+        }
+    };
     // Path 1 at ncols = cols. With GGML_GQH_MMQ=1 this node IS the MMQ path -- the
     // dequant->cuBLAS route it used to take is exactly what MMQ replaces -- so the
     // expectation changes with it: no longer fp16(decode(W)) bitwise, but the
@@ -469,6 +532,9 @@ int main(int argc, char ** argv) {
                     float wv = want[(size_t) i * cols + off + j];
                     if (gv == 0.0f) { gv = 0.0f; }   // normalise -0.0, as above
                     if (wv == 0.0f) { wv = 0.0f; }
+                    if (i8_mode) {
+                        grid_check(i, j, (double) gv, (double) wv, "offset-onehot", off);
+                    }
                     const bool differs = i8_mode
                         ? (std::fabs((double) gv - (double) wv) > onehot_tol(i))
                         : (memcmp(&gv, &wv, 4) != 0);
@@ -653,6 +719,9 @@ int main(int argc, char ** argv) {
             for (int j = 0; j < nvec; ++j) {
                 const float g = norm(got2[(size_t) j * rows + i]);
                 const float w = norm(want[(size_t) i * cols + j]);
+                if (i8_mode) {
+                    grid_check(i, j, (double) g, (double) w, "fused-onehot", 0);
+                }
                 const bool differs = i8_mode
                     ? (std::fabs((double) g - (double) w) > onehot_tol(i))
                     : (memcmp(&g, &w, 4) != 0);
@@ -666,13 +735,17 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (bad || bad2 || bad_off || bad_dense || bad_mmq_off || bad_mmq_dense || collapsed) {
+    if (bad || bad2 || bad_off || bad_dense || bad_mmq_off || bad_mmq_dense ||
+            collapsed || bad_grid) {
         printf("FAIL %s %dx%d [%s]: wide %zu/%zu differ, fused %zu/%d differ, "
                "offset-onehot %zu differ over %d offsets, dense %zu differ "
-               "(max rel %.3g)",
+               "(max rel %.3g), %zu over the per-grid weight-LUT bound "
+               "(grid %d, derived N=%d, maxe %.4g, slack used %.3f vs %.2f allowed)",
                rung.c_str(), rows, cols, i8_mode ? "i8" : "f32",
                bad, n_elem, bad2, rows * nvec,
-               bad_off, n_off, bad_dense, max_rel);
+               bad_off, n_off, bad_dense, max_rel,
+               bad_grid, grid_code, q8_denom, q8_maxe,
+               max_grid_slack, GRID_MAXE_SLACK);
         if (mmq_mode) {
             printf(", mmq n%d: offset-onehot %zu differ over %d offsets "
                    "(max abs %.4g), dense %zu differ (max rel %.3g), "
@@ -706,10 +779,16 @@ int main(int argc, char ** argv) {
     }
     printf("OK   %s %dx%d [%s]: dequant->BLAS matches the fp16-rounded reference%s, "
            "fused matvec %s the f32 reference over %d cols at %d "
-           "activation offsets, dense max rel %.3g (scale %.9g, grid %d)\n",
+           "activation offsets, dense max rel %.3g (scale %.9g, grid %d)",
            rung.c_str(), rows, cols, i8_mode ? "i8" : "f32",
            ties ? (" apart from " + std::to_string(ties) + " exact fp16 ties").c_str() : "",
            i8_mode ? "within the int8 bound of" : "bit-identical to",
            nvec, n_off + 1, max_rel, tensor_scale, grid_code);
+    if (grid_bound_live) {
+        printf(", per-grid weight-LUT bound held: derived N=%d, grid maxe %.4g, "
+               "slack used %.3f of %.2f", q8_denom, q8_maxe,
+               max_grid_slack, GRID_MAXE_SLACK);
+    }
+    printf("\n");
     return 0;
 }

@@ -18,7 +18,15 @@ static __constant__ uint8_t  GQH2C_SIGN_D[128]    = GQH2C_SIGN_MASK_INIT;
 // The grid is per-tensor and only 4-8 floats, so it travels as a by-value kernel
 // argument instead of a device lookup. That is also what keeps an MMVQ vec-dot
 // reachable later: the header resolves once at graph time, not per block.
-struct gqh_grid16 { float v[16]; };
+// q8n: the int8 weight-LUT denominator for THIS tensor's grid (ggml_gqh_q8_denom,
+// or the GGML_GQH_Q8N override). It rides here rather than as a separate kernarg
+// because the LUT fill and the compensating weight scale must read ONE field
+// sourced ONCE -- the paired arm carries two grids whose codes, and therefore
+// whose denominators, differ for 26% of this model's gate/up pairs, and two
+// independently-derived copies of N is exactly the drift the extreme-entry check
+// below exists to catch. Unused by the f32 and dequant paths, which never bake a
+// codebook to int8.
+struct gqh_grid16 { float v[16]; int q8n; };
 struct gqh_grid8 { float v[8]; };
 struct gqh_grid4 { float v[4]; };
 
@@ -112,6 +120,7 @@ static void gqh4_decode_cuda(const void * wire, float tensor_scale, int grid_cod
                              dst_t * dst, int64_t nsb_total, cudaStream_t stream) {
     gqh_grid16 grid;
     memcpy(grid.v, GQH4_GRID[grid_code], sizeof(grid.v));
+    grid.q8n = 0;   // dequant path bakes no int8 codebook
     gqh4_decode_kernel<dst_t><<<nsb_total, GQH_SUPERBLOCK, 0, stream>>>(
         (const uint8_t *) wire, tensor_scale, grid, dst);
 }
@@ -1898,19 +1907,27 @@ static __device__ __forceinline__ void gqh_pair_lut_fill(
     }
 }
 
-// The codebook -> int8 scale is 1/127 exactly, not a measured amax: every rung's grid
-// spans -1 .. +1, so 127 lands on the extreme level with no clamping and the levels in
-// between round to within half a step (worst case 0.4% of amax, and the residual is a
-// fixed perturbation of the codebook -- the same 8 or 16 numbers for every weight in
-// the tensor -- not per-weight noise).
+// The codebook -> int8 scale is 1/N, where N is the grid's OWN denominator rather than
+// a flat 127. Every rung's grid spans -1 .. +1, so any N <= 127 lands the extreme level
+// on +-N with no clamping; the levels in between land wherever the k/N lattice falls,
+// and 127 is merely the widest lattice, not the best-fitting one. ggml_gqh_q8_denom
+// picks the N in 1..127 that minimises the uniform-prior rms ABSOLUTE level error --
+// absolute, because a dot product accumulates sum_k w_k x_k and a level's RELATIVE
+// error never enters that sum. On this artifact's grids that is a 1.35x to 3.96x cut in
+// rms weight error for zero runtime cost, because the compensating 127/N folds into the
+// per-tensor weight scale (see the t_scale fold in gqh_matvec_kernel). The full
+// derivation, the table, and why the prior is uniform are in ggml/src/gqh.cpp.
+//
+// The residual is still a fixed perturbation of the codebook -- the same 8 or 16 numbers
+// for every weight in the tensor -- not per-weight noise.
 //
 // Both fills below take the LDS level copy (`s_grid`), NOT the kernarg `grid`, and that is
 // a measured constraint rather than a style choice: a DYNAMIC index into a by-value kernarg
 // struct puts the whole struct on the stack, and the PAIRED arm carries two of them --
 // 132 bytes/lane of scratch when it was tried. That is why the fills pay a prologue-only
 // second __syncthreads instead of reading `grid` directly.
-static __device__ __forceinline__ int gqh_q8_level(float level) {
-    const int q = __float2int_rn(level * 127.0f);
+static __device__ __forceinline__ int gqh_q8_level(float level, int n) {
+    const int q = __float2int_rn(level * (float) n);
     return q > 127 ? 127 : (q < -127 ? -127 : q);
 }
 
@@ -1931,11 +1948,12 @@ static __device__ __forceinline__ int gqh_fp8_level(float level) {
 
 // One LUT byte, whichever arm is compiled. Both fills go through this so the weight side
 // cannot drift out of step with the dot opcode.
-static __device__ __forceinline__ int gqh_w8_level(float level) {
+static __device__ __forceinline__ int gqh_w8_level(float level, int n) {
 #if GQH_FP8DOT
+    (void) n;   // e4m3 carries no denominator: the byte IS the level
     return gqh_fp8_level(level);
 #else
-    return gqh_q8_level(level);
+    return gqh_q8_level(level, n);
 #endif
 }
 
@@ -1973,12 +1991,26 @@ static __device__ __forceinline__ uint16_t * gqh_q8_lut_lds() {
 
 template <ggml_type RUNG>
 static __device__ __forceinline__ void gqh_q8_lut_fill(
-        uint16_t * lut, const float * __restrict__ g_levels) {
+        uint16_t * lut, const float * __restrict__ g_levels, int n) {
     constexpr int SIZE = gqh_pair_lut<RUNG>::SIZE;
     for (int i = threadIdx.x; i < SIZE; i += blockDim.x) {
-        const int q0 = gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code0(i)]);
-        const int q1 = gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code1(i)]);
+        const int q0 = gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code0(i)], n);
+        const int q1 = gqh_w8_level(g_levels[gqh_pair_lut<RUNG>::code1(i)], n);
         lut[i] = (uint16_t) ((q0 & 0xff) | ((q1 & 0xff) << 8));
+#if !GQH_FP8DOT
+        // THE ONE THING THAT MUST NOT DRIFT. The compensating 127/n rides the
+        // per-tensor weight scale, so if this LUT were baked against a different n
+        // than the scale carries, EVERY weight in the tensor would come back scaled
+        // by the ratio -- a silent, uniform, plausible-looking error. Every grid's
+        // amax is exactly 1.0, so gqh_q8_level(+-1.0f, n) == +-n exactly; and by
+        // gqh_pair_lut::code0/code1, pair index 0 is (-1, -1) and index SIZE-1 is
+        // (+1, +1) for all three rungs. Check both and trap. Prologue-only: two
+        // scalar compares against a loop that then folds nsb x ROWS superblocks.
+        if ((i == 0        && (q0 != -n || q1 != -n)) ||
+            (i == SIZE - 1 && (q0 !=  n || q1 !=  n))) {
+            __trap();
+        }
+#endif
     }
 }
 
@@ -2046,14 +2078,44 @@ static __global__ void gqh_matvec_kernel(
     // quantized against different GQH4 grids (measured: 53 of 200), and requiring a
     // shared table would silently leave those pairs unfused.
     const float * g_levels = grid.v;
+    int q8n = grid.q8n;
     if constexpr (PAIRED) {
         if (blockIdx.y != 0) {
             w_base   = data_b;
             y_base   = y_b;
             t_scale  = tensor_scale_b;
             g_levels = grid_b.v;
+            q8n      = grid_b.q8n;
         }
     }
+#if !GQH_FP8DOT
+    // OPTIMAL-S COMPENSATION, and note WHERE it goes. The int8 arm's scale chain
+    // divides by 127 twice -- once for the codebook, once for the activation --
+    // and both /127s are folded into GQH_Q8_XSCALE, which rides the ACTIVATION
+    // pre-pass. The codebook's half of that no longer holds once the LUT is baked
+    // against q8n instead of 127, so the weight side owes a factor of 127/q8n.
+    //
+    // It CANNOT be folded into GQH_Q8_XSCALE. That constant rides the activation,
+    // and this kernel's PAIRED arm shares ONE quantised activation between the
+    // gate and up tensors, which routinely carry different grid codes and so
+    // different q8n (26% of this model's pairs). One activation cannot carry two
+    // weight-side factors; folding there would silently rescale one half of every
+    // fused pair. It goes on the per-tensor WEIGHT scale, which is per half by
+    // construction -- t_scale is already selected by blockIdx.y three lines up.
+    //
+    // The registry's tensor_scale stays untouched: the f32 arm, the dequant
+    // kernels and the fp16 converters must never see this factor, and they do not,
+    // because it is applied here, on this kernel's local copy, only when I8DOT.
+    //
+    // This does reassociate the d_real chain relative to the f32 arm (see the note
+    // at the top of the file). That note guards BIT-EXACTNESS against the
+    // reference decode, which the int8 arm does not have and cannot have -- it
+    // rounds every level to int8. The f32 instantiations compile this away
+    // entirely and stay bit-exact.
+    if constexpr (I8DOT) {
+        t_scale *= 127.0f / (float) q8n;
+    }
+#endif
     constexpr bool IS_GQH3 = RUNG == GGML_TYPE_GQH3;
     constexpr bool IS_GQH4 = RUNG == GGML_TYPE_GQH4;
     // Exact-width multi-column instantiation: ncols == NCOLS_MAX by the launcher's
@@ -2156,7 +2218,7 @@ static __global__ void gqh_matvec_kernel(
     uint16_t * s_q8 = nullptr;
     if constexpr (I8DOT) {
         s_q8 = gqh_q8_lut_lds<RUNG>();
-        gqh_q8_lut_fill<RUNG>(s_q8, s_grid);
+        gqh_q8_lut_fill<RUNG>(s_q8, s_grid, q8n);
         __syncthreads();
     }
     if (row >= out) return;
@@ -3911,6 +3973,33 @@ static int gqh_pairlut_mode() {
     return mode;
 }
 
+// GGML_GQH_Q8N: force the int8 weight-LUT denominator for EVERY grid, instead of
+// taking ggml_gqh_q8_denom's per-grid optimum. It exists for the negative control:
+// test-gqh-backend's per-grid max|e| bound is built from ggml_gqh_q8_denom and does
+// NOT read this variable, so GGML_GQH_Q8N=127 restores the old flat denominator and
+// the bound must then FAIL. A gate that only ever passes proves nothing about
+// whether it can see the thing it claims to measure.
+//
+// Both the LUT fill and the compensating weight scale read the value this returns,
+// via grid.q8n, so an override stays self-consistent -- it degrades accuracy, it
+// does not corrupt the reconstruction.
+static int gqh_q8_denom_override() {
+    static const int n = []() {
+        const char * e = getenv("GGML_GQH_Q8N");
+        if (!e) {
+            return 0;
+        }
+        const int v = atoi(e);
+        return (v >= 1 && v <= 127) ? v : 0;
+    }();
+    return n;
+}
+
+static int gqh_q8_denom_eff(ggml_type type, int grid_code) {
+    const int forced = gqh_q8_denom_override();
+    return forced > 0 ? forced : ggml_gqh_q8_denom(type, grid_code);
+}
+
 // GGML_GQH_I8DOT: N=8 FMA uses codebook->int8 + v_sudot4 (gfx1201). Default ON.
 // GGML_GQH_I8DOT=0 restores the f32 bit-exact arm (ctest). GGML_GQH_F16DOT=1 is
 // the closed v_dot2 experiment and only applies when I8DOT is explicitly 0.
@@ -4939,6 +5028,10 @@ bool ggml_cuda_gqh_mul_mat_vec(
     } else {
         memcpy(grid.v, GQH2H_GRID[code], 4 * sizeof(float));
     }
+    grid.q8n = gqh_q8_denom_eff(type, code);
+    if (grid.q8n <= 0) {
+        return false;   // no level grid for this type/code -- keep the fallback
+    }
 
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
     switch (type) {
@@ -5030,6 +5123,12 @@ bool ggml_cuda_gqh_mul_mat_vec_pair(
     } else {
         memcpy(grid_a.v, GQH2H_GRID[code_a], 4 * sizeof(float));
         memcpy(grid_b.v, GQH2H_GRID[code_b], 4 * sizeof(float));
+    }
+    // Per HALF, not per pair: the two grids can differ and so can their denominators.
+    grid_a.q8n = gqh_q8_denom_eff(type, code_a);
+    grid_b.q8n = gqh_q8_denom_eff(type, code_b);
+    if (grid_a.q8n <= 0 || grid_b.q8n <= 0) {
+        return false;
     }
 
     const uint8_t * a = (const uint8_t *) vx_a;
