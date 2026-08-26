@@ -246,16 +246,36 @@ float ggml_gqh_q8_maxe_at(enum ggml_type type, int grid_code, int n) {
 // gated on HumanEval+ and did not earn the default. Four readings, order-balanced
 // ABBA, canonical drafter, R9700, greedy and byte-identical within each arm:
 //
-//   derived N   144/164, 144/164
-//   flat 127    145/164, 145/164
+//   derived N   144/164, 144/164     (145/145 once the scorer bug below is fixed)
+//   flat 127    145/164, 145/164     (146/146)
 //
-// Same-arm floor is 0 items in BOTH arms, so the 1-item deficit is reproducible
-// rather than noise. It is NOT statistically separable -- the arms are discordant
-// on 5 items, 3 to 2 (McNemar exact two-sided p ~ 1.0) -- so this is not evidence
-// of harm. But the measured throughput gain was also nil (193.76/191.21 tok/s
-// derived against 194.33/195.13 flat, inside the arm own 1.33% spread and under
-// the rig ~1.3% floor), and a change that alters generated tokens for no
-// measurable benefit does not get to be the default.
+// THE 1-ITEM GAP IS INSIDE THE FLOOR, and an earlier version of this comment said
+// otherwise. Two instrument faults were found after the gate ran:
+//
+//  1. The harness only extracted a fenced code block when the fence was CLOSED
+//     (quality_humaneval_plus.py). An unterminated fence leaked the literal
+//     ```python line into the graded script, failing it on SyntaxError. 12 items
+//     per reading take that path, and it costs ~1 item systematically -- both arms
+//     equally, so the comparison held but the totals were low.
+//  2. The GRADER is not deterministic. Re-grading BYTE-IDENTICAL replies flips a
+//     verdict: HumanEval/39 (prime_fib) alternates pass/fail across grading passes,
+//     an execution-timeout effect. So the "floor 0 items" measured here is REPLY
+//     determinism, not VERDICT determinism, and the real floor is +-1 item.
+//
+// With a +-1 grader floor, a 1-item difference is not a result in either direction.
+// The arms are also not statistically separable (discordant on 3 items, 2 to 1
+// after the scorer fix; McNemar exact two-sided p ~ 1.0). So this is NOT evidence
+// of harm.
+//
+// What survives, and what the default rests on: the measured throughput gain was
+// NIL (193.76/191.21 tok/s derived against 194.33/195.13 flat, inside the arm's own
+// 1.33% spread and under the rig's ~1.3% floor). A change that alters generated
+// tokens -- 38 of 164 replies differ -- for no measurable benefit does not get to
+// be the default. Not "it measured worse"; "it measured no better, and it is not
+// free of consequence".
+//
+// Resolving a 1-item effect here would need ~3700 items at the observed discordance
+// rate, and that assumes a deterministic scorer, which this is not.
 //
 // GGML_GQH_Q8N selects:
 //   unset                       -> the flat 127 above

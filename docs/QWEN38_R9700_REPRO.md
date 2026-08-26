@@ -50,6 +50,29 @@ the two emit different tokens on 110 items and still land on the same score.
 Read that as *no measurable quality difference on this benchmark*, not as *the
 arms are interchangeable*.
 
+**The instrument has a floor of about one item, and it is not the model.** Two
+faults were found in the scorer after these numbers were taken, and both survive
+into any pass@1 this harness prints:
+
+* **An unterminated code fence used to fail a correct answer.** The extractor only
+  matched a fenced block when the fence was CLOSED, so a reply that ran to its
+  token cap mid-block leaked the literal ```` ```python ```` line into the graded
+  script and died on `SyntaxError`. 12 of 164 items take that path. It costs about
+  one item per reading, equally in both arms -- so comparisons held, but absolute
+  totals read low. Fixed; the figures above are the pre-fix numbers and both arms
+  gain one item under the fix.
+* **The grader is not deterministic.** Re-grading BYTE-IDENTICAL replies flips a
+  verdict: `HumanEval/39` (`prime_fib`) alternates pass and fail between grading
+  passes, which is an execution-timeout effect, not a sampling one. So the
+  "same-arm floor 0 items" above is REPLY determinism. VERDICT determinism is
+  weaker, and the floor is about +-1 item.
+
+Consequence for anyone quoting these: **a one-item difference on this benchmark is
+not a result.** At the discordance rate observed here, resolving one would need on
+the order of 3,700 items -- and that assumes a deterministic scorer, which this is
+not. Quote the two arms as indistinguishable, which is what both the McNemar result
+and the floor say.
+
 ### Where the speed comes from, and what it costs
 
 The decode win is real per-step work, not an acceptance artefact: **47.6 ms/step
