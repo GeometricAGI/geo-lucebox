@@ -42,11 +42,19 @@ TARGETS  = {
 # GGML_GQH_MMQ gives the MMQ on/off control; holding the env fixed and moving the
 # target gives the format-vs-format comparison. Both run through this one driver
 # so neither can drift from the other in prompts, cache flags or geometry.
+# "args" are extra server flags. The b16 arms exist to settle one specific
+# question: the accept-rate ordering between GQH and IQ4_XS reversed between an
+# older local probe that ran --draft-block-size 16 and this one, which runs the
+# shipping default (0 = drafter metadata, block_size 8). Same box, same
+# canonical drafter both times, so the drafter cannot be the cause; these arms
+# move ONLY the block width and leave prompts, caches and metric alone.
 ARMS = {
-    "gqh":        {"target": "gqh",   "env": {}},
-    "iq4xs":      {"target": "iq4xs", "env": {}},
-    "gqh_mmqoff": {"target": "gqh",   "env": {"GGML_GQH_MMQ": "0"}},
-    "gqh_mmqon":  {"target": "gqh",   "env": {"GGML_GQH_MMQ": "1"}},
+    "gqh":        {"target": "gqh",   "env": {}, "args": []},
+    "iq4xs":      {"target": "iq4xs", "env": {}, "args": []},
+    "gqh_mmqoff": {"target": "gqh",   "env": {"GGML_GQH_MMQ": "0"}, "args": []},
+    "gqh_mmqon":  {"target": "gqh",   "env": {"GGML_GQH_MMQ": "1"}, "args": []},
+    "gqh_b16":    {"target": "gqh",   "env": {}, "args": ["--draft-block-size", "16"]},
+    "iq4xs_b16":  {"target": "iq4xs", "env": {}, "args": ["--draft-block-size", "16"]},
 }
 # Census mode asks the library for the ne11 histogram instead of a clean timing.
 # It is a SEPARATE run: the atomic increments are cheap but not free, and the
@@ -218,6 +226,7 @@ def main():
                                    capture_output=True, text=True).stdout.strip(),
         "run": RUN,
         "arm_env": spec["env"],
+        "arm_args": spec.get("args", []),
         "census": CENSUS,
         "env_note": ("shipping defaults except where arm_env overrides: "
                      "GGML_GQH_MMQ unset (=on), GGML_GQH_MMQ_MAX_NE11 unset "
@@ -261,7 +270,8 @@ def main():
     env.update(spec["env"])       # then the one variable this arm moves
     if CENSUS:
         env["GGML_GQH_NE11_LOG"] = "1"
-    cmd = [BIN, target, "--draft", DRAFTER, "--port", str(PORT), *CACHE_OFF]
+    cmd = [BIN, target, "--draft", DRAFTER, "--port", str(PORT), *CACHE_OFF,
+           *spec.get("args", [])]
     rec["cmd"] = cmd
     log = open(LOG, "w")
     t_launch = time.time()
