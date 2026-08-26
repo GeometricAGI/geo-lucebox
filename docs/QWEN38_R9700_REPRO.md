@@ -7,45 +7,60 @@ which makes every throughput number meaningless.
 
 ## Results
 
-One configuration, measured once, on the canonical drafter. **Every number below
-comes from this setup and nothing else appears in this section.**
+One configuration, both arms measured on the same box at the same commit.
+**Every number below comes from this setup and nothing else appears here.**
 
-* R9700 (gfx1201), lucebox6, ROCm 7.2.4, `server/build-wide`
+* R9700 (gfx1201), ROCm 7.2.4, `server/build-wide` at this branch's head
 * drafter `qwen38-dflash2-q8_0-canonical.gguf`, 2,045,471,776 B, md5
   `a98fb401578886f082315c7031f419a2` -- verified loaded in every server log
-* shipping defaults: MMQ on, width gate 160, draft block 8, prefix and prefill
-  caches off
-* two readings per arm, order-balanced ABBA, co-tenant checked against an exact
-  VRAM baseline before and after every reading
+* shipping defaults: MMQ on, width gate 160, draft block 8, `GGML_GQH_Q8N` unset
+  (flat 127), prefix and prefill caches off -- `cache_hit=true` never observed
+* two readings per arm, order-balanced ABBA, GPU at its exact idle VRAM baseline
+  before and after every reading
 
 | | GQH-Q3KXL | IQ4_XS | delta |
 |---|---:|---:|---:|
 | file bytes | 13,440,110,432 | 15,567,824,480 | **-13.67%** |
-| HumanEval+ pass@1 | **145/164 = 0.8841** | **145/164 = 0.8841** | **identical** |
-| decode tok/s | 95.42 - 95.46 | 81.60 - 82.46 | **+16%** |
-| decode ms/step | 47.56 - 47.78 | 52.25 - 53.50 | **-10%** |
-| prefill tok/s, 119-token prompt | 526.8 - 530.2 | 875.8 - 891.8 | -40% |
-| prefill tok/s, 6,850-token prompt | 771.4 - 773.3 | 1073.2 - 1074.5 | -28% |
-| end-to-end tok/s, 10 HumanEval prompts | 118.83 - 118.88 | 115.84 - 116.55 | **+2.6%** |
+| HumanEval+ pass@1 | 145/164 | 145/164 | **indistinguishable** |
+| decode tok/s | 95.10 - 95.20 | 82.50 - 82.80 | **+15.1%** |
+| decode ms/step | 47.78 - 47.89 | 52.33 - 52.50 | **-8.7%** |
+| prefill tok/s, 119-token prompt | 701.2 - 711.3 | 862.3 - 871.8 | -18.5% |
+| prefill tok/s, 6,850-token prompt | 719.8 - 750.6 | 1064.2 - 1075.7 | -30.6% |
+| end-to-end tok/s, 10 code prompts | 126.60 - 126.68 | 116.15 - 116.24 | **+9.0%** |
 | accept % / avg_commit, prose | 56.9 / 4.56 | 54.2 / 4.33 | GQH higher |
-| accept % / avg_commit, code | 91.7 / 7.34 | 88.5 / 7.08 | GQH higher |
 
-**In one line: 13.7% smaller, indistinguishable quality, decodes about 16%
-faster, prefills slower, net slightly ahead end-to-end.**
+**In one line: 13.7% smaller, indistinguishable quality, decodes ~15% faster,
+still prefills slower, and ~9% ahead end-to-end.**
+
+### Where the speed comes from, and what it still costs
+
+The decode win is real per-step work, not an acceptance artefact: a ~9% narrower
+step at equal geometry, with `avg_commit` identical across arms' repeats.
+
+**Short-prompt prefill improved 38% within this branch** and that is what carries
+the end-to-end result. Measured same-box, one commit apart: 507.7-515.4 tok/s at
+the parent against 701.2-711.3 at the head, non-overlapping ranges. The mechanism
+is one `v_perm_b32` replacing four LUT selects in the MMQ weight decode (2,048 of
+them in the shipped gfx1201 ISA), and an estimated -25.7% dynamic VALU predicts
+the measured -23% prefill on the search's own harness.
+
+**Long-prompt prefill did not move, and structurally cannot.** `gqh_mmq_max_ne11`
+is 160, so a 512-wide prefill chunk never enters the GQH MMQ kernel where that
+code lives -- it goes to dequant->cuBLAS. That is where the remaining 30.6% gap
+sits, and it is a weight *materialisation* cost, not a kernel-tuning one.
+
+So prefill is still the axis where this artifact loses. It lost by 40.2% at the
+short prompt before this branch and loses by 18.5% now; the long prompt is
+unchanged. A prefill-dominated workload will not see the end-to-end number above.
 
 ### What the quality number does and does not say
 
-pass@1 is **identical**, and that is a stronger statement than the totals alone.
-Determinism was established first: with the harness pinned to `temperature: 0,
-top_k: 1`, both readings of each arm returned **164/164 byte-identical replies**,
-so the same-arm floor is **0 items** and a one-item difference would have been
-real. There is none.
-
-Item-by-item the arms are not the same model: 140 items pass in both, 14 fail in
-both, and **10 items are discordant -- 5 each way** (GQH passes 40, 77, 97, 115,
-163; IQ4_XS passes 1, 59, 83, 134, 140). McNemar exact, two-sided:
-**p = 1.0000**. Only 54 of 164 replies are byte-identical between the arms, so
-the two emit different tokens on 110 items and still land on the same score.
+pass@1 is **identical**. Determinism was established first: with the harness
+pinned to `temperature: 0, top_k: 1`, both readings of each arm returned 164/164
+byte-identical replies. Item-by-item the arms are not the same model -- 140 pass
+in both, 14 fail in both, 10 discordant 5 each way -- and McNemar exact,
+two-sided, gives **p = 1.0000**. Only 54 of 164 replies are byte-identical
+between arms, so they emit different tokens on 110 items and still score the same.
 
 Read that as *no measurable quality difference on this benchmark*, not as *the
 arms are interchangeable*.
@@ -72,19 +87,6 @@ not a result.** At the discordance rate observed here, resolving one would need 
 the order of 3,700 items -- and that assumes a deterministic scorer, which this is
 not. Quote the two arms as indistinguishable, which is what both the McNemar result
 and the floor say.
-
-### Where the speed comes from, and what it costs
-
-The decode win is real per-step work, not an acceptance artefact: **47.6 ms/step
-against 52.3-53.5**, a ~10% narrower step at equal geometry. Acceptance is also
-slightly better at the shipping block width, on both prose and code.
-
-The prefill loss is the honest cost. GQH weights cannot be streamed to a GEMM the
-way an fp16-friendly quant can, so a prefill pays either a dequantise or a
-per-tile decode. MMQ recovers the narrow chunks (see the MMQ section) but the
-wide ones stay with dequant, and IQ4_XS keeps a substantial prefill advantage at
-both prompt lengths. On short-prompt serving the decode win dominates and the net
-is positive; on a prefill-heavy workload it will not be.
 
 ### Two traps for anyone reproducing this
 
