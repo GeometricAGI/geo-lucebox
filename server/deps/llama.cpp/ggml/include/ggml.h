@@ -3325,6 +3325,17 @@ extern "C" {
     GGML_API float ggml_gqh_q8_maxe (enum ggml_type type, int grid_code);
     GGML_API float ggml_gqh_q8_rms  (enum ggml_type type, int grid_code);
 
+    // maxe at an ARBITRARY denominator rather than at the derived optimum, and the
+    // denominator ACTUALLY IN FORCE for a grid. The shipping default is the flat
+    // 127 -- per-grid optimal-s is opt-in through GGML_GQH_Q8N -- and
+    // ggml_gqh_q8_denom_eff is the single definition of that policy: the int8 arms
+    // and the test harness both read it, so a bound can be stated for the
+    // quantiser that ran instead of hardcoding a second copy of the default.
+    // ggml_gqh_q8_maxe(t, c) == ggml_gqh_q8_maxe_at(t, c, ggml_gqh_q8_denom(t, c)).
+    // maxe_at returns 0 for n outside 1..127 or a grid that does not exist.
+    GGML_API float ggml_gqh_q8_maxe_at   (enum ggml_type type, int grid_code, int n);
+    GGML_API int   ggml_gqh_q8_denom_eff (enum ggml_type type, int grid_code);
+
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);
 
     // ggml threadpool

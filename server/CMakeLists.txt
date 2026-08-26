@@ -1225,8 +1225,16 @@ if(DFLASH27B_TESTS)
                     add_test(NAME test-gqh-backend-i8-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                              COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                      "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" ${GQH_NVEC} i8)
+                    # GGML_GQH_Q8N is deliberately NOT pinned here: it is inherited, so
+                    # `ctest -R gqh` exercises whatever denominator policy the caller
+                    # has set, and the bound in test-gqh-backend follows the EFFECTIVE
+                    # denominator (ggml_gqh_q8_denom_eff), so the case is self-consistent
+                    # and green with the default unset, with GGML_GQH_Q8N=127, and with
+                    # per-grid optimal-s opted in. GQH_TEST_BOUND_N is pinned empty so
+                    # the invoking shell cannot move the bound behind the case -- only
+                    # the negative controls below set it, and they set it on purpose.
                     set_tests_properties(test-gqh-backend-i8-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_MMQ=0")
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_MMQ=0;GQH_TEST_BOUND_N=")
                 endforeach()
                 # Per-column scale form. GGML_GQH_I8_XSCALE=0 also turns SB2 off, so
                 # this is the only coverage of the non-SB2 wide kernel.
@@ -1234,15 +1242,24 @@ if(DFLASH27B_TESTS)
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                  "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 16 i8)
                 set_tests_properties(test-gqh-backend-i8xs0-n16-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_I8_XSCALE=0;GGML_GQH_MMQ=0")
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_I8_XSCALE=0;GGML_GQH_MMQ=0;GQH_TEST_BOUND_N=")
                 # NEGATIVE CONTROL for the per-grid weight-LUT bound, and the reason
                 # the i8 cases above are a gate rather than a formality.
                 #
-                # GGML_GQH_Q8N=127 puts the OLD flat int8 denominator back in the
-                # kernel. The bound in test-gqh-backend is built from
-                # ggml_gqh_q8_denom, which does not read that variable, so it stays
-                # where the derivation says it belongs -- and the case must FAIL.
-                # Measured slack used at N=127 against the 1.05 allowed:
+                # BOTH SIDES ARE PINNED EXPLICITLY, and that is the point. The kernel
+                # runs the flat 127 (GGML_GQH_Q8N=127) while the bound is built at the
+                # per-grid derived optimum (GQH_TEST_BOUND_N=derived) -- a bound
+                # TIGHTER than the quantiser actually running can meet, so the case
+                # MUST fail. Neither pin depends on what the shipping default happens
+                # to be, so this control fails identically with GGML_GQH_Q8N unset,
+                # with it set to 127, and with per-grid optimal-s opted in. It used to
+                # pin only the kernel and rely on the harness bound being hardwired to
+                # the derived table; flipping the default to the flat 127 then made 35
+                # ordinary i8 cases fail and left this case passing for a reason that
+                # had nothing to do with the mismatch it is meant to demonstrate.
+                #
+                # Measured slack used at kernel N=127 against a derived-N bound and
+                # the 1.05 allowed:
                 #
                 #   gqh3   1x256  grid 5  1.29    gqh4   1x256  grid 4  1.18
                 #   gqh3   4x512  grid 6  2.37    gqh4   4x512  grid 2  1.22
@@ -1254,16 +1271,25 @@ if(DFLASH27B_TESTS)
                 # gqh4 1x256 is the narrowest at 1.18 and is why the slack is 1.05
                 # rather than 1.10: at 1.10 that case had 7% of headroom.
                 #
-                # This is also the ONLY thing in the suite that proves the int8 arm
+                # It also proves GQH_TEST_BOUND_N is HONOURED. If the harness ignored
+                # it the bound would follow the kernel, the case would be
+                # self-consistent, it would pass, and WILL_FAIL would turn that into a
+                # ctest failure -- in every one of the three default states.
+                #
+                # And it is still the ONLY thing in the suite that proves the int8 arm
                 # DISPATCHED. If it silently declined, the f32 arm would answer
                 # bit-exactly, every error would be zero, and every tolerance in the
                 # file would pass -- including this bound. It cannot pass here.
-                add_test(NAME test-gqh-backend-i8-q8n127-negctl-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                #
+                # nvec=16 and not 8 on purpose: at nvec=8 the one-hot sweep does not
+                # reach the weight whose level error breaches the tighter bound on
+                # gqh3 1x256, so an 8-wide control would be vacuous on that case.
+                add_test(NAME test-gqh-backend-i8-negctl-boundopt-kern127-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                  "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 16 i8)
-                set_tests_properties(test-gqh-backend-i8-q8n127-negctl-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                set_tests_properties(test-gqh-backend-i8-negctl-boundopt-kern127-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                     PROPERTIES WILL_FAIL TRUE
-                               ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_Q8N=127;GGML_GQH_MMQ=0")
+                               ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_MMQ=0;GGML_GQH_Q8N=127;GQH_TEST_BOUND_N=derived")
             endif()
             # WIDER THAN THE MATVEC: the MMQ path. Everything above stops at
             # GQH_MAX_COLS (16) because that is where ggml_cuda_gqh_mul_mat_vec
