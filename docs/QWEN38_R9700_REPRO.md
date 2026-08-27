@@ -32,6 +32,18 @@ One configuration, both arms measured on the same box at the same commit.
 **In one line: 13.7% smaller, indistinguishable quality, decodes ~15% faster,
 still prefills slower, and ~9% ahead end-to-end.**
 
+> **PROVENANCE CAVEAT, being fixed.** This table claims both arms at one commit,
+> and one cell no longer honours that: the GQH `prefill @6,850` row was patched
+> from a **GQH-only** run after the width gate moved, while the IQ4_XS column is
+> from the earlier both-arms run. A GQH-only gate change cannot move IQ4_XS, so
+> the number is not *wrong* -- but the table's own methodology claim is what makes
+> it trustworthy, and patching one cell weakens it. The `end-to-end` row is also
+> from an older reading and did not reproduce to its stated band in a later A/B
+> (126.79-126.88 against 126.60-126.68), which is within noise but not the same
+> measurement. Both arms are being re-measured at the head; until then treat the
+> deltas as accurate to about a point and the methodology line as aspirational for
+> those two rows.
+
 ### Where the speed comes from, and what it still costs
 
 The decode win is real per-step work, not an acceptance artefact: a ~9% narrower
