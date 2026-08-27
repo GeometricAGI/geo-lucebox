@@ -692,40 +692,75 @@ static int64_t mix_mmq_max_ne11(int cc) {
 // forbids aligned loads). So it wins by 2-4x narrow and loses by up to 1.8x wide.
 //
 // The threshold is measured, not guessed: gqh-mmq-sweep on the three shapes that
-// carry the artifact, 60 iterations, warm-up pass discarded, spreads under 1%
-// except where noted. MMQ/dequant time ratio, so under 1.00 is an MMQ win:
+// carry the artifact, 2 passes x 60 iterations, warm-up discarded. MMQ/dequant
+// time ratio, so under 1.00 is an MMQ win. Re-measured with the gate lifted
+// (GGML_GQH_MMQ_MAX_NE11=4096) AFTER the v_perm_b32 weight-LUT decode, which the
+// previous bound of 160 predates:
 //
-//   ncols                          160    192    256    320
-//   GQH3 5120x17408 (130 tensors)  0.56   0.60   0.74   1.15
-//   GQH4 17408x5120 ( 61 tensors)  0.89   1.03   1.10   1.22
-//   GQH4 6144x5120  ( 61 tensors)  0.86   0.89   0.95   1.02
+//   ncols                            160     256     512     640     768    1024
+//   GQH3 5120x17408 (130 tensors)  0.428   0.576   0.927   0.999   1.069   1.203
+//   GQH4 17408x5120 ( 61 tensors)  0.419   0.600   0.875   0.980   1.023   1.142
+//   GQH4 6144x5120  ( 61 tensors)  0.440   0.608   0.734   0.892   0.975   1.103
 //
-// GQH4 17408x5120 crosses first, between 160 and 192, so 160 is the widest bound
-// at which EVERY shape in the artifact is still a win. It is not a round number
-// chosen for looking tidy - 192 already costs that shape 3%.
-//
-// Re-measured on a second R9700 / gfx1201 box the curve keeps its shape but
-// shifts OUTWARD: GQH4 17408x5120, still the shape that crosses first, reads
-// 0.83 at 160 and 0.87 at 192 there and does not cross until between 256 (0.94)
-// and 320 (1.05); the other two cross around 512. So 160 is conservative on
-// that box rather than wrong - it is the widest bound that is a win on BOTH.
+// Every shape is still a win at 640 and the first crossing is between 640 and
+// 768, so the widest all-shapes-win bound is now ~640, not 160. The old bound
+// was not wrong when it was set -- before v_perm_b32 the same sweep read 0.89
+// for GQH4 17408x5120 at 160 and 1.03 at 192, so 160 really was the widest
+// all-shapes win then. It went stale when the decode got faster.
 //
 // The other leg of the justification is the WORKLOAD, which the kernel curve
 // cannot supply: a crossover says where MMQ stops paying, not whether anything
 // ever dispatches there. GGML_GQH_NE11_LOG=1 (the census in ggml-cuda.cu) over a
-// DFlash2 verify at --draft-block-size 16 plus a 7.3k-token prefill:
+// shipping-default serve (drafter metadata block_size 8, no --specla) of a
+// 119-token and a 6850-token prompt plus the HumanEval e2e set:
 //
 //   ne11        GQH mul_mat calls   past the matvec (gate-visible)
-//   16                     40280                                0
-//   39..104                 4323                             4323
-//   512                     5502                             5502
+//   8                      49290                                0
+//   39..93                  3930                             3930
+//   119                     5109                             5109
+//   194                     1965                             1965
+//   512                    25545                            25545
 //
-// Verify at block 16 never reaches the gate -- the matvec owns it and returns
-// first. Every call the gate CAN see is either <= 104, where MMQ wins 1.5-2.7x,
-// or exactly the 512-wide prefill chunk, where it loses ~1.2x. Nothing lands in
-// 105..511, so every threshold in that window dispatches identically and the
-// exact value is not load-bearing. What IS load-bearing is that the gate
-// declines 512: lifting it costs ~7% of prefill throughput end to end.
+// Of the 36549 calls the gate CAN see, 27510 (75%) are the 194 and 512 buckets,
+// and 6850 = 13*512 + 194 exactly, with 25545/1965 = 13.0: those two buckets ARE
+// the long prefill, chunked. So the gate is load-bearing, and at 160 it was
+// sending the bulk of the prefill work to dequant.
+//
+// 512 rather than 640 because 512 is the whole of the workload, not a round
+// number. qwen35moe_prefill_chunk_limit is min(DFLASH_QWEN35MOE_PREFILL_CHUNK,
+// prompt_len) and that env defaults to 512, so no prefill can present an ne11
+// above 512 at shipping settings. A 640 bound therefore admits nothing extra for
+// any prompt, while spending GQH3's whole margin: 0.999 at 640 is break-even,
+// 0.927 at 512 is not. Raise it past 512 only together with the chunk width, and
+// re-measure both when doing so.
+//
+// End to end on lucebox5 (R9700 / gfx1201), same artifact and canonical drafter,
+// every cache off, ABBA order-balanced, 2 readings per arm x 5 samples per
+// reading, cooled to 36C between readings. Two independent sequences, 160 vs 640
+// and 160 vs 512, min-max over the raw samples:
+//
+//   arm          decode tok/s    prefill @119    prefill @6850
+//   gate 160     95.00-95.30     702.5-709.6     723.3-751.3
+//   gate 640     94.70-95.20     700.4-708.8     852.2-866.3   +15.7%
+//   gate 512     95.00-95.30     702.9-708.8     852.5-866.5   +15.6%
+//
+// The 119-token prefill is the negative control and does not move: ne11 119 was
+// under the old bound already, so the gate cannot touch it. Decode does not move
+// either, for the reason in the last paragraph. The whole gain is the long
+// prefill -- exactly the row the census says the gate was declining, and the
+// worst row of the published GQH-vs-IQ4_XS table. 640 and 512 agree to 0.14pp
+// because they dispatch identically here (nothing lands in 195..511), which is
+// the internal control on the noise floor.
+//
+// This REPLACES an earlier claim in this comment that lifting the gate cost ~7%
+// of prefill throughput end to end. That was measured before v_perm_b32 and does
+// not hold at this commit: lifting it to 512 is a 15.6% prefill GAIN.
+//
+// NOT re-measured here: the small row tile in mmq.cuh (mmq_gqh_small_tile) was
+// chosen under the old bound, where a gate-admitted multiply fitted one output
+// column tile. At 512 it no longer does, so that tile choice is now load-bearing
+// at a width it was never swept at. The gain above is with the small tile in
+// place; whether the default tile would do better at 512 is an open question.
 //
 // Widths below 17 never reach here: ggml_cuda_gqh_mul_mat_vec owns 1..16 and
 // returns before this is consulted, so the gate is purely an upper bound.
@@ -738,7 +773,7 @@ static int64_t gqh_mmq_max_ne11(int cc) {
         return override_value;
     }
     GGML_UNUSED(cc);
-    return 160;
+    return 512;
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

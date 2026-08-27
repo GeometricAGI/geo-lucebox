@@ -55,6 +55,19 @@ ARMS = {
     "gqh_mmqon":  {"target": "gqh",   "env": {"GGML_GQH_MMQ": "1"}, "args": []},
     "gqh_b16":    {"target": "gqh",   "env": {}, "args": ["--draft-block-size", "16"]},
     "iq4xs_b16":  {"target": "iq4xs", "env": {}, "args": ["--draft-block-size", "16"]},
+    # MMQ width-gate arms. gqh_mmq_max_ne11 defaults to 160, a bound measured
+    # BEFORE the v_perm_b32 weight-LUT decode made MMQ faster. Re-measuring the
+    # kernel crossover with the gate lifted puts the widest all-shapes-win bound
+    # at ~640, with the 512-wide prefill chunk a 7-27% MMQ win. These arms move
+    # ONLY the gate, so the real-workload question is asked separately from the
+    # kernel curve. 512 and 640 should behave IDENTICALLY on this workload -- the
+    # ne11 census shows nothing dispatches in 105..511 -- so a gap between them is
+    # a read on the noise floor, not an effect.
+    # The OLD compiled default, pinned explicitly. Once the default moves, this
+    # is the only way to get the pre-change dispatch back for a same-binary A/B.
+    "gqh_ne11_160": {"target": "gqh", "env": {"GGML_GQH_MMQ_MAX_NE11": "160"}, "args": []},
+    "gqh_ne11_640": {"target": "gqh", "env": {"GGML_GQH_MMQ_MAX_NE11": "640"}, "args": []},
+    "gqh_ne11_512": {"target": "gqh", "env": {"GGML_GQH_MMQ_MAX_NE11": "512"}, "args": []},
 }
 # Census mode asks the library for the ne11 histogram instead of a clean timing.
 # It is a SEPARATE run: the atomic increments are cheap but not free, and the

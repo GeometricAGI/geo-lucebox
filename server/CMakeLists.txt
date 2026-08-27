@@ -1376,25 +1376,42 @@ if(DFLASH27B_TESTS)
             # using the launch counter, on the only shape wide enough to straddle
             # the default bound.
             #
-            # in160/out161 PIN THE THRESHOLD to exactly 160: one requires MMQ at
-            # 160, the other requires it to decline at 161. Move the default in
-            # either direction and one of them fails. They also prove the
-            # comparison is <= rather than <.
+            # in512/out513 PIN THE THRESHOLD to exactly 512, the default: one
+            # requires MMQ at 512, the other requires it to decline at 513. Move
+            # the default in either direction and one of them fails. They also
+            # prove the comparison is <= rather than <.
+            #
+            # These need a vector wide enough to straddle the default, because
+            # the probe width must satisfy nwide <= cols. At the old default of
+            # 160 that was every shape here; at 512 only 64x1024 qualifies, so
+            # the pair registers on that shape alone. Per-shape coverage of the
+            # gate MECHANISM is not lost -- knob-in64/knob-out65 below still run
+            # on all three shapes, under their own width condition, pinning the
+            # knob low enough for any of them to straddle it.
             #
             # knob-in64/knob-out65 do the same for GGML_GQH_MMQ_MAX_NE11, so the
             # override is covered independently of whatever the compiled default
             # happens to be.
-            if(GQH_COLS GREATER 161 AND (GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4"))
-                add_test(NAME test-gqh-backend-gate-in160-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+            if(GQH_COLS GREATER 513 AND (GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4"))
+                add_test(NAME test-gqh-backend-gate-in512-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
-                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq160)
-                set_tests_properties(test-gqh-backend-gate-in160-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq512)
+                set_tests_properties(test-gqh-backend-gate-in512-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
-                add_test(NAME test-gqh-backend-gate-out161-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                add_test(NAME test-gqh-backend-gate-out513-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
-                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq161 refuse)
-                set_tests_properties(test-gqh-backend-gate-out161-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq513 refuse)
+                set_tests_properties(test-gqh-backend-gate-out513-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+            endif()
+            # The knob pair gets its OWN width condition, deliberately. It pins
+            # GGML_GQH_MMQ_MAX_NE11=64, so it only needs a vector wide enough to
+            # straddle 64 -- which every shape here is. Sharing the in/out pair's
+            # condition would tie per-shape coverage of the gate mechanism to
+            # whatever the compiled default happens to be, and raising that
+            # default from 160 to 512 would then have silently dropped these from
+            # three shapes to one.
+            if(GQH_COLS GREATER 65 AND (GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4"))
                 add_test(NAME test-gqh-backend-gate-knob-in64-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                  "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq64)

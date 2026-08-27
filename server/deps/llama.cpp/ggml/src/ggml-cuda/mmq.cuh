@@ -280,10 +280,20 @@ static constexpr __device__ int get_mmq_y_device() {
 // are only 40 tiles at mmq_y 128 and 24 of this card's 64 CUs get no work.
 //
 // The cost is activation traffic: a row pair that shared one y tile now loads
-// it twice. That is the small side of this multiply -- these widths are <= 160
-// columns against thousands of rows -- and WEIGHT traffic is unchanged, since
-// gqh_mmq_max_ne11 caps ncols_max at 160 and mmq_x_best is then >= ncols_max,
-// so ntx == 1 and no superblock is decoded twice either way.
+// it twice. That was the small side of this multiply when it was measured, at
+// widths <= 160 columns against thousands of rows, and WEIGHT traffic was
+// unchanged too: gqh_mmq_max_ne11 capped ncols_max at 160, mmq_x_best was then
+// >= ncols_max, so the multiply fitted ONE output column tile and no superblock
+// was decoded twice.
+//
+// That second half no longer holds. gqh_mmq_max_ne11 now defaults to 512 (see
+// its comment for the re-measured crossover and the end-to-end numbers), and a
+// 512-wide multiply spans several output column tiles, so the weight superblock
+// IS decoded more than once. The gate change was measured end to end WITH this
+// tile in place and is a 15.6% prefill gain, so the tile is not costing more
+// than the change buys -- but it has not been re-swept against the default tile
+// at 512, and it is no longer covered by the ntx == 1 argument. Treat the tile
+// choice as open at the new width rather than as settled by the text above.
 //
 // Only the GQH rungs move. Every other type keeps the tile it was measured
 // with, deliberately: for IQ4_XS the 64-row tile is known to cost ~8% of
