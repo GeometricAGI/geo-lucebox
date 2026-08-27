@@ -243,7 +243,7 @@ def main():
         "census": CENSUS,
         "env_note": ("shipping defaults except where arm_env overrides: "
                      "GGML_GQH_MMQ unset (=on), GGML_GQH_MMQ_MAX_NE11 unset "
-                     "(gate=160), no --specla, no --draft-block-size "
+                     "(gate=compiled default), no --specla, no --draft-block-size "
                      "(drafter metadata block_size=8)"),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }

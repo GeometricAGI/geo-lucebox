@@ -13,7 +13,7 @@ One configuration, both arms measured on the same box at the same commit.
 * R9700 (gfx1201), ROCm 7.2.4, `server/build-wide` at this branch's head
 * drafter `qwen38-dflash2-q8_0-canonical.gguf`, 2,045,471,776 B, md5
   `a98fb401578886f082315c7031f419a2` -- verified loaded in every server log
-* shipping defaults: MMQ on, width gate 160, draft block 8, `GGML_GQH_Q8N` unset
+* shipping defaults: MMQ on, width gate **512**, draft block 8, `GGML_GQH_Q8N` unset
   (flat 127), prefix and prefill caches off -- `cache_hit=true` never observed
 * two readings per arm, order-balanced ABBA, GPU at its exact idle VRAM baseline
   before and after every reading
@@ -21,28 +21,29 @@ One configuration, both arms measured on the same box at the same commit.
 | | GQH-Q3KXL | IQ4_XS | delta |
 |---|---:|---:|---:|
 | file bytes | 13,440,110,432 | 15,567,824,480 | **-13.67%** |
-| HumanEval+ pass@1 | 145/164 | 145/164 | **indistinguishable** |
-| decode tok/s | 95.10 - 95.20 | 82.50 - 82.80 | **+15.1%** |
-| decode ms/step | 47.78 - 47.89 | 52.33 - 52.50 | **-8.7%** |
-| prefill tok/s, 119-token prompt | 701.2 - 711.3 | 862.3 - 871.8 | -18.5% |
-| prefill tok/s, 6,850-token prompt | 852.5 - 866.5 | 1064.2 - 1075.7 | **-19.5%** |
-| end-to-end tok/s, 10 code prompts | 126.60 - 126.68 | 116.15 - 116.24 | **+9.0%** |
+| decode tok/s | 95.00 - 95.20 | 82.50 - 82.70 | **+15.1%** |
+| decode ms/step | 47.89 - 48.00 | 52.42 - 52.50 | **-8.6%** |
+| prefill tok/s, 119-token prompt | 703.3 - 712.6 | 858.6 - 868.6 | -18.0% |
+| prefill tok/s, 6,850-token prompt | 851.7 - 866.3 | 1064.0 - 1074.7 | **-19.7%** |
+| end-to-end tok/s, 10 code prompts | 127.18 - 127.23 | 117.89 - 118.02 | **+7.8%** |
 | accept % / avg_commit, prose | 56.9 / 4.56 | 54.2 / 4.33 | GQH higher |
+| HumanEval+ pass@1 *(carried over)* | 145/164 | 145/164 | **indistinguishable** |
+
+Every row except the last is from a single run at one commit on one box. **The
+quality row is carried over** from the earlier quality gate and was not
+re-measured here; it is unaffected by anything in this branch's timing path, but
+it is not part of this run and is labelled so rather than absorbed into the claim.
+
+**End-to-end is quoted to about +-0.3, not finer.** It measures 763 tokens over
+~6.0-6.5 s, so a 0.05 s difference in wall clock moves it ~0.8%; an earlier
+0.08-wide band was finer than the method supports. It is also measured on an
+ISOLATED cold server: run in sequence after the long prefills, GQH enters e2e
+2-5 C hotter than IQ4_XS because it spends ~8 s longer in that phase, which
+inflates the delta to +8.2%. Isolated, all readings enter at 38-39 C, the
+within-arm spread collapses from 0.87 to 0.05, and the honest figure is +7.8%.
 
 **In one line: 13.7% smaller, indistinguishable quality, decodes ~15% faster,
 still prefills slower, and ~9% ahead end-to-end.**
-
-> **PROVENANCE CAVEAT, being fixed.** This table claims both arms at one commit,
-> and one cell no longer honours that: the GQH `prefill @6,850` row was patched
-> from a **GQH-only** run after the width gate moved, while the IQ4_XS column is
-> from the earlier both-arms run. A GQH-only gate change cannot move IQ4_XS, so
-> the number is not *wrong* -- but the table's own methodology claim is what makes
-> it trustworthy, and patching one cell weakens it. The `end-to-end` row is also
-> from an older reading and did not reproduce to its stated band in a later A/B
-> (126.79-126.88 against 126.60-126.68), which is within noise but not the same
-> measurement. Both arms are being re-measured at the head; until then treat the
-> deltas as accurate to about a point and the methodology line as aspirational for
-> those two rows.
 
 ### Where the speed comes from, and what it still costs
 
