@@ -289,11 +289,48 @@ static constexpr __device__ int get_mmq_y_device() {
 // That second half no longer holds. gqh_mmq_max_ne11 now defaults to 512 (see
 // its comment for the re-measured crossover and the end-to-end numbers), and a
 // 512-wide multiply spans several output column tiles, so the weight superblock
-// IS decoded more than once. The gate change was measured end to end WITH this
-// tile in place and is a 15.6% prefill gain, so the tile is not costing more
-// than the change buys -- but it has not been re-swept against the default tile
-// at 512, and it is no longer covered by the ntx == 1 argument. Treat the tile
-// choice as open at the new width rather than as settled by the text above.
+// IS decoded more than once. The ntx == 1 argument above is void at the new
+// bound.
+//
+// The tile has been re-swept against the default one anyway, and the small tile
+// survives on measurement rather than on that argument. Both arms are this
+// commit differing only in the constexpr below, selected by swapping
+// libggml-hip.so so ONE sweep binary measures both; gqh-mmq-sweep at iters 400,
+// GGML_GQH_MMQ_MAX_NE11 lifted so MMQ dispatches at every width in BOTH arms --
+// without that both arms fall to dequant above the bound and the comparison
+// measures nothing -- and the per-width mmq/iter column confirms it did. Eight
+// readings per cell over two order-balanced passes; ratio is default-tile time
+// over small-tile time, so above 1.0 the small tile is faster:
+//
+//   ncols          119     194     256     384     512     640
+//   gqh3         1.055   1.000   1.015   0.982   0.982   0.996
+//   gqh4 K17408  1.196   1.071   1.090   0.983   0.981   1.028
+//   gqh4 K6144   1.178   1.064   1.094   0.976   0.979   1.026
+//
+// The crossover sits between 256 and 384, and the two widths this workload
+// dispatches straddle it: the small tile is 0-7% ahead at 194, the default tile
+// ~2% ahead at 512. Weighting those by the real chunking of a 6850-token
+// prefill (13*512 + 194, per the ne11 census) predicts the default tile winning
+// that one prefill by 1.8-2.0% and nothing else.
+//
+// It does, and nothing else is what it wins. End to end at the shipping gate,
+// ABBA order-balanced, two readings per arm, five samples per reading, prefix
+// and prefill caches off and no cache_hit observed:
+//
+//   arm            prefill @119   prefill @6850   e2e HE-10        decode
+//   small tile     688.7-709.6    848.9-865.6     126.57 / 126.78  94.9-95.2
+//   default tile   643.6-648.1    863.1-876.9     124.34 / 124.76  95.0-95.2
+//
+// The default tile takes 1.5-1.7% of the long prefill and gives back 8.8% of
+// the short one and 1.6-1.9% of end-to-end. Decode is flat in both arms, as it
+// must be: the matvec owns widths 1..16 and returns before the gate. The small
+// tile arm is also the pessimistic one here -- its first reading started at
+// 43 C against 36 C for every other reading -- and it wins anyway.
+//
+// So the small tile keeps the GQH rungs, now on the sweep rather than on
+// ntx == 1. What would change that is a workload whose prefill widths sit above
+// the 256-384 crossover with the short buckets gone, which the chunk limit and
+// the census say this one is not.
 //
 // Only the GQH rungs move. Every other type keeps the tile it was measured
 // with, deliberately: for IQ4_XS the 64-row tile is known to cost ~8% of
