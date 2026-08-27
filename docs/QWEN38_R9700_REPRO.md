@@ -25,7 +25,7 @@ One configuration, both arms measured on the same box at the same commit.
 | decode tok/s | 95.10 - 95.20 | 82.50 - 82.80 | **+15.1%** |
 | decode ms/step | 47.78 - 47.89 | 52.33 - 52.50 | **-8.7%** |
 | prefill tok/s, 119-token prompt | 701.2 - 711.3 | 862.3 - 871.8 | -18.5% |
-| prefill tok/s, 6,850-token prompt | 719.8 - 750.6 | 1064.2 - 1075.7 | -30.6% |
+| prefill tok/s, 6,850-token prompt | 852.5 - 866.5 | 1064.2 - 1075.7 | **-19.5%** |
 | end-to-end tok/s, 10 code prompts | 126.60 - 126.68 | 116.15 - 116.24 | **+9.0%** |
 | accept % / avg_commit, prose | 56.9 / 4.56 | 54.2 / 4.33 | GQH higher |
 
@@ -44,14 +44,29 @@ is one `v_perm_b32` replacing four LUT selects in the MMQ weight decode (2,048 o
 them in the shipped gfx1201 ISA), and an estimated -25.7% dynamic VALU predicts
 the measured -23% prefill on the search's own harness.
 
-**Long-prompt prefill did not move, and structurally cannot.** `gqh_mmq_max_ne11`
-is 160, so a 512-wide prefill chunk never enters the GQH MMQ kernel where that
-code lives -- it goes to dequant->cuBLAS. That is where the remaining 30.6% gap
-sits, and it is a weight *materialisation* cost, not a kernel-tuning one.
+**Long-prompt prefill improved 15.7%, by fixing a stale threshold rather than a
+kernel.** `gqh_mmq_max_ne11` gated MMQ dispatch at 160, a bound measured BEFORE
+`v_perm_b32` made the MMQ kernel ~2.3x faster, so 512-wide prefill chunks were
+being routed to the slower dequant->cuBLAS path on the strength of an obsolete
+measurement. Re-measured with the gate lifted, MMQ is 7-27% faster than dequant at
+width 512. Raising the default to 512 moved prefill @6,850 from 723.3-751.3 to
+852.5-866.5 tok/s.
 
-So prefill is still the axis where this artifact loses. It lost by 40.2% at the
-short prompt before this branch and loses by 18.5% now; the long prompt is
-unchanged. A prefill-dominated workload will not see the end-to-end number above.
+512 rather than the crossover's 640: `qwen35moe_prefill_chunk_limit` is
+`min(DFLASH_QWEN35MOE_PREFILL_CHUNK, prompt_len)` with an env default of 512, so
+**no prefill can ever present ne11 > 512**. 640 admits nothing extra for any
+prompt while spending gqh3's entire remaining margin (0.999 at 640, break-even,
+against 0.927 at 512).
+
+That the gate was the cause is measured, not inferred: the MMQ launch counter
+reads 0 at gate 511 and 1 at gate 512 for an ne11=512 node, and an `ne11` census
+over a shipping serve puts 27,510 of 36,549 gate-visible calls in exactly the 194
+and 512 buckets -- 6,850 = 13x512 + 194, with a measured 13.0 ratio. Those buckets
+ARE the long prefill, chunked.
+
+So prefill is still the axis where this artifact loses, but by much less: 40.2%
+-> 18.5% at the short prompt and 30.6% -> 19.5% at the long one. A
+prefill-dominated workload will still not see the end-to-end number above.
 
 ### What the quality number does and does not say
 
