@@ -4505,6 +4505,34 @@ static __device__ __forceinline__ void load_tiles_gqh3(
 
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
 
+    // Address a row as ONE loop-invariant 64-bit base plus a 32-bit byte
+    // offset. Both halves of that matter. The base is hoisted out of the row
+    // loop so no 64-bit arithmetic is recomputed per row; the per-row part being
+    // 32-bit is what makes the backend emit the SADDR form
+    // (`global_load_u8 v, v_off, s[base] offset:imm`) instead of the
+    // v_add_co_u32 / v_add_co_ci_u32 pair it otherwise spends on every single
+    // code-byte address. Measured on gfx1201: 64 SADDR loads appear, v_add_co
+    // pairs drop 54 -> 6, dynamic VALU -4.7%, VGPRs 175 -> 173.
+    //
+    // The 32-bit offset cannot overflow: i < mmq_y (64) and the offset is
+    // i*stride*105, so it would take a row stride near 500 K superblocks (a
+    // 127 M-element row) to reach 2^32. Folding kbx0 in as well -- i.e. making
+    // the WHOLE tensor byte offset 32-bit -- also emits SADDR and costs 6 fewer
+    // VGPRs, but it caps a single GQH tensor at 4 GB, which is not a limit worth
+    // buying registers with.
+    const uint8_t * __restrict__ xrow0 =
+        reinterpret_cast<const uint8_t *>(x) + (size_t) kbx0 * GQH3_SB_BYTES;
+
+    // Per-lane byte offsets into the superblock, and the high-plane nibble
+    // shift. All three are invariant across rows AND across `h`/`w0`, because
+    // the code word index is `w = (even compile-time delta) + txi`: the delta
+    // rides the load's immediate field, `w & 1` is `txi & 1`, and `w >> 1` is
+    // `(delta >> 1) + (txi >> 1)` exactly. Hoisting them leaves ONE address per
+    // (row, plane) instead of one per load.
+    const uint32_t lane_lo  = 9u  + (uint32_t) txi;             // low-2-bit plane
+    const uint32_t lane_hi  = 73u + (uint32_t) (txi >> 1);      // high-1-bit plane
+    const uint32_t hi_shift = (uint32_t) ((txi & 1) << 2);
+
     // Both halves in one pass, and FULLY unrolled: `rp` has to be a compile-time
     // index or the staged half-1 dwords land in scratch instead of registers
     // (see the note by MMQ_MMA_TILE_X_K_GQH). The unroll is also what stacks the
@@ -4525,6 +4553,19 @@ static __device__ __forceinline__ void load_tiles_gqh3(
         if (need_check) {
             i = min(i, i_max);
         }
+#if defined(GGML_USE_HIP)
+        // mul_mat_q launches block_dims(warp_size, nwarps, 1), so with nrows == 1
+        // a wave IS one threadIdx.y row and `i` is wave-uniform -- i_max is a
+        // kernel argument, so the need_check clamp preserves that. LLVM cannot
+        // see the block shape, treats threadIdx.y as divergent, and therefore
+        // keeps the whole row offset in VGPRs. Stating the uniformity moves it
+        // to SALU and is what leaves an SGPR base for the SADDR form above.
+        // Guarded to nrows == 1: on the wave64 MFMA path `i` carries
+        // threadIdx.x and really is divergent.
+        if (nrows == 1) {
+            i = __builtin_amdgcn_readfirstlane(i);
+        }
+#endif
 
         if (mode == 1) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -4539,18 +4580,18 @@ static __device__ __forceinline__ void load_tiles_gqh3(
             continue;
         }
 
-        const uint8_t * __restrict__ b =
-            reinterpret_cast<const uint8_t *>(x) + (size_t) (kbx0 + i*stride) * GQH3_SB_BYTES;
+        const uint32_t rowoff = (uint32_t) (i*stride) * (uint32_t) GQH3_SB_BYTES;
+        const uint8_t * __restrict__ bl = xrow0 + (rowoff + lane_lo);
+        const uint8_t * __restrict__ bh = xrow0 + (rowoff + lane_hi);
 
 #pragma unroll
         for (int h = 0; h < khalves; ++h) {
 #pragma unroll
         for (int w0 = 0; w0 < words_per_lane; ++w0) {
             const int wt = txi + w0*threads_per_row;            // slot in the tile
-            const int w  = h*words_per_pass + wt;               // code word, 0..63
-            const uint32_t lo_byte = b[ 9 + w];
-            const uint32_t hi_byte = b[73 + (w >> 1)];
-            const uint32_t hi_shift = (w & 1) << 2;
+            const int wc = h*words_per_pass + w0*threads_per_row;  // even, compile-time
+            const uint32_t lo_byte = bl[wc];
+            const uint32_t hi_byte = bh[wc >> 1];
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             if (h != 0) {
@@ -4589,6 +4630,10 @@ static __device__ __forceinline__ void load_tiles_gqh3(
     static_assert(warp_size % scales_per_pass == 0,               "GQH3 MMQ scale lanes");
     static_assert(mmq_y % (nwarps*scale_rows_per_warp) == 0,      "GQH3 MMQ scale row step");
     const int kst = threadIdx.x % scales_per_pass;                   // slot in the tile
+    // Lane part of the ratio-byte offset. scales_per_pass is even, so
+    // `kscale >> 1 == (h*scales_per_pass >> 1) + (kst >> 1)` exactly and the
+    // half rides the load immediate.
+    const uint32_t lane_rb = (uint32_t) (kst >> 1);
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps*scale_rows_per_warp) {
@@ -4610,10 +4655,12 @@ static __device__ __forceinline__ void load_tiles_gqh3(
         const uint8_t * __restrict__ b =
             reinterpret_cast<const uint8_t *>(x) + (size_t) (kbx0 + i*stride) * GQH3_SB_BYTES;
 
+        const uint8_t * __restrict__ brb = b + lane_rb;
+
 #pragma unroll
         for (int h = 0; h < khalves; ++h) {
             const int kscale = h*scales_per_pass + kst;              // sub-block, 0..15
-            const uint32_t rb    = b[1 + (kscale >> 1)];
+            const uint32_t rb    = brb[1 + ((h*scales_per_pass) >> 1)];
             const uint32_t ratio = (kscale & 1) ? (rb >> 4) : (rb & 0x0fu);
             // Multiply order is load-bearing (see the note above): do not hoist.
             const float    scale = gqh_mmq_e4m3_to_f32(b[0]) *
