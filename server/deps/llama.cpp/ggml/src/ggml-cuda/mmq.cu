@@ -6,6 +6,7 @@
 #include "mmid.cuh"
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
+#include "gqh.cuh"
 
 static thread_local size_t g_mmq_launch_count = 0;
 
@@ -120,6 +121,12 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q3_1_ROCMFP3_MIX:
             mul_mat_q_case<GGML_TYPE_Q3_1_ROCMFP3_MIX>(ctx, args, stream);
             break;
+        case GGML_TYPE_GQH3:
+            mul_mat_q_case<GGML_TYPE_GQH3>(ctx, args, stream);
+            break;
+        case GGML_TYPE_GQH4:
+            mul_mat_q_case<GGML_TYPE_GQH4>(ctx, args, stream);
+            break;
         case GGML_TYPE_Q3_0_ROCMFPX:
             mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, args, stream);
             break;
@@ -231,6 +238,16 @@ static void ggml_cuda_mul_mat_q_impl(
     } else if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
         GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
             src0->data, &mix_codebooks_raw, &mix_modes));
+    }
+    // GQH per-tensor header -> int8 grid LUT + tile-scale prefactor. Unlike the
+    // mix registries this needs no dispatch lock: the result is 20 bytes copied
+    // into the kernarg struct here, so nothing the kernel reads can be torn down
+    // underneath it. should_use_mmq plus ggml_cuda_gqh_mmq_eligible already
+    // refused every type/grid this cannot resolve, hence the assert.
+    gqh_mmq_params gqh_params = {};
+    if (ggml_cuda_gqh_mmq_type(src0->type)) {
+        GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+            src0->type, src0->data, gqh_params.lut, &gqh_params.dscale));
     }
     const nv_bfloat16 * mix_codebooks =
         reinterpret_cast<const nv_bfloat16 *>(mix_codebooks_raw);
@@ -349,7 +366,7 @@ static void ggml_cuda_mul_mat_q_impl(
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr,
-            mix_codebooks, mix_modes, dst_d,
+            mix_codebooks, mix_modes, gqh_params, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -375,6 +392,12 @@ static void ggml_cuda_mul_mat_q_impl(
                 pair_args.mix_codebooks =
                     reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
                 pair_args.mix_modes = pair_modes;
+            } else if (ggml_cuda_gqh_mmq_type(src0_pair->type)) {
+                // The pair shares nothing per-tensor: each projection has its own
+                // header, so re-resolve rather than reuse src0's.
+                GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+                    src0_pair->type, src0_pair->data,
+                    pair_args.gqh.lut, &pair_args.gqh.dscale));
             }
             ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
         }
@@ -451,7 +474,7 @@ static void ggml_cuda_mul_mat_q_impl(
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
-        mix_codebooks, mix_modes, dst_d,
+        mix_codebooks, mix_modes, gqh_params, dst_d,
         ne00, ne01, ne_get_rows, s01, n_routes_quantized, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
@@ -478,6 +501,10 @@ static void ggml_cuda_mul_mat_q_impl(
             pair_args.mix_codebooks =
                 reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
             pair_args.mix_modes = pair_modes;
+        } else if (ggml_cuda_gqh_mmq_type(src0_pair->type)) {
+            GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+                src0_pair->type, src0_pair->data,
+                pair_args.gqh.lut, &pair_args.gqh.dscale));
         }
         ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
     }
@@ -544,10 +571,17 @@ void ggml_cuda_op_mul_mat_q(
         GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
             src0_dd_i, &mix_codebooks_raw, &mix_modes));
     }
+    // The split-buffer op receives a ROW SLICE, which ggml_gqh_lookup resolves to
+    // its owning tensor (that is why it takes an interior pointer at all).
+    gqh_mmq_params gqh_params = {};
+    if (ggml_cuda_gqh_mmq_type(src0->type)) {
+        GGML_ASSERT(ggml_cuda_gqh_mmq_info(
+            src0->type, src0_dd_i, gqh_params.lut, &gqh_params.dscale));
+    }
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr,
         reinterpret_cast<const nv_bfloat16 *>(mix_codebooks_raw), mix_modes,
-        dst_dd_i,
+        gqh_params, dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
@@ -651,6 +685,97 @@ static int64_t mix_mmq_max_ne11(int cc) {
     return GGML_CUDA_CC_IS_RDNA4(cc) ? 1024 : 256;
 }
 
+// GQH's two effects point opposite ways, so this is a width gate, not a switch.
+// MMQ deletes the fp16 materialisation but re-decodes the weight tile once per
+// OUTPUT COLUMN TILE, and GQH's unpack is expensive (bit-sliced planes or uint4
+// codes, plus a curved-grid select per code, off an odd superblock stride that
+// forbids aligned loads). So it wins by 2-4x narrow and loses by up to 1.8x wide.
+//
+// The threshold is measured, not guessed: gqh-mmq-sweep on the three shapes that
+// carry the artifact, 2 passes x 60 iterations, warm-up discarded. MMQ/dequant
+// time ratio, so under 1.00 is an MMQ win. Re-measured with the gate lifted
+// (GGML_GQH_MMQ_MAX_NE11=4096) AFTER the v_perm_b32 weight-LUT decode, which the
+// previous bound of 160 predates:
+//
+//   ncols                            160     256     512     640     768    1024
+//   GQH3 5120x17408 (130 tensors)  0.428   0.576   0.927   0.999   1.069   1.203
+//   GQH4 17408x5120 ( 61 tensors)  0.419   0.600   0.875   0.980   1.023   1.142
+//   GQH4 6144x5120  ( 61 tensors)  0.440   0.608   0.734   0.892   0.975   1.103
+//
+// Every shape is still a win at 640 and the first crossing is between 640 and
+// 768, so the widest all-shapes-win bound is now ~640, not 160. The old bound
+// was not wrong when it was set -- before v_perm_b32 the same sweep read 0.89
+// for GQH4 17408x5120 at 160 and 1.03 at 192, so 160 really was the widest
+// all-shapes win then. It went stale when the decode got faster.
+//
+// The other leg of the justification is the WORKLOAD, which the kernel curve
+// cannot supply: a crossover says where MMQ stops paying, not whether anything
+// ever dispatches there. GGML_GQH_NE11_LOG=1 (the census in ggml-cuda.cu) over a
+// shipping-default serve (drafter metadata block_size 8, no --specla) of a
+// 119-token and a 6850-token prompt plus the HumanEval e2e set:
+//
+//   ne11        GQH mul_mat calls   past the matvec (gate-visible)
+//   8                      49290                                0
+//   39..93                  3930                             3930
+//   119                     5109                             5109
+//   194                     1965                             1965
+//   512                    25545                            25545
+//
+// Of the 36549 calls the gate CAN see, 27510 (75%) are the 194 and 512 buckets,
+// and 6850 = 13*512 + 194 exactly, with 25545/1965 = 13.0: those two buckets ARE
+// the long prefill, chunked. So the gate is load-bearing, and at 160 it was
+// sending the bulk of the prefill work to dequant.
+//
+// 512 rather than 640 because 512 is the whole of the workload, not a round
+// number. qwen35moe_prefill_chunk_limit is min(DFLASH_QWEN35MOE_PREFILL_CHUNK,
+// prompt_len) and that env defaults to 512, so no prefill can present an ne11
+// above 512 at shipping settings. A 640 bound therefore admits nothing extra for
+// any prompt, while spending GQH3's whole margin: 0.999 at 640 is break-even,
+// 0.927 at 512 is not. Raise it past 512 only together with the chunk width, and
+// re-measure both when doing so.
+//
+// End to end on lucebox5 (R9700 / gfx1201), same artifact and canonical drafter,
+// every cache off, ABBA order-balanced, 2 readings per arm x 5 samples per
+// reading, cooled to 36C between readings. Two independent sequences, 160 vs 640
+// and 160 vs 512, min-max over the raw samples:
+//
+//   arm          decode tok/s    prefill @119    prefill @6850
+//   gate 160     95.00-95.30     702.5-709.6     723.3-751.3
+//   gate 640     94.70-95.20     700.4-708.8     852.2-866.3   +15.7%
+//   gate 512     95.00-95.30     702.9-708.8     852.5-866.5   +15.6%
+//
+// The 119-token prefill is the negative control and does not move: ne11 119 was
+// under the old bound already, so the gate cannot touch it. Decode does not move
+// either, for the reason in the last paragraph. The whole gain is the long
+// prefill -- exactly the row the census says the gate was declining, and the
+// worst row of the published GQH-vs-IQ4_XS table. 640 and 512 agree to 0.14pp
+// because they dispatch identically here (nothing lands in 195..511), which is
+// the internal control on the noise floor.
+//
+// This REPLACES an earlier claim in this comment that lifting the gate cost ~7%
+// of prefill throughput end to end. That was measured before v_perm_b32 and does
+// not hold at this commit: lifting it to 512 is a 15.6% prefill GAIN.
+//
+// NOT re-measured here: the small row tile in mmq.cuh (mmq_gqh_small_tile) was
+// chosen under the old bound, where a gate-admitted multiply fitted one output
+// column tile. At 512 it no longer does, so that tile choice is now load-bearing
+// at a width it was never swept at. The gain above is with the small tile in
+// place; whether the default tile would do better at 512 is an open question.
+//
+// Widths below 17 never reach here: ggml_cuda_gqh_mul_mat_vec owns 1..16 and
+// returns before this is consulted, so the gate is purely an upper bound.
+static int64_t gqh_mmq_max_ne11(int cc) {
+    static const int64_t override_value = []() -> int64_t {
+        const char * value = getenv("GGML_GQH_MMQ_MAX_NE11");
+        return value ? strtoll(value, nullptr, 10) : -1;
+    }();
+    if (override_value >= 0) {
+        return override_value;
+    }
+    GGML_UNUSED(cc);
+    return 512;
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -740,6 +865,43 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
             mmq_supported = true;
+            break;
+        case GGML_TYPE_GQH3:
+        case GGML_TYPE_GQH4:
+            // GQH prefill used to dequantise the WHOLE weight set to fp16 for a
+            // cuBLAS GEMM: a fixed per-request cost set by the artifact, not the
+            // prompt (13.44 GB -> ~27 GB of fp16, measured as a steady 0.3 s per
+            // request against IQ4_XS's 0.1 s -- section 9 of
+            // docs/QWEN38_R9700_REPRO.md). MMQ removes the materialisation.
+            //
+            // This does not contest the narrow widths: ggml_cuda_gqh_mul_mat_vec
+            // owns 1..16 and wins decode there, and declines above GQH_MAX_COLS,
+            // so MMQ catches exactly the widths that used to fall to dequant.
+            //
+            // Arch gate mirrors ROCmFPX: the wave32 WMMA branch is what these
+            // tile shapes are validated on. The dp4a arm in both GQH tile
+            // loaders is UNVALIDATED -- on every arch reached here the WMMA
+            // branch is what compiles and runs, dp4a is dead code, and there is
+            // no build switch to force it, so its tile indices have never been
+            // exercised by a single test. amd_wmma_available(cc) is what keeps
+            // it unreachable: it is not a relaxation of the allowlist below but
+            // a hard invariant on top of it, so that adding an arch to the
+            // validated list can never silently arm dp4a instead. The allowlist
+            // stays the list of arches these tile shapes were measured on --
+            // notably NOT RDNA3.0, which amd_wmma_available admits but which
+            // was never validated here.
+            //
+            // n_experts > 1 declines because there is no expert-batched arm
+            // (see ggml_cuda_gqh_mmq_eligible), and the caller must ALSO pass
+            // that per-tensor check -- this signature has no tensor, so it
+            // cannot see an int8-unrepresentable grid.
+            // Width-gated: see gqh_mmq_max_ne11 for the measured crossover and
+            // why a single all-or-nothing switch cannot serve both effects.
+            mmq_supported = ggml_cuda_gqh_mmq_enabled() && n_experts <= 1 &&
+                            ne11 <= gqh_mmq_max_ne11(cc) &&
+                            amd_wmma_available(cc) &&
+                            (GGML_CUDA_CC_IS_RDNA3_5(cc) ||
+                             GGML_CUDA_CC_IS_RDNA4(cc));
             break;
         case GGML_TYPE_Q2_0_ROCMFP2:
         case GGML_TYPE_Q3_0_ROCMFPX:

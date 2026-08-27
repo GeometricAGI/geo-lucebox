@@ -4,6 +4,10 @@
 #include "vecdotq.cuh"
 #include "mma.cuh"
 
+// GQH superblock geometry (GQH3_SB_BYTES, GQH_SUPERBLOCK, GQH_N_SUB); the loader
+// below indexes wire bytes and must not hand-copy them.
+#include "../gqh-tables.h"
+
 #include <climits>
 #include <cstdint>
 
@@ -70,6 +74,8 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_GQH3:
+        case GGML_TYPE_GQH4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q2_0_ROCMFP2:
 #ifdef ROCMFP2_AFFINE
@@ -241,6 +247,112 @@ static constexpr __device__ int get_mmq_y_device() {
 #endif // defined(GGML_USE_HIP)
 }
 
+// ---- GQH: the small tile, so that TWO workgroups fit in a CU ---------------
+//
+// GQH3/GQH4 borrow Q3_K's MMA x-tile, MMQ_MMA_TILE_X_K_Q3_K == 84 ints per row
+// (64 for the int8 code words of one 256-weight superblock, 16 for its
+// sub-block scales, 4 of padding). At the RDNA default mmq_y 128 that is 43008
+// B of weight tile; with the ids and the q8_1 y tile the block asks for 52480
+// B, which is the lds_size rocprofv3 reports for every
+// mul_mat_q<GQH3|GQH4, 64> dispatch in a trace of an HE-prompt prefill on this
+// box. A gfx1201 CU has 64 KB of LDS, so exactly ONE workgroup is resident.
+//
+// That is the problem, and it is not a wave-count problem. The trace says
+// nothing is saturated: those two kernels are 86% of the prefill's GPU time
+// (68.6 + 47.3 of 134.2 ms busy) and move the ~13.4 GB weight set once, i.e.
+// ~116 GB/s against this card's ~640, while the int8 WMMA work over the same
+// window is a similar fraction of its own peak. Both roofs ~1/6 used is what a
+// LATENCY-bound kernel looks like, not a saturated one. And with one workgroup
+// per CU the two __syncthreads() per k-step in mul_mat_q_process_tile idle the
+// whole CU: every wave on it belongs to that one workgroup, so the weight loads
+// of the next step cannot start until the WMMA of this one has finished. There
+// is no register budget to software-pipeline around it either -- the kernel
+// already sits at 232 VGPRs with 24 B of scratch spill, sum[] alone being 32
+// floats.
+//
+// Halving BOTH the row tile and the warp count keeps the assert in
+// mmq_write_back_mma (nwarps*tile_C::I == mmq_y) and takes the block to 30976
+// B, so two workgroups become resident. Waves per CU are unchanged at 8: this
+// does not buy occupancy and is not meant to. What it buys is that the two
+// workgroups are INDEPENDENT -- one can be loading its x tile while the other
+// is inside vec_dot, because a barrier only stalls its own workgroup. It also
+// doubles the tile count, which matters on the GQH4 rung where 5120 output rows
+// are only 40 tiles at mmq_y 128 and 24 of this card's 64 CUs get no work.
+//
+// The cost is activation traffic: a row pair that shared one y tile now loads
+// it twice. That was the small side of this multiply when it was measured, at
+// widths <= 160 columns against thousands of rows, and WEIGHT traffic was
+// unchanged too: gqh_mmq_max_ne11 capped ncols_max at 160, mmq_x_best was then
+// >= ncols_max, so the multiply fitted ONE output column tile and no superblock
+// was decoded twice.
+//
+// That second half no longer holds. gqh_mmq_max_ne11 now defaults to 512 (see
+// its comment for the re-measured crossover and the end-to-end numbers), and a
+// 512-wide multiply spans several output column tiles, so the weight superblock
+// IS decoded more than once. The ntx == 1 argument above is void at the new
+// bound.
+//
+// The tile has been re-swept against the default one anyway, and the small tile
+// survives on measurement rather than on that argument. Both arms are this
+// commit differing only in the constexpr below, selected by swapping
+// libggml-hip.so so ONE sweep binary measures both; gqh-mmq-sweep at iters 400,
+// GGML_GQH_MMQ_MAX_NE11 lifted so MMQ dispatches at every width in BOTH arms --
+// without that both arms fall to dequant above the bound and the comparison
+// measures nothing -- and the per-width mmq/iter column confirms it did. Eight
+// readings per cell over two order-balanced passes; ratio is default-tile time
+// over small-tile time, so above 1.0 the small tile is faster:
+//
+//   ncols          119     194     256     384     512     640
+//   gqh3         1.055   1.000   1.015   0.982   0.982   0.996
+//   gqh4 K17408  1.196   1.071   1.090   0.983   0.981   1.028
+//   gqh4 K6144   1.178   1.064   1.094   0.976   0.979   1.026
+//
+// The crossover sits between 256 and 384, and the two widths this workload
+// dispatches straddle it: the small tile is 0-7% ahead at 194, the default tile
+// ~2% ahead at 512. Weighting those by the real chunking of a 6850-token
+// prefill (13*512 + 194, per the ne11 census) predicts the default tile winning
+// that one prefill by 1.8-2.0% and nothing else.
+//
+// It does, and nothing else is what it wins. End to end at the shipping gate,
+// ABBA order-balanced, two readings per arm, five samples per reading, prefix
+// and prefill caches off and no cache_hit observed:
+//
+//   arm            prefill @119   prefill @6850   e2e HE-10        decode
+//   small tile     688.7-709.6    848.9-865.6     126.57 / 126.78  94.9-95.2
+//   default tile   643.6-648.1    863.1-876.9     124.34 / 124.76  95.0-95.2
+//
+// The default tile takes 1.5-1.7% of the long prefill and gives back 8.8% of
+// the short one and 1.6-1.9% of end-to-end. Decode is flat in both arms, as it
+// must be: the matvec owns widths 1..16 and returns before the gate. The small
+// tile arm is also the pessimistic one here -- its first reading started at
+// 43 C against 36 C for every other reading -- and it wins anyway.
+//
+// So the small tile keeps the GQH rungs, now on the sweep rather than on
+// ntx == 1. What would change that is a workload whose prefill widths sit above
+// the 256-384 crossover with the short buckets gone, which the chunk limit and
+// the census say this one is not.
+//
+// Only the GQH rungs move. Every other type keeps the tile it was measured
+// with, deliberately: for IQ4_XS the 64-row tile is known to cost ~8% of
+// prefill throughput (see the LUCEBOX_RDNA_MMQ_TILE_OVERRIDE comment above), so
+// this is not a result that generalises off the GQH rungs.
+template <ggml_type type>
+static constexpr bool mmq_gqh_small_tile =
+    type == GGML_TYPE_GQH3 || type == GGML_TYPE_GQH4;
+
+#define MMQ_GQH_SMALL_TILE_Y      64
+#define MMQ_GQH_SMALL_TILE_NWARPS (MMQ_GQH_SMALL_TILE_Y/16)
+
+template <ggml_type type>
+static int get_mmq_y_host_for(const int cc) {
+    return mmq_gqh_small_tile<type> ? MMQ_GQH_SMALL_TILE_Y : get_mmq_y_host(cc);
+}
+
+template <ggml_type type>
+static constexpr __device__ int get_mmq_y_device_for() {
+    return mmq_gqh_small_tile<type> ? MMQ_GQH_SMALL_TILE_Y : get_mmq_y_device();
+}
+
 // Decouple shared memory tile sizes from WARP_SIZE to allow for different warp sizes.
 // The K dimension of the tiles has either,
 // 1*MMQ_TILE_NE_K==32 (always for TILE_Y_K) or 2*MMQ_TILE_NE_K==64 (typically for TILE_X_K),
@@ -278,6 +390,14 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_DP4A_TXS_Q8_0_16;
+        // GQH3: 64 code words and 16 sub-block scales per 256-weight
+        // superblock, which is exactly one x-scale per 16 int8 weights --
+        // the _16 vec_dot family's granularity, so no new activation
+        // quantiser is needed.
+        case GGML_TYPE_GQH3:    return MMQ_DP4A_TXS_Q8_0_16;
+        // GQH4 shares the geometry exactly: same 256-weight superblock, same 16
+        // sub-blocks. Only the code width and the grid size differ.
+        case GGML_TYPE_GQH4:    return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
@@ -314,6 +434,87 @@ static_assert(MMQ_MMA_TILE_X_K_FP4  % 8 == 4, "Wrong padding.");
 static_assert(MMQ_MMA_TILE_X_K_FP4 == MMQ_MMA_TILE_X_K_Q8_1, "Wrong tile size for MXFP4");
 static_assert(MMQ_MMA_TILE_X_K_NVFP4 % 8 == 4, "Wrong padding.");
 
+// ---- GQH: the HALF-SUPERBLOCK x tile ---------------------------------------
+//
+// GQH3/GQH4 used to borrow Q3_K's MMA x-tile wholesale: 2*32 code ints for a
+// whole 256-weight superblock, 16 sub-block scales, 4 of padding == 84 ints per
+// row. But mul_mat_q_process_tile never consumes a whole superblock at once --
+// the y tile only ever holds ONE 128-weight q8_1 block set, so the loop reloads
+// y and calls vec_dot twice, once per half, and every MMA branch of
+// vec_dot_q8_0_16_q8_1_mma walks exactly MMQ_TILE_NE_K == 32 code ints and 8
+// scale slots per call. The second half of the x tile is therefore dead LDS for
+// the whole first vec_dot and vice versa.
+//
+// Holding only the half being consumed costs nothing in weight traffic: the two
+// halves read disjoint code bytes, so the only thing read twice per superblock
+// is the 9-byte header (scale + ratios), ~8% more bytes on a path a
+// rocprofv3 kernel trace of an HE-sized prefill puts at ~116 GB/s of this
+// card's ~640. What it buys is LDS, and LDS is what caps this kernel:
+//
+//   block LDS = ids + mmq_y*tile_row*4 + pad(mmq_x*MMQ_TILE_Y_K*4)
+//   84 ints/row: 256 + 64*84*4 + 9216 = 30976 B -> 2 workgroups of 4 warps
+//   44 ints/row: 256 + 64*44*4 + 9216 = 20736 B -> 3 workgroups of 4 warps
+//
+// i.e. 8 -> 12 waves per CU on a 64 KB CU, and 2 -> 3 independent workgroups.
+// Registers do NOT bind here and are not touched by this change: a static
+// screen (-Rpass-analysis=kernel-resource-usage, gfx1201) of the GQH3 instance
+// reports mul_mat_q<GQH3,64> at 224 VGPRs (need_check=false) / 253
+// (need_check=true), i.e. a register-only occupancy of 5 waves/SIMD, against
+// the 2 waves/SIMD the old tile allowed. 3 waves/SIMD still fits.
+//
+// Both mechanisms iteration 1 measured point the same way: it halved mmq_y to
+// put a SECOND workgroup on the CU (barrier independence, no occupancy change)
+// and prefill went 405.9 -> 433-444 tok/s. This adds a third AND raises waves.
+//
+// KHALVES is tied to MMA availability because only the MMA branches of the
+// loaders and of vec_dot use this stride; the dp4a branches size their tile from
+// mmq_get_dp4a_tile_x_sizes and keep loading whole superblocks. The macro value
+// itself must NOT be conditional -- mmq_get_mma_tile_x_k is __host__ __device__
+// and the host pass sees none of the *_MMA_AVAILABLE defines, so a conditional
+// value would make the host allocate a tile of a different shape than the device
+// writes. Keying the value on nothing and the LOADING on the same #if the tile
+// layout already branches on keeps the two consistent for every arch.
+#define GQH_MMQ_X_KHALVES    2
+#define GQH_MMQ_TILE_X_QS    (2*MMQ_TILE_NE_K/GQH_MMQ_X_KHALVES)
+#define MMQ_MMA_TILE_X_K_GQH (GQH_MMQ_TILE_X_QS + GQH_MMQ_TILE_X_QS/4 + 4)
+static_assert(MMQ_MMA_TILE_X_K_GQH % 8 == 4, "Wrong padding.");
+
+// The staged half-1 state has to be SROA-able to live in registers, i.e. every
+// access needs a COMPILE-TIME index, which means the loader's row loop must be
+// FULLY unrolled. `#pragma unroll 4` left `rp` a runtime value, so `xreg[rp]`
+// was a dynamic index into an alloca and the "registers" were scratch: on
+// gfx1201 ScratchSize is 112 bytes/lane on exactly the three widths that take
+// the GQH MMA path against 24 on every other width, i.e. 88 bytes of staged
+// state, and a rocprofv3 trace confirms scratch_size 112 on all 1179 GQH
+// dispatches (all of them mmq_x 64 / need_check false / lds_size 20736).
+//
+// Be clear about what removing it bought: **on the HE-10 prefill, nothing
+// measurable.** An interleaved 3-round A/B against the staged-in-scratch form
+// (6 draws per arm, rebuilt and relinked between arms) put the paired delta in
+// prefill_ms_per_request at -0.52% median with the sign flipping across rounds,
+// inside a 3.75% draw-to-draw spread. That is a neutral result, not a win. The
+// block's whole scratch footprint is only ~14 KB (128 threads x 112 B), so it
+// was living in cache and never cost the DRAM traffic its per-lane byte count
+// suggests. It is kept because it is strictly better statically -- scratch
+// 112 -> 24, zero spills, and gqh4 187 -> 134 VGPRs -- and because that VGPR
+// headroom is what a quarter-k tile or a register-resident A-fragment path
+// would have to spend.
+//
+// Registers are the cheap resource here, and that is the reusable fact: the
+// 20736 B x tile caps residency at 6 waves/SIMD (3 blocks/CU in CU mode,
+// 6/WGP in WGP mode -- both land on 6), while the 1536 VGPRs/SIMD file gives 6
+// waves even to a 256-VGPR kernel. Any non-spilling VGPR count is
+// occupancy-equivalent here; only scratch and spills cost anything. LDS is the
+// only thing binding.
+//
+// Nothing fences the scheduler here. A __builtin_amdgcn_sched_barrier every
+// 4 / 8 / 16 rows was screened, on the theory that a full unroll would hoist
+// every row's byte loads and spill -- which is what it does when the DECODED
+// word is staged. With the raw bits staged instead, the unfenced form dominates
+// on both axes at mmq_x 64, need_check false, ScratchSize 24 and zero spills
+// throughout (gqh3 VGPRs 215 / 234 / 212 for no-fence / 8 / 4; gqh4 134 / 200 /
+// 228). A fence can only cut the loads in flight, so there was nothing to buy.
+
 
 static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
     switch (type) {
@@ -332,6 +533,10 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
+        // 32 code words + 32/4 scale floats == one HALF superblock; the loop
+        // reloads the tile between the two halves. See MMQ_MMA_TILE_X_K_GQH.
+        case GGML_TYPE_GQH3:    return MMQ_MMA_TILE_X_K_GQH;
+        case GGML_TYPE_GQH4:    return MMQ_MMA_TILE_X_K_GQH;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_MMA_TILE_X_K_NVFP4;
@@ -418,6 +623,20 @@ static constexpr __device__ int mmq_get_nwarps_device() {
 #else
     return 256/ggml_cuda_get_physical_warp_size();
 #endif // AMD_MFMA_AVAILABLE
+}
+
+// Paired with get_mmq_y_*_for: mmq_write_back_mma asserts nwarps*tile_C::I ==
+// mmq_y, so the GQH row tile and the warp count have to move together.
+template <ggml_type type>
+static int mmq_get_nwarps_host_for(const int cc, const int warp_size) {
+    return mmq_gqh_small_tile<type> ? MMQ_GQH_SMALL_TILE_NWARPS
+                                    : mmq_get_nwarps_host(cc, warp_size);
+}
+
+template <ggml_type type>
+static constexpr __device__ int mmq_get_nwarps_device_for() {
+    return mmq_gqh_small_tile<type> ? MMQ_GQH_SMALL_TILE_NWARPS
+                                    : mmq_get_nwarps_device();
 }
 
 // ------------------------------------------------------------
@@ -2060,8 +2279,16 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_dp4a(
     }
 }
 
-// Used for Q3_K, IQ2_S, and IQ2_XS:
-template <int mmq_x, int mmq_y>
+// Used for Q3_K, IQ2_S, IQ2_XS and the GQH rungs.
+//
+// tile_x_k (row stride) and x_df_off (offset of the scale array within a row)
+// make the x-tile geometry a parameter instead of hardcoding Q3_K's. Every MMA
+// branch below already walks exactly MMQ_TILE_NE_K code ints and
+// MMQ_TILE_NE_K/4 scale slots per call, so a tile holding only the half being
+// consumed (MMQ_MMA_TILE_X_K_GQH) needs nothing else changed. The defaults are
+// Q3_K's values, so every pre-existing instantiation is byte-identical.
+template <int mmq_x, int mmq_y,
+          int tile_x_k = MMQ_MMA_TILE_X_K_Q3_K, int x_df_off = 2*MMQ_TILE_NE_K>
 static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE)
@@ -2078,7 +2305,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
     const int   * x_qs = (const int   *) x;
-    const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
+    const float * x_df = (const float *) x_qs + x_df_off;
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
@@ -2090,7 +2317,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
         tile_A A[ntx];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            load_generic(((tile_load *) A)[n], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q3_K + k0, MMQ_MMA_TILE_X_K_Q3_K);
+            load_generic(((tile_load *) A)[n], x_qs + (i0 + n*tile_A::I)*tile_x_k + k0, tile_x_k);
         }
 
 #pragma unroll
@@ -2109,7 +2336,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * x_df[i*MMQ_MMA_TILE_X_K_Q3_K + k0/4] * dB;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * x_df[i*tile_x_k + k0/4] * dB;
                 }
             }
         }
@@ -2127,7 +2354,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
     const int   * x_qs = (const int   *) x;
-    const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
+    const float * x_df = (const float *) x_qs + x_df_off;
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
@@ -2139,7 +2366,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
         tile_A A[ntx];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            load_generic(A[n], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q3_K + k0, MMQ_MMA_TILE_X_K_Q3_K);
+            load_generic(A[n], x_qs + (i0 + n*tile_A::I)*tile_x_k + k0, tile_x_k);
         }
 
 #pragma unroll
@@ -2158,7 +2385,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * x_df[i*MMQ_MMA_TILE_X_K_Q3_K + k0/4] * dB;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * x_df[i*tile_x_k + k0/4] * dB;
                 }
             }
         }
@@ -2177,7 +2404,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
     const int   * x_qs = (const int   *) x;
-    const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
+    const float * x_df = (const float *) x_qs + x_df_off;
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
@@ -2192,7 +2419,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 8) {
             const int k0 = k00 + k01;
 
-            load_ldmatrix(((tile_A_8 *) A[n])[k01/8], x_qs + (i0 + n*tile_A::I)*MMQ_MMA_TILE_X_K_Q3_K + k0, MMQ_MMA_TILE_X_K_Q3_K);
+            load_ldmatrix(((tile_A_8 *) A[n])[k01/8], x_qs + (i0 + n*tile_A::I)*tile_x_k + k0, tile_x_k);
         }
 
 #pragma unroll
@@ -2203,7 +2430,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
             for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
                 const int k0 = k00 + k01;
 
-                dA[n][l][k01/4] = x_df[i*MMQ_MMA_TILE_X_K_Q3_K + k0/4];
+                dA[n][l][k01/4] = x_df[i*tile_x_k + k0/4];
             }
         }
     }
@@ -3978,7 +4205,7 @@ static __device__ __forceinline__ void mmq_write_back_mma(
         const int stride, const int i_max, const int j_max) {
 
     constexpr int granularity = mmq_get_granularity_device(mmq_x);
-    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int nwarps = mmq_get_nwarps_device_for<type>();
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr int tileC_IJ = mmq_get_granularity_device(0);
@@ -4017,6 +4244,617 @@ static __device__ __forceinline__ void mmq_write_back_mma(
 
                 dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
             }
+        }
+    }
+}
+
+// ---- GQH -----------------------------------------------------------------
+// Per-tensor MMQ side data for the header-bearing GQH rungs. Unlike the mix
+// qtypes, whose codebooks are big enough to need a device buffer and an LDS
+// stage, a GQH grid is 4-16 levels: quantised to int8 it is 16 bytes, so it
+// rides in the kernarg struct and the loader selects a byte out of a register
+// pair. That removes the LDS staging AND its bank conflicts -- an int8 LUT in
+// LDS would be four ds_read_u8 per code word, since 16 packed bytes span only
+// four banks (contrast the 16 distinct banks the by-value float grid gets in
+// gqh.cu's decode kernel).
+//
+// See gqh.cuh for how ggml_cuda_gqh_mmq_info builds these and which grids it
+// refuses. `lut` is ascending by code; `dscale` is tensor_scale * (amax/127).
+struct gqh_mmq_params {
+    int   lut[4];
+    float dscale;
+};
+
+// torch.float8_e4m3fn -> float32 for the superblock scale byte. gqh-tables.h has
+// the reference [32][8] table, but a table would have to be __constant__ in every
+// TU that instantiates an MMQ case (141 of them) and NVIDIA caps __constant__ at
+// 64 KiB per module, so this is the closed form instead. It is written on the BITS
+// so the static_assert below can check it against GQH_E4M3_LUT for all 256
+// encodings at compile time -- the table stays the authority and the two cannot
+// drift.
+static __host__ __device__ constexpr uint32_t gqh_mmq_e4m3_bits(const uint32_t d) {
+    const uint32_t sign = (d & 0x80u) << 24;
+    const uint32_t e    = (d >> 3) & 0x0fu;
+    const uint32_t m    =  d       & 0x07u;
+    if (e == 0u) {
+        // Subnormal: value = m * 2^-9. Normalising it means shifting the mantissa
+        // up by the position of m's high bit and dropping that bit.
+        if (m == 0u) {
+            return sign;                                   // +-0
+        }
+        const uint32_t hi = m >= 4u ? 2u : (m >= 2u ? 1u : 0u);
+        return sign | ((118u + hi) << 23) | ((m << (23 - hi)) & 0x7fffffu);
+    }
+    if (e == 0x0fu && m == 0x07u) {
+        return sign | 0x7ff00000u;                         // e4m3fn reserves this for NaN
+    }
+    return sign | ((e + 120u) << 23) | (m << 20);          // e - 7 + 127
+}
+
+namespace gqh_mmq_selfcheck {
+constexpr uint32_t e4m3_ref[32][8] = GQH_E4M3_LUT_INIT;
+constexpr bool e4m3_closed_form_exact() {
+    for (uint32_t d = 0; d < 256u; ++d) {
+        if (gqh_mmq_e4m3_bits(d) != e4m3_ref[d >> 3][d & 7]) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(e4m3_closed_form_exact(),
+              "gqh_mmq_e4m3_bits no longer reproduces GQH_E4M3_LUT");
+
+// The tile scale multiplies by ratio/15. The generated table is single-rounded
+// (as numpy does it), which a true division reproduces exactly and a multiply by
+// the rounded reciprocal does NOT -- it double-rounds 6 of the 16 entries. Pin
+// that here so nobody "optimises" the division into a reciprocal.
+constexpr uint32_t ratio_ref[16][1] = GQH_RATIO_Q_INIT;
+constexpr bool ratio_division_exact() {
+    for (uint32_t r = 0; r < 16u; ++r) {
+        if (__builtin_bit_cast(uint32_t, (float) r / 15.0f) != ratio_ref[r][0]) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(ratio_division_exact(),
+              "(float) ratio / 15.0f no longer reproduces GQH_RATIO_Q");
+}  // namespace gqh_mmq_selfcheck
+
+static __device__ __forceinline__ float gqh_mmq_e4m3_to_f32(const uint32_t d) {
+    return __int_as_float((int) gqh_mmq_e4m3_bits(d));
+}
+
+// Select the int8 grid level for `code` out of the packed kernarg LUT. `code` is
+// divergent and `lut` is a kernarg array, which is exactly the case gqh.cu warns
+// spills to scratch or expands into a select tree -- so index it with CONSTANTS
+// and do the divergent part in the ALU: one select for the word, one variable
+// shift for the byte. No memory touched.
+static __device__ __forceinline__ uint32_t gqh_mmq_lut8(const gqh_mmq_params & p, const uint32_t code) {
+    const uint32_t w = (code & 4u) ? (uint32_t) p.lut[1] : (uint32_t) p.lut[0];
+    return (w >> (8*(code & 3u))) & 0xffu;
+}
+
+// Same for a 16-level grid: two selects to pick the word, then the byte. Still
+// constant-indexed into the kernarg array, still no memory touched.
+static __device__ __forceinline__ uint32_t gqh_mmq_lut16(const gqh_mmq_params & p, const uint32_t code) {
+    const uint32_t lo = (code & 4u) ? (uint32_t) p.lut[1] : (uint32_t) p.lut[0];
+    const uint32_t hi = (code & 4u) ? (uint32_t) p.lut[3] : (uint32_t) p.lut[2];
+    const uint32_t w  = (code & 8u) ? hi : lo;
+    return (w >> (8*(code & 3u))) & 0xffu;
+}
+
+// Decode FOUR consecutive weights -- one whole x-tile int -- with ONE LUT
+// instruction instead of four.
+//
+// v_perm_b32 gathers four bytes out of a 64-bit {src0:src1} pair using a 4-byte
+// selector of 3-bit indices, which is exactly gqh_mmq_lut8 applied four times:
+// the kernarg LUT is 8 int8 levels in p.lut[0:2], ascending by code, so
+// concatenating {lut[1], lut[0]} makes byte `code` of the pair the level for
+// `code`. What the scalar loop actually costs is not the lookup but the
+// per-weight bit surgery around it -- extract 2 low bits, extract 1 high bit,
+// splice them, variable-shift the LUT word, mask, shift into place -- ~7 VALU
+// ops x 4 weights. Building the selector instead is a bit-spread that costs the
+// same for all four at once: two shift-or-mask pairs for the low plane, two for
+// the high, one splice.
+//
+// The spread is where this goes wrong silently if it goes wrong at all: v_perm
+// does not fault on an out-of-range selector byte, it returns 0x00/0xff, so a
+// bad mask yields plausible weights and a drifted avg_commit rather than a
+// crash. Both expressions below were checked exhaustively against the scalar
+// form off-GPU -- all 4096 (lo,hi) code pairs for gqh3 and all 65536 byte pairs
+// for gqh4, over several LUT payloads.
+//
+// Both helpers mask their input to 16 bits so callers may pass a staged dword
+// that still carries the NEXT row in its upper half. Where the argument is
+// provably a byte (the mode 0 fetch) that mask folds away.
+
+// byte k of the selector == ((lo_byte >> 2k) & 3) | (((hi_bits >> k) & 1) << 2),
+// i.e. the 3-bit code for weight 4w+k. `lo_byte` is the low-2-bit plane byte,
+// `hi_bits` the high-1-bit plane nibble in its low four bits.
+static __device__ __forceinline__ uint32_t gqh_mmq_lut8_x4(
+        const gqh_mmq_params & p, const uint32_t lo_byte, const uint32_t hi_bits) {
+    const uint32_t lo  =  lo_byte & 0xffffu;
+    const uint32_t hi  =  hi_bits & 0xffffu;
+    const uint32_t t   = (lo | (lo << 12)) & 0x000f000fu;   // 2 weights per 16-bit half
+    const uint32_t slo = (t  | (t  <<  6)) & 0x03030303u;   // 1 weight per byte
+    const uint32_t u   = (hi | (hi << 14)) & 0x00030003u;
+    const uint32_t shi = (u  | (u  <<  7)) & 0x01010101u;
+    const uint32_t sel = slo | (shi << 2);
+#if defined(GGML_USE_HIP)
+    return __builtin_amdgcn_perm((uint32_t) p.lut[1], (uint32_t) p.lut[0], sel);
+#else
+    uint32_t packed = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        packed |= gqh_mmq_lut8(p, (sel >> (8*k)) & 0xffu) << (8*k);
+    }
+    return packed;
+#endif
+}
+
+// Same for a 16-level grid. `bits16` is the two nibble-pair bytes, low byte
+// first, so the selector bytes are the four 4-bit codes. A nibble does not fit
+// v_perm's 3-bit index, so this is the same two-halves-then-blend shape
+// get_int_from_table_16 uses in vecdotq.cuh: look the low 3 bits up in each half
+// of the LUT, then select per byte on bit 3.
+static __device__ __forceinline__ uint32_t gqh_mmq_lut16_x4(
+        const gqh_mmq_params & p, const uint32_t bits16) {
+    const uint32_t w16 = bits16 & 0xffffu;
+    const uint32_t t   = (w16 | (w16 << 8)) & 0x00ff00ffu;  // 2 weights per 16-bit half
+    const uint32_t sel = (t   | (t   << 4)) & 0x0f0f0f0fu;  // 1 weight per byte
+#if defined(GGML_USE_HIP)
+    const uint32_t s3 = sel & 0x07070707u;
+    const uint32_t lo = __builtin_amdgcn_perm((uint32_t) p.lut[1], (uint32_t) p.lut[0], s3);
+    const uint32_t hi = __builtin_amdgcn_perm((uint32_t) p.lut[3], (uint32_t) p.lut[2], s3);
+    return __builtin_amdgcn_perm(hi, lo, 0x03020100u | ((sel & 0x08080808u) >> 1));
+#else
+    uint32_t packed = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        packed |= gqh_mmq_lut16(p, (sel >> (8*k)) & 0xffu) << (8*k);
+    }
+    return packed;
+#endif
+}
+
+// How many registers a lane needs to carry half 1 across vec_dot. Sized for the
+// MMA path (khalves 2); on dp4a the staging branch is dead and the arrays are
+// unused.
+//
+// What is staged is the RAW code bytes, not the decoded word: 12 bits per row
+// for gqh3 (one low-plane byte + one high-plane nibble) and 16 for gqh4 (two
+// nibble-pair bytes), so TWO rows fit one dword and the array is half the size
+// the decoded ints needed. That halving is load-bearing, not tidiness -- gqh4
+// enters the loader at 187 VGPRs, and 16 staged dwords plus a full unroll put it
+// over the 256 ceiling at every fence group (measured: 30-51 VGPRs spilled,
+// scratch 144-228). It also moves gqh4's four LUT16 selects off the load
+// critical path into mode 1, where there is nothing else to do. The decode is
+// the same expression on the same bits, so the tile is bit-identical either way.
+template <int mmq_y> static constexpr __device__ int gqh_mmq_row_regs() {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = mmq_get_nwarps_device_for<GGML_TYPE_GQH3>();
+    return mmq_y / ((warp_size/32) * nwarps * 2);
+}
+template <int mmq_y> static constexpr __device__ int gqh_mmq_scale_regs() {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = mmq_get_nwarps_device_for<GGML_TYPE_GQH3>();
+    return mmq_y / (nwarps * (warp_size/(GQH_N_SUB/GQH_MMQ_X_KHALVES)));
+}
+
+// GQH3 tile loader. 105-byte superblock, 256 weights along the row axis:
+//   [0]      E4M3 superblock scale
+//   [1:9]    16 uint4 sub-block ratios (ratio/15), low nibble = even sub-block
+//   [9:73]   low-2-bit code plane, 4 weights per byte
+//   [73:105] high-1-bit code plane, 8 weights per byte
+// One int32 of the x tile holds four consecutive weights, and those four always
+// come from ONE byte of the low plane and ONE nibble of the high plane, so a code
+// word costs exactly two byte loads. Consecutive lanes take consecutive words, so
+// both streams coalesce.
+//
+// The superblock stride is 105 bytes -- ODD -- so this must index bytes; there is
+// no aligned int load to be had. The same is true of every GQH rung (137/73) and
+// of the dequant path it replaces.
+// mode 0 fetches the WHOLE superblock in one fully-unrolled pass, stores half 0
+// into the tile and keeps half 1 in `xreg`/`sreg`; mode 1 drains those registers
+// into the same tile after the first vec_dot, touching no global memory.
+//
+// Why, concretely. Splitting the tile in two (iteration 2) shrinks the block from
+// 30976 to 20736 B so THREE workgroups fit a 64 KB CU instead of two -- but as
+// written each half was fetched in its own call, which on a kernel that is ~83%
+// stall costs a second full weight-load latency per superblock, and the
+// `#pragma unroll 4` it needed to stay off the 256-VGPR ceiling cut the loads in
+// flight per pass from ~64 to ~8. Measured on this box: prefill median 427.4
+// tok/s over n=7 against 434.0 for the un-split tile over n=6 -- the split as
+// written is a REGRESSION. Staging half 1 in registers buys back both the single
+// latency and the un-split loader's memory-level parallelism, at the price of
+// gqh_mmq_row_regs() ints + gqh_mmq_scale_regs() floats per lane held across
+// vec_dot (16 + 4 at mmq_y 64 / 4 warps).
+template <int mmq_y, bool need_check, int mode, int NR, int NS>
+static __device__ __forceinline__ void load_tiles_gqh3(
+        const char * __restrict__ x, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride,
+        const gqh_mmq_params gqh, int (&xreg)[NR], float (&sreg)[NS]) {
+    constexpr int nwarps    = mmq_get_nwarps_device_for<GGML_TYPE_GQH3>();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    // khalves == 2: the tile holds only the half-superblock the next vec_dot will
+    // consume, and the caller loads it once per half. See MMQ_MMA_TILE_X_K_GQH.
+    constexpr int khalves = GQH_MMQ_X_KHALVES;
+    int   * x_qs = reinterpret_cast<int   *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + GQH_MMQ_TILE_X_QS);
+#else
+    // The dp4a tile is sized from mmq_get_dp4a_tile_x_sizes, not from the MMA row
+    // stride, so this branch keeps loading whole superblocks and khalf is always 0.
+    constexpr int khalves = 1;
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_GQH3, mmq_y);
+    int   * x_qs = reinterpret_cast<int   *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + txs.qs);
+#endif
+
+    // ---- code words: 64 per superblock, words_per_pass of them per call ----
+    constexpr int words_per_row   = GQH_SUPERBLOCK/4;      // 64
+    constexpr int words_per_pass  = words_per_row / khalves;
+    constexpr int threads_per_row = 32;
+    constexpr int words_per_lane  = words_per_pass / threads_per_row;
+    constexpr int nrows           = warp_size / threads_per_row;
+    static_assert(words_per_pass % threads_per_row == 0, "GQH3 MMQ loader wants 32 lanes per row");
+    static_assert(warp_size % threads_per_row == 0,      "GQH3 MMQ loader wants a multiple of 32 lanes");
+    static_assert(mmq_y % (nrows*nwarps) == 0,           "GQH3 MMQ loader wants mmq_y divisible by the row step");
+
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+    // Address a row as ONE loop-invariant 64-bit base plus a 32-bit byte
+    // offset. Both halves of that matter. The base is hoisted out of the row
+    // loop so no 64-bit arithmetic is recomputed per row; the per-row part being
+    // 32-bit is what makes the backend emit the SADDR form
+    // (`global_load_u8 v, v_off, s[base] offset:imm`) instead of the
+    // v_add_co_u32 / v_add_co_ci_u32 pair it otherwise spends on every single
+    // code-byte address. Measured on gfx1201: 64 SADDR loads appear, v_add_co
+    // pairs drop 54 -> 6, dynamic VALU -4.7%, VGPRs 175 -> 173.
+    //
+    // The 32-bit offset cannot overflow: i < mmq_y (64) and the offset is
+    // i*stride*105, so it would take a row stride near 500 K superblocks (a
+    // 127 M-element row) to reach 2^32. Folding kbx0 in as well -- i.e. making
+    // the WHOLE tensor byte offset 32-bit -- also emits SADDR and costs 6 fewer
+    // VGPRs, but it caps a single GQH tensor at 4 GB, which is not a limit worth
+    // buying registers with.
+    const uint8_t * __restrict__ xrow0 =
+        reinterpret_cast<const uint8_t *>(x) + (size_t) kbx0 * GQH3_SB_BYTES;
+
+    // Per-lane byte offsets into the superblock, and the high-plane nibble
+    // shift. All three are invariant across rows AND across `h`/`w0`, because
+    // the code word index is `w = (even compile-time delta) + txi`: the delta
+    // rides the load's immediate field, `w & 1` is `txi & 1`, and `w >> 1` is
+    // `(delta >> 1) + (txi >> 1)` exactly. Hoisting them leaves ONE address per
+    // (row, plane) instead of one per load.
+    const uint32_t lane_lo  = 9u  + (uint32_t) txi;             // low-2-bit plane
+    const uint32_t lane_hi  = 73u + (uint32_t) (txi >> 1);      // high-1-bit plane
+    const uint32_t hi_shift = (uint32_t) ((txi & 1) << 2);
+
+    // Both halves in one pass, and FULLY unrolled: `rp` has to be a compile-time
+    // index or the staged half-1 dwords land in scratch instead of registers
+    // (see the note by MMQ_MMA_TILE_X_K_GQH). The unroll is also what stacks the
+    // in-flight byte loads, which is the axis that matters on a kernel this
+    // latency-bound.
+    constexpr int rows_here  = mmq_y / (nrows*nwarps);
+    static_assert(rows_here % 2 == 0, "GQH MMQ loader stages two rows per dword");
+    // Only the half-k (MMA) path stages anything, and only it has one word per
+    // lane. The host pass sees none of the *_MMA_AVAILABLE defines, so khalves is
+    // 1 there and this must not be asserted unconditionally.
+    static_assert(khalves == 1 || words_per_lane == 1,
+                  "GQH MMQ loader stages exactly one word per lane");
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        const int rp = i0 / (nrows*nwarps);
+        int i = i0 + (nrows == 1 ? (int) threadIdx.y
+                                 : (int) threadIdx.y*nrows + (int) threadIdx.x/threads_per_row);
+        if (need_check) {
+            i = min(i, i_max);
+        }
+#if defined(GGML_USE_HIP)
+        // mul_mat_q launches block_dims(warp_size, nwarps, 1), so with nrows == 1
+        // a wave IS one threadIdx.y row and `i` is wave-uniform -- i_max is a
+        // kernel argument, so the need_check clamp preserves that. LLVM cannot
+        // see the block shape, treats threadIdx.y as divergent, and therefore
+        // keeps the whole row offset in VGPRs. Stating the uniformity moves it
+        // to SALU and is what leaves an SGPR base for the SADDR form above.
+        // Guarded to nrows == 1: on the wave64 MFMA path `i` carries
+        // threadIdx.x and really is divergent.
+        if (nrows == 1) {
+            i = __builtin_amdgcn_readfirstlane(i);
+        }
+#endif
+
+        if (mode == 1) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (khalves > 1) {
+                // 12 staged bits: low-plane byte, then the high-plane nibble.
+                const uint32_t bits = (uint32_t) xreg[rp/2] >> (16*(rp % 2));
+
+                x_qs[i*MMQ_MMA_TILE_X_K_GQH + txi] =
+                    (int) gqh_mmq_lut8_x4(gqh, bits, bits >> 8);
+            }
+#endif
+            continue;
+        }
+
+        const uint32_t rowoff = (uint32_t) (i*stride) * (uint32_t) GQH3_SB_BYTES;
+        const uint8_t * __restrict__ bl = xrow0 + (rowoff + lane_lo);
+        const uint8_t * __restrict__ bh = xrow0 + (rowoff + lane_hi);
+
+#pragma unroll
+        for (int h = 0; h < khalves; ++h) {
+#pragma unroll
+        for (int w0 = 0; w0 < words_per_lane; ++w0) {
+            const int wt = txi + w0*threads_per_row;            // slot in the tile
+            const int wc = h*words_per_pass + w0*threads_per_row;  // even, compile-time
+            const uint32_t lo_byte = bl[wc];
+            const uint32_t hi_byte = bh[wc >> 1];
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (h != 0) {
+                // Held across vec_dot 0 as raw bits; mode 1 does the decode.
+                const uint32_t bits = lo_byte | (((hi_byte >> hi_shift) & 0x0fu) << 8);
+                if (rp % 2 == 0) {
+                    xreg[rp/2]  = (int) bits;
+                } else {
+                    xreg[rp/2] |= (int) (bits << 16);
+                }
+                continue;
+            }
+#endif
+
+            const uint32_t packed = gqh_mmq_lut8_x4(gqh, lo_byte, hi_byte >> hi_shift);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_GQH + wt] = (int) packed;      // vec_dot 0 reads this
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + wt] = (int) packed;
+#endif
+        }
+        }
+    }
+
+    // ---- sub-block scales: 16 per row ----
+    // The tile scale is the reference's own product with 1/127 folded in through
+    // dscale. The reference decode multiplies in a fixed order for bit-exactness;
+    // MMQ cannot be bit-exact anyway (the grid is curved and int8 perturbs every
+    // level), so this reassociates to keep the per-tensor factor on the host.
+    // The ratio uses true division, which reproduces GQH_RATIO_Q exactly where a
+    // multiply by the rounded reciprocal would not; see ratio_division_exact.
+    constexpr int scales_per_tile     = GQH_N_SUB;                   // 16 per superblock
+    constexpr int scales_per_pass     = scales_per_tile / khalves;   // 8 on the MMA path
+    constexpr int scale_rows_per_warp = warp_size / scales_per_pass;
+    static_assert(warp_size % scales_per_pass == 0,               "GQH3 MMQ scale lanes");
+    static_assert(mmq_y % (nwarps*scale_rows_per_warp) == 0,      "GQH3 MMQ scale row step");
+    const int kst = threadIdx.x % scales_per_pass;                   // slot in the tile
+    // Lane part of the ratio-byte offset. scales_per_pass is even, so
+    // `kscale >> 1 == (h*scales_per_pass >> 1) + (kst >> 1)` exactly and the
+    // half rides the load immediate.
+    const uint32_t lane_rb = (uint32_t) (kst >> 1);
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*scale_rows_per_warp) {
+        const int sp = i0 / (nwarps*scale_rows_per_warp);
+        int i = i0 + (int) threadIdx.y*scale_rows_per_warp + (int) threadIdx.x/scales_per_pass;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        if (mode == 1) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (khalves > 1) {
+                x_df[i*MMQ_MMA_TILE_X_K_GQH + kst] = sreg[sp];
+            }
+#endif
+            continue;
+        }
+
+        const uint8_t * __restrict__ b =
+            reinterpret_cast<const uint8_t *>(x) + (size_t) (kbx0 + i*stride) * GQH3_SB_BYTES;
+
+        const uint8_t * __restrict__ brb = b + lane_rb;
+
+#pragma unroll
+        for (int h = 0; h < khalves; ++h) {
+            const int kscale = h*scales_per_pass + kst;              // sub-block, 0..15
+            const uint32_t rb    = brb[1 + ((h*scales_per_pass) >> 1)];
+            const uint32_t ratio = (kscale & 1) ? (rb >> 4) : (rb & 0x0fu);
+            // Multiply order is load-bearing (see the note above): do not hoist.
+            const float    scale = gqh_mmq_e4m3_to_f32(b[0]) *
+                                   ((float) ratio / (float) GQH_RATIO_MAX) * gqh.dscale;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (h == 0) {
+                x_df[i*MMQ_MMA_TILE_X_K_GQH + kst] = scale;
+            } else {
+                sreg[sp] = scale;
+            }
+#else
+            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kst] = scale;
+#endif
+        }
+    }
+}
+
+// GQH4 tile loader. 137-byte superblock, same 256/16 geometry as gqh3 and the
+// same head; only the code plane and the grid size differ:
+//   [0]      E4M3 superblock scale
+//   [1:9]    16 uint4 sub-block ratios
+//   [9:137]  uint4 codes, two per byte -- even weight low nibble, odd high
+// Four consecutive weights are two whole bytes, so a code word is two byte loads
+// here too, and consecutive lanes still take consecutive byte pairs. The grid has
+// 16 levels rather than 8, so the LUT fills all four kernarg words and the select
+// costs one extra cndmask.
+//
+// The 137-byte stride is odd, like gqh3's 105, so this indexes bytes as well.
+// mode 0 fetches the WHOLE superblock in one fully-unrolled pass, stores half 0
+// into the tile and keeps half 1 in `xreg`/`sreg`; mode 1 drains those registers
+// into the same tile after the first vec_dot, touching no global memory.
+//
+// Why, concretely. Splitting the tile in two (iteration 2) shrinks the block from
+// 30976 to 20736 B so THREE workgroups fit a 64 KB CU instead of two -- but as
+// written each half was fetched in its own call, which on a kernel that is ~83%
+// stall costs a second full weight-load latency per superblock, and the
+// `#pragma unroll 4` it needed to stay off the 256-VGPR ceiling cut the loads in
+// flight per pass from ~64 to ~8. Measured on this box: prefill median 427.4
+// tok/s over n=7 against 434.0 for the un-split tile over n=6 -- the split as
+// written is a REGRESSION. Staging half 1 in registers buys back both the single
+// latency and the un-split loader's memory-level parallelism, at the price of
+// gqh_mmq_row_regs() ints + gqh_mmq_scale_regs() floats per lane held across
+// vec_dot (16 + 4 at mmq_y 64 / 4 warps).
+template <int mmq_y, bool need_check, int mode, int NR, int NS>
+static __device__ __forceinline__ void load_tiles_gqh4(
+        const char * __restrict__ x, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride,
+        const gqh_mmq_params gqh, int (&xreg)[NR], float (&sreg)[NS]) {
+    constexpr int nwarps    = mmq_get_nwarps_device_for<GGML_TYPE_GQH4>();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    // khalves == 2: the tile holds only the half-superblock the next vec_dot will
+    // consume, and the caller loads it once per half. See MMQ_MMA_TILE_X_K_GQH.
+    constexpr int khalves = GQH_MMQ_X_KHALVES;
+    int   * x_qs = reinterpret_cast<int   *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + GQH_MMQ_TILE_X_QS);
+#else
+    // The dp4a tile is sized from mmq_get_dp4a_tile_x_sizes, not from the MMA row
+    // stride, so this branch keeps loading whole superblocks and khalf is always 0.
+    constexpr int khalves = 1;
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_GQH4, mmq_y);
+    int   * x_qs = reinterpret_cast<int   *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + txs.qs);
+#endif
+
+    // ---- code words: 64 per superblock, words_per_pass of them per call ----
+    constexpr int words_per_row   = GQH_SUPERBLOCK/4;      // 64
+    constexpr int words_per_pass  = words_per_row / khalves;
+    constexpr int threads_per_row = 32;
+    constexpr int words_per_lane  = words_per_pass / threads_per_row;
+    constexpr int nrows           = warp_size / threads_per_row;
+    static_assert(words_per_pass % threads_per_row == 0, "GQH4 MMQ loader wants 32 lanes per row");
+    static_assert(warp_size % threads_per_row == 0,      "GQH4 MMQ loader wants a multiple of 32 lanes");
+    static_assert(mmq_y % (nrows*nwarps) == 0,           "GQH4 MMQ loader wants mmq_y divisible by the row step");
+
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+    // Both halves in one pass, and FULLY unrolled: `rp` has to be a compile-time
+    // index or the staged half-1 dwords land in scratch instead of registers
+    // (see the note by MMQ_MMA_TILE_X_K_GQH). The unroll is also what stacks the
+    // in-flight byte loads, which is the axis that matters on a kernel this
+    // latency-bound.
+    constexpr int rows_here  = mmq_y / (nrows*nwarps);
+    static_assert(rows_here % 2 == 0, "GQH MMQ loader stages two rows per dword");
+    // Only the half-k (MMA) path stages anything, and only it has one word per
+    // lane. The host pass sees none of the *_MMA_AVAILABLE defines, so khalves is
+    // 1 there and this must not be asserted unconditionally.
+    static_assert(khalves == 1 || words_per_lane == 1,
+                  "GQH MMQ loader stages exactly one word per lane");
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        const int rp = i0 / (nrows*nwarps);
+        int i = i0 + (nrows == 1 ? (int) threadIdx.y
+                                 : (int) threadIdx.y*nrows + (int) threadIdx.x/threads_per_row);
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        if (mode == 1) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (khalves > 1) {
+                // 16 staged bits: the two nibble-pair bytes, low byte first.
+                const uint32_t bits = (uint32_t) xreg[rp/2] >> (16*(rp % 2));
+
+                x_qs[i*MMQ_MMA_TILE_X_K_GQH + txi] = (int) gqh_mmq_lut16_x4(gqh, bits);
+            }
+#endif
+            continue;
+        }
+
+        const uint8_t * __restrict__ b =
+            reinterpret_cast<const uint8_t *>(x) + (size_t) (kbx0 + i*stride) * GQH4_SB_BYTES;
+
+#pragma unroll
+        for (int h = 0; h < khalves; ++h) {
+#pragma unroll
+        for (int w0 = 0; w0 < words_per_lane; ++w0) {
+            const int wt = txi + w0*threads_per_row;            // slot in the tile
+            const int w  = h*words_per_pass + wt;               // code word, 0..63
+            const uint32_t b0 = b[9 + 2*w];                    // weights 4w, 4w+1
+            const uint32_t b1 = b[9 + 2*w + 1];                // weights 4w+2, 4w+3
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (h != 0) {
+                // Held across vec_dot 0 as raw bits; mode 1 does the decode.
+                const uint32_t bits = b0 | (b1 << 8);
+                if (rp % 2 == 0) {
+                    xreg[rp/2]  = (int) bits;
+                } else {
+                    xreg[rp/2] |= (int) (bits << 16);
+                }
+                continue;
+            }
+#endif
+
+            const uint32_t packed = gqh_mmq_lut16_x4(gqh, b0 | (b1 << 8));
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_GQH + wt] = (int) packed;      // vec_dot 0 reads this
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + wt] = (int) packed;
+#endif
+        }
+        }
+    }
+
+    // ---- sub-block scales: 16 per row, identical head to gqh3 ----
+    constexpr int scales_per_tile     = GQH_N_SUB;                   // 16 per superblock
+    constexpr int scales_per_pass     = scales_per_tile / khalves;   // 8 on the MMA path
+    constexpr int scale_rows_per_warp = warp_size / scales_per_pass;
+    static_assert(warp_size % scales_per_pass == 0,          "GQH4 MMQ scale lanes");
+    static_assert(mmq_y % (nwarps*scale_rows_per_warp) == 0, "GQH4 MMQ scale row step");
+    const int kst = threadIdx.x % scales_per_pass;                   // slot in the tile
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*scale_rows_per_warp) {
+        const int sp = i0 / (nwarps*scale_rows_per_warp);
+        int i = i0 + (int) threadIdx.y*scale_rows_per_warp + (int) threadIdx.x/scales_per_pass;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        if (mode == 1) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (khalves > 1) {
+                x_df[i*MMQ_MMA_TILE_X_K_GQH + kst] = sreg[sp];
+            }
+#endif
+            continue;
+        }
+
+        const uint8_t * __restrict__ b =
+            reinterpret_cast<const uint8_t *>(x) + (size_t) (kbx0 + i*stride) * GQH4_SB_BYTES;
+
+#pragma unroll
+        for (int h = 0; h < khalves; ++h) {
+            const int kscale = h*scales_per_pass + kst;              // sub-block, 0..15
+            const uint32_t rb    = b[1 + (kscale >> 1)];
+            const uint32_t ratio = (kscale & 1) ? (rb >> 4) : (rb & 0x0fu);
+            // Multiply order is load-bearing (see the note above): do not hoist.
+            const float    scale = gqh_mmq_e4m3_to_f32(b[0]) *
+                                   ((float) ratio / (float) GQH_RATIO_MAX) * gqh.dscale;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            if (h == 0) {
+                x_df[i*MMQ_MMA_TILE_X_K_GQH + kst] = scale;
+            } else {
+                sreg[sp] = scale;
+            }
+#else
+            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kst] = scale;
+#endif
         }
     }
 }
@@ -4105,6 +4943,29 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q3_1_ROCMFP3_MIX> {
     // mul_mat_q_process_tile because it needs registry side data.
     static constexpr load_tiles_mmq_t load_tiles   = nullptr;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_GQH3> {
+    static constexpr int              vdr          = VDR_Q3_K_Q8_1_MMQ;
+    // Same reason as the mix qtypes: the loader needs per-tensor state that no
+    // load_tiles_mmq_t signature carries, so mul_mat_q_process_tile calls it
+    // explicitly. vdr has no consumer; it is the Q3_K value for the shared tile.
+    static constexpr load_tiles_mmq_t load_tiles   = nullptr;
+    // Half-superblock x tile, so the row stride and the in-row scale offset are
+    // not Q3_K's; see MMQ_MMA_TILE_X_K_GQH.
+    static constexpr vec_dot_mmq_t    vec_dot_mma  =
+        vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y, MMQ_MMA_TILE_X_K_GQH, GQH_MMQ_TILE_X_QS>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_GQH4> {
+    static constexpr int              vdr          = VDR_Q3_K_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = nullptr;   // see GQH3
+    static constexpr vec_dot_mmq_t    vec_dot_mma  =
+        vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y, MMQ_MMA_TILE_X_K_GQH, GQH_MMQ_TILE_X_QS>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
@@ -4248,12 +5109,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
         const nv_bfloat16 * __restrict__ mix_codebooks,
-        const uint8_t * __restrict__ mix_modes, const int mix_expert) {
+        const uint8_t * __restrict__ mix_modes, const gqh_mmq_params gqh,
+        const int mix_expert) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
-    constexpr int              nwarps     = mmq_get_nwarps_device();
+    constexpr int              nwarps     = mmq_get_nwarps_device_for<type>();
     constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
-    constexpr int              mmq_y      = get_mmq_y_device();
+    constexpr int              mmq_y      = get_mmq_y_device_for<type>();
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
 
     extern __shared__ int data_mul_mat_q[];
@@ -4263,8 +5125,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
     constexpr mmq_write_back_t write_back = mmq_write_back_mma<type, mmq_x, mmq_y, need_check>;
+    // GQH's MMA x tile holds only the half-superblock the next vec_dot consumes,
+    // so it is reloaded between the halves and vec_dot always reads it at k00 = 0.
+    // Every other type spans the whole iteration in one tile and reads the upper
+    // half at k00 = MMQ_TILE_NE_K. See MMQ_MMA_TILE_X_K_GQH.
+    constexpr bool gqh_half_k = type == GGML_TYPE_GQH3 || type == GGML_TYPE_GQH4;
 #else
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
+    constexpr bool gqh_half_k = false;
     constexpr mmq_write_back_t write_back = mmq_write_back_dp4a<mmq_x, mmq_y, need_check>;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
@@ -4286,7 +5154,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     // For mmq_x=128, MMQ_TILE_Y_K=36: 4608 / (2*256) = 9 exactly → clean unroll.
     constexpr bool ytile_use_int2 = (mmq_x * MMQ_TILE_Y_K % (2 * nwarps * warp_size)) == 0;
 
+    // Half 1 of the GQH superblock, carried in registers from the fetch above
+    // vec_dot 0 to the store below it. Sized 1 for every other type, where the
+    // arrays are unreferenced and fold away.
+    constexpr int gqh_nr = gqh_half_k ? gqh_mmq_row_regs<mmq_y>()   : 1;
+    constexpr int gqh_ns = gqh_half_k ? gqh_mmq_scale_regs<mmq_y>() : 1;
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        int   gqh_xreg[gqh_nr];
+        float gqh_sreg[gqh_ns];
+
         if constexpr (type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
             load_tiles_rocmfp2_mix<mmq_y, need_check>(
                 x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x,
@@ -4295,6 +5172,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             load_tiles_rocmfp3_mix<mmq_y, need_check>(
                 x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x,
                 mix_codebooks, mix_modes, mix_expert);
+        } else if constexpr (type == GGML_TYPE_GQH3) {
+            load_tiles_gqh3<mmq_y, need_check, 0>(
+                x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, gqh,
+                gqh_xreg, gqh_sreg);
+        } else if constexpr (type == GGML_TYPE_GQH4) {
+            load_tiles_gqh4<mmq_y, need_check, 0>(
+                x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, gqh,
+                gqh_xreg, gqh_sreg);
         } else {
             load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         }
@@ -4321,6 +5206,25 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+        // Safe here and only here: the barrier above is the WAR edge, so no warp
+        // is still reading the lower half, and the barrier below publishes this
+        // half together with the y tile. Barrier count per iteration is unchanged.
+        // Pure LDS: the bytes this writes were fetched and decoded before the
+        // barrier above, so no global load is issued here and the superblock's
+        // weight-load latency is exposed exactly once per iteration, as it was
+        // before the tile was split.
+        if constexpr (gqh_half_k) {
+            if constexpr (type == GGML_TYPE_GQH3) {
+                load_tiles_gqh3<mmq_y, need_check, 1>(
+                    x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, gqh,
+                    gqh_xreg, gqh_sreg);
+            } else {
+                load_tiles_gqh4<mmq_y, need_check, 1>(
+                    x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, gqh,
+                    gqh_xreg, gqh_sreg);
+            }
+        }
+
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
             if constexpr (ytile_use_int2) {
@@ -4340,7 +5244,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        vec_dot(tile_x, tile_y, sum, gqh_half_k ? 0 : MMQ_TILE_NE_K);
 
         __syncthreads();
     }
@@ -4360,9 +5264,9 @@ template <ggml_type type, int mmq_x, bool need_check>
 // RDNA4 is compute-bound on MMQ (WMMA path); allow compiler to use more VGPRs
 // (minBlocks=1 matches NVIDIA Volta+ behavior and reduces register spilling).
 #if defined(RDNA4) && !defined(GGML_CUDA_MMQ_SMALL_TILE)
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for<type>(), 1)
 #elif defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for<type>(), 2)
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -4375,7 +5279,7 @@ static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds,
         const nv_bfloat16 * __restrict__ mix_codebooks,
-        const uint8_t * __restrict__ mix_modes,
+        const uint8_t * __restrict__ mix_modes, const gqh_mmq_params gqh,
         float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -4388,11 +5292,11 @@ static __global__ void mul_mat_q(
         return;
     }
 
-    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int nwarps = mmq_get_nwarps_device_for<type>();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr int qk    = ggml_cuda_type_traits<type>::qk;
-    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int mmq_y = get_mmq_y_device_for<type>();
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y; // Number of tiles y
 
@@ -4466,7 +5370,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
-             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
+             mix_codebooks, mix_modes, gqh, fastdiv(zt, channel_ratio));
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4547,7 +5451,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
-             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
+             mix_codebooks, mix_modes, gqh, fastdiv(zt, channel_ratio));
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -4617,22 +5521,22 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
-         mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
+         mix_codebooks, mix_modes, gqh, fastdiv(zt, channel_ratio));
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
-__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device()/2, 1)
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device_for<type>()/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx) {
-    constexpr int mmq_y           = get_mmq_y_device();
+    constexpr int mmq_y           = get_mmq_y_device_for<type>();
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
 
-    constexpr int nwarps = mmq_get_nwarps_device()/2;
+    constexpr int nwarps = mmq_get_nwarps_device_for<type>()/2;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     float sum[mmq_x / nwarps] = {0.0f};
@@ -4761,7 +5665,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds;
-    const nv_bfloat16 * mix_codebooks; const uint8_t * mix_modes; float * dst;
+    const nv_bfloat16 * mix_codebooks; const uint8_t * mix_modes; gqh_mmq_params gqh; float * dst;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
@@ -4790,8 +5694,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const int nwarps = mmq_get_nwarps_host(cc, warp_size);
-    const int mmq_y = get_mmq_y_host(cc);
+    const int nwarps = mmq_get_nwarps_host_for<type>(cc, warp_size);
+    const int mmq_y = get_mmq_y_host_for<type>(cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
@@ -4822,7 +5726,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             constexpr bool need_check = false;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds,
-                 args.mix_codebooks, args.mix_modes, args.dst, nullptr,
+                 args.mix_codebooks, args.mix_modes, args.gqh, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4831,7 +5735,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds,
-                 args.mix_codebooks, args.mix_modes, args.dst, nullptr,
+                 args.mix_codebooks, args.mix_modes, args.gqh, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4864,7 +5768,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         constexpr bool need_check = false;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds,
-             args.mix_codebooks, args.mix_modes, args.dst, tmp_fixup.ptr,
+             args.mix_codebooks, args.mix_modes, args.gqh, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4883,7 +5787,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         constexpr bool need_check = true;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds,
-             args.mix_codebooks, args.mix_modes, args.dst, tmp_fixup.ptr,
+             args.mix_codebooks, args.mix_modes, args.gqh, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4907,10 +5811,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int    cc     = ggml_cuda_info().devices[id].cc;
     const size_t smpbo  = ggml_cuda_info().devices[id].smpbo;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
+    const int nwarps    = mmq_get_nwarps_host_for<type>(cc, warp_size);
 
     const int mmq_x_max = get_mmq_x_max_host(cc);
-    const int mmq_y = get_mmq_y_host(cc);
+    const int mmq_y = get_mmq_y_host_for<type>(cc);
 
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
@@ -5007,6 +5911,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q2_0_ROCMFP2);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_1_ROCMFP2_MIX);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_0_ROCMFPX);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_1_ROCMFP3_MIX);
+extern DECL_MMQ_CASE(GGML_TYPE_GQH3);
+extern DECL_MMQ_CASE(GGML_TYPE_GQH4);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);

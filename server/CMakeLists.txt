@@ -1173,7 +1173,7 @@ if(DFLASH27B_TESTS)
     # libstdc++ (undefined operator new / __gxx_personality_v0).
     set(GQH_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/tests")
     if(EXISTS "${GQH_TEST_DIR}/test-gqh-cpu-decode.cpp")
-        foreach(GQH_SRC test-gqh-cpu-decode test-gqh-backend)
+        foreach(GQH_SRC test-gqh-cpu-decode test-gqh-backend gqh-mmq-sweep)
             add_executable(${GQH_SRC} "${GQH_TEST_DIR}/${GQH_SRC}.cpp")
             target_link_libraries(${GQH_SRC} PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
             target_include_directories(${GQH_SRC} PRIVATE
@@ -1207,11 +1207,232 @@ if(DFLASH27B_TESTS)
                          COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
                                  "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" ${GQH_NVEC})
                 set_tests_properties(test-gqh-backend-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
+                                     PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=0")
             endforeach()
+            # The I8 ACTIVATION ARM -- what serving actually runs, since
+            # GGML_GQH_I8DOT defaults ON. It had no correctness coverage at all, and
+            # not because of the env var: gqh_i8_shape_ok() floors the arm at 16 Mi
+            # of in*rows, and the largest case here is 64*1024 = 64 Ki, i.e. 256x
+            # under the floor. So the arm was unreachable from ctest at ANY setting
+            # of GGML_GQH_I8DOT, which is why a kernel trace of these cases shows
+            # only the f32 arm. GGML_GQH_I8_MINWORK=0 lifts the floor host-side --
+            # it moves no dispatch and no kernel. The arm is NOT bit-exact, so these
+            # cases pass "i8" to select int8-sized tolerances.
+            # gqh2_c is excluded on purpose: it returns before any I8 dispatch and
+            # has no I8 arm, so its bitwise cases above are already complete.
+            if(NOT GQH_RUNG STREQUAL "gqh2_c")
+                foreach(GQH_NVEC 8 13 16)
+                    add_test(NAME test-gqh-backend-i8-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                             COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                     "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" ${GQH_NVEC} i8)
+                    # GGML_GQH_Q8N is deliberately NOT pinned here: it is inherited, so
+                    # `ctest -R gqh` exercises whatever denominator policy the caller
+                    # has set, and the bound in test-gqh-backend follows the EFFECTIVE
+                    # denominator (ggml_gqh_q8_denom_eff), so the case is self-consistent
+                    # and green with the default unset, with GGML_GQH_Q8N=127, and with
+                    # per-grid optimal-s opted in. GQH_TEST_BOUND_N is pinned empty so
+                    # the invoking shell cannot move the bound behind the case -- only
+                    # the negative controls below set it, and they set it on purpose.
+                    set_tests_properties(test-gqh-backend-i8-n${GQH_NVEC}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_MMQ=0;GQH_TEST_BOUND_N=")
+                endforeach()
+                # Per-column scale form. GGML_GQH_I8_XSCALE=0 also turns SB2 off, so
+                # this is the only coverage of the non-SB2 wide kernel.
+                add_test(NAME test-gqh-backend-i8xs0-n16-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 16 i8)
+                set_tests_properties(test-gqh-backend-i8xs0-n16-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_I8_XSCALE=0;GGML_GQH_MMQ=0;GQH_TEST_BOUND_N=")
+                # NEGATIVE CONTROL for the per-grid weight-LUT bound, and the reason
+                # the i8 cases above are a gate rather than a formality.
+                #
+                # BOTH SIDES ARE PINNED EXPLICITLY, and that is the point. The kernel
+                # runs the flat 127 (GGML_GQH_Q8N=127) while the bound is built at the
+                # per-grid derived optimum (GQH_TEST_BOUND_N=derived) -- a bound
+                # TIGHTER than the quantiser actually running can meet, so the case
+                # MUST fail. Neither pin depends on what the shipping default happens
+                # to be, so this control fails identically with GGML_GQH_Q8N unset,
+                # with it set to 127, and with per-grid optimal-s opted in. It used to
+                # pin only the kernel and rely on the harness bound being hardwired to
+                # the derived table; flipping the default to the flat 127 then made 35
+                # ordinary i8 cases fail and left this case passing for a reason that
+                # had nothing to do with the mismatch it is meant to demonstrate.
+                #
+                # Measured slack used at kernel N=127 against a derived-N bound and
+                # the 1.05 allowed:
+                #
+                #   gqh3   1x256  grid 5  1.29    gqh4   1x256  grid 4  1.18
+                #   gqh3   4x512  grid 6  2.37    gqh4   4x512  grid 2  1.22
+                #   gqh3 64x1024  grid 6  2.37    gqh4 64x1024  grid 2  1.31
+                #   gqh2_h 1x256  grid 4 11.15
+                #   gqh2_h 4x512  grid 5 49.56
+                #   gqh2_h 64x1024 grid 5 49.56
+                #
+                # gqh4 1x256 is the narrowest at 1.18 and is why the slack is 1.05
+                # rather than 1.10: at 1.10 that case had 7% of headroom.
+                #
+                # It also proves GQH_TEST_BOUND_N is HONOURED. If the harness ignored
+                # it the bound would follow the kernel, the case would be
+                # self-consistent, it would pass, and WILL_FAIL would turn that into a
+                # ctest failure -- in every one of the three default states.
+                #
+                # And it is still the ONLY thing in the suite that proves the int8 arm
+                # DISPATCHED. If it silently declined, the f32 arm would answer
+                # bit-exactly, every error would be zero, and every tolerance in the
+                # file would pass -- including this bound. It cannot pass here.
+                #
+                # nvec=16 and not 8 on purpose: at nvec=8 the one-hot sweep does not
+                # reach the weight whose level error breaches the tighter bound on
+                # gqh3 1x256, so an 8-wide control would be vacuous on that case.
+                add_test(NAME test-gqh-backend-i8-negctl-boundopt-kern127-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 16 i8)
+                set_tests_properties(test-gqh-backend-i8-negctl-boundopt-kern127-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES WILL_FAIL TRUE
+                               ENVIRONMENT "GGML_GQH_I8DOT=1;GGML_GQH_I8_MINWORK=0;GGML_GQH_MMQ=0;GGML_GQH_Q8N=127;GQH_TEST_BOUND_N=derived")
+            endif()
+            # WIDER THAN THE MATVEC: the MMQ path. Everything above stops at
+            # GQH_MAX_COLS (16) because that is where ggml_cuda_gqh_mul_mat_vec
+            # stops; past it the multiply used to dequantise the whole weight set
+            # to fp16 for cuBLAS, and MMQ is what replaces that. So these are the
+            # only cases that touch it, and the ONLY ones that touch the wide
+            # write-back at all.
+            #
+            # 17 is the first width past the matvec cap and 33 is the first past a
+            # 32-wide tile, so both leave a partial tile and run the j_max bound
+            # that 64 (and cols itself, always a multiple of the granularity)
+            # never does. Each case also asserts MMQ actually DISPATCHED -- the
+            # tolerances are looser than the dequant fallback's error, so without
+            # that assert a silent decline would read as a pass.
+            #
+            # GGML_GQH_MMQ=1 is pinned explicitly rather than inherited: MMQ is
+            # on by default now, but these cases assert MMQ DISPATCHED, so they
+            # must not silently become no-ops if the default is ever flipped
+            # back. The dequant route stays the reference they are verified
+            # against. GGML_GQH_I8DOT=0 keeps the narrow fused arm in the same
+            # run bit-exact.
+            if(GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4")
+                foreach(GQH_MMQN 17 33 64)
+                    add_test(NAME test-gqh-backend-mmq${GQH_MMQN}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                             COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                     "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32"
+                                     8 mmq${GQH_MMQN})
+                    set_tests_properties(test-gqh-backend-mmq${GQH_MMQN}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+                endforeach()
+            endif()
+            # THE INT8 RANGE GUARD. MMQ quantises the GRID, and int8 spans 127:1, so
+            # a wider grid loses its innermost levels -- gqh4 codes 10 and 11 round
+            # two of their sixteen to exactly zero. ggml_cuda_gqh_mmq_info refuses
+            # those. Nothing real trips it: the shipping artifact uses gqh3 {3,4} and
+            # gqh4 {2,3,4}, and no vector file is wider either. So the guard had no
+            # coverage at all, on the one code path whose failure is a silently wrong
+            # answer rather than a crash.
+            #
+            # "gridN" forces the code and decodes the reference on the host for it,
+            # which is what makes these reachable. The pairs straddle the threshold
+            # exactly: gqh4 grid 7 is 112.84:1 and must be ACCEPTED, grid 8 is
+            # 164.69:1 and must be REFUSED. grid 11 (512:1) is the collapse case.
+            # gqh3 grid 11 is 64:1 -- its widest -- and must be accepted, so the
+            # guard is shown not to over-refuse either.
+            #
+            # "refuse" makes the answer bitwise-checked against the fp16-rounded
+            # reference, which only the dequant fallback can produce. A guard that
+            # let the grid through returns int8-perturbed values and fails loudly.
+            if(GQH_ROWS GREATER 1)
+                if(GQH_RUNG STREQUAL "gqh4")
+                    set(GQH_GUARD_GRIDS 7 8 11)
+                elseif(GQH_RUNG STREQUAL "gqh3")
+                    set(GQH_GUARD_GRIDS 11)
+                else()
+                    set(GQH_GUARD_GRIDS "")
+                endif()
+                foreach(GQH_GRID ${GQH_GUARD_GRIDS})
+                    # Accepted iff the grid fits int8's 127:1. gqh4 crosses between
+                    # code 7 (112.84:1) and code 8 (164.69:1); every gqh3 grid fits,
+                    # its widest being code 11 at 64:1.
+                    if(GQH_RUNG STREQUAL "gqh4" AND GQH_GRID GREATER_EQUAL 8)
+                        set(GQH_VERDICT refuse)
+                    else()
+                        set(GQH_VERDICT accept)
+                    endif()
+                    set(GQH_GUARD_ARGS 8 mmq33 grid${GQH_GRID})
+                    if(GQH_VERDICT STREQUAL "refuse")
+                        list(APPEND GQH_GUARD_ARGS refuse)
+                    endif()
+                    set(GQH_GUARD_NAME test-gqh-backend-guard-${GQH_VERDICT}${GQH_GRID}-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS})
+                    add_test(NAME ${GQH_GUARD_NAME}
+                             COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                     "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32"
+                                     ${GQH_GUARD_ARGS})
+                    set_tests_properties(${GQH_GUARD_NAME}
+                        PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+                endforeach()
+            endif()
+            # THE WIDTH GATE. MMQ wins narrow and loses wide for GQH (see
+            # gqh_mmq_max_ne11 in mmq.cu for the measured crossover), so dispatch
+            # is width-bounded -- and a gate that never declines is
+            # indistinguishable from no gate. These cases assert both sides of it
+            # using the launch counter, on the only shape wide enough to straddle
+            # the default bound.
+            #
+            # in512/out513 PIN THE THRESHOLD to exactly 512, the default: one
+            # requires MMQ at 512, the other requires it to decline at 513. Move
+            # the default in either direction and one of them fails. They also
+            # prove the comparison is <= rather than <.
+            #
+            # These need a vector wide enough to straddle the default, because
+            # the probe width must satisfy nwide <= cols. At the old default of
+            # 160 that was every shape here; at 512 only 64x1024 qualifies, so
+            # the pair registers on that shape alone. Per-shape coverage of the
+            # gate MECHANISM is not lost -- knob-in64/knob-out65 below still run
+            # on all three shapes, under their own width condition, pinning the
+            # knob low enough for any of them to straddle it.
+            #
+            # knob-in64/knob-out65 do the same for GGML_GQH_MMQ_MAX_NE11, so the
+            # override is covered independently of whatever the compiled default
+            # happens to be.
+            if(GQH_COLS GREATER 513 AND (GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4"))
+                add_test(NAME test-gqh-backend-gate-in512-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq512)
+                set_tests_properties(test-gqh-backend-gate-in512-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+                add_test(NAME test-gqh-backend-gate-out513-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq513 refuse)
+                set_tests_properties(test-gqh-backend-gate-out513-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1")
+            endif()
+            # The knob pair gets its OWN width condition, deliberately. It pins
+            # GGML_GQH_MMQ_MAX_NE11=64, so it only needs a vector wide enough to
+            # straddle 64 -- which every shape here is. Sharing the in/out pair's
+            # condition would tie per-shape coverage of the gate mechanism to
+            # whatever the compiled default happens to be, and raising that
+            # default from 160 to 512 would then have silently dropped these from
+            # three shapes to one.
+            if(GQH_COLS GREATER 65 AND (GQH_RUNG STREQUAL "gqh3" OR GQH_RUNG STREQUAL "gqh4"))
+                add_test(NAME test-gqh-backend-gate-knob-in64-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq64)
+                set_tests_properties(test-gqh-backend-gate-knob-in64-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1;GGML_GQH_MMQ_MAX_NE11=64")
+                add_test(NAME test-gqh-backend-gate-knob-out65-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                         COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                                 "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8 mmq65 refuse)
+                set_tests_properties(test-gqh-backend-gate-knob-out65-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                    PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=1;GGML_GQH_MMQ_MAX_NE11=64")
+            endif()
             # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
+            # GGML_GQH_MMQ=0 is pinned on every case above that asserts the DEQUANT
+            # result, because ctest's ENVIRONMENT adds to the ambient environment
+            # rather than replacing it: with GGML_GQH_MMQ=1 exported, 42 of these
+            # silently moved their wide node onto MMQ while still demanding
+            # fp16-bitwise dequant output. gqh_wide_measure.sh exports exactly that
+            # when the search runs with MMQ on, so an unpinned gate reports a false
+            # failure and the loop cannot tell it from a real one.
             set_tests_properties(test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
-                PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
+                PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0;GGML_GQH_MMQ=0")
         endforeach()
     endif()
 

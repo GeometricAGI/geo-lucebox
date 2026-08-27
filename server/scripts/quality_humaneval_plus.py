@@ -57,7 +57,7 @@ CONFIGS = {
     },
 }
 
-PORT     = 8765
+PORT     = int(os.environ.get("PFLASH_PORT", "8765"))
 TARGET   = os.environ.get("PFLASH_TARGET", "/home/peppi/models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf")
 DRAFT    = os.environ.get("PFLASH_DRAFT",  "/home/peppi/models/qwen3.6-27b-dflash/model.safetensors")
 SERVER_BIN = os.environ.get("DFLASH_SERVER_BIN", str(PROJECT_ROOT / "dflash/build/dflash_server"))
@@ -148,8 +148,21 @@ def extract_completion(reply: str, entry_point: str, prompt: str) -> str:
       4. On failure, return ``    pass  # empty`` so grading just fails the
          task instead of crashing.
     """
-    fences = re.findall(r"```(?:python)?\s*\n(.*?)```", reply, re.DOTALL)
-    code = fences[-1] if fences else reply
+    # The final fence is often never closed -- the model runs to its token cap
+    # mid-block. The old pattern required a CLOSING ```, so those replies matched
+    # nothing, `code` fell back to the whole reply, and the literal ```python line
+    # reached the grader as source: SyntaxError on line 1, scored as a failure.
+    # 12 of 164 items took that path, costing ~1 item per reading. `\Z` lets the
+    # last block run to end-of-reply; the pattern stays non-greedy so a properly
+    # closed block still stops at its fence.
+    blocks = re.findall(r"```(?:[A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)(?:```|\Z)",
+                        reply, re.DOTALL)
+    code = blocks[-1] if blocks else reply
+    # Belt and braces: no residual fence line may reach the grader.
+    code = "\n".join(
+        l for l in code.split("\n")
+        if l.strip().rstrip("`") == "" or not l.strip().startswith("```")
+    )
 
     # If the code defines our entry function, grade that whole script
     # by *replacing* the prompt with the model's full implementation.
@@ -192,6 +205,17 @@ def generate(name, cfg, tasks, samples_path):
                         "messages": [{"role": "user", "content": user_msg}],
                         "max_tokens": MAX_TOKENS,
                         "stream": False,
+                        # This harness reports its result as "greedy", but it never
+                        # asked for greedy: with no temperature in the payload the
+                        # server falls back to the model card's sampling defaults.
+                        # Two runs of the SAME config then agreed on only 16.5% of
+                        # replies, and 30 of 164 items flipped verdict between them
+                        # -- wider than any effect this instrument gets used to
+                        # measure, and the reason an n=1 pass@1 from it means very
+                        # little. top_k is pinned too so the choice is argmax
+                        # regardless of how temperature 0 is handled downstream.
+                        "temperature": 0,
+                        "top_k": 1,
                         "chat_template_kwargs": {"enable_thinking": False},
                     })
                     err = None

@@ -59,9 +59,9 @@ bool ggml_cuda_gqh_mul_mat_vec(
 
 // One dispatch for two same-rung, same-shape GQH GEMVs that share `x`
 // (FFN gate/up). Writes both y buffers; the caller still runs SwiGLU.
-// ncols 1..12: batch-1 decode and DFlash2 verify (block 8, optional 12).
-// Launch geometry matches the unpaired arm (GQH3 N=1 uses GQH_MATVEC_ROWS;
-// N=2..8 uses GQH_MULTICOL_ROWS; N=9..12 uses ROWS=1).
+// ncols 1..16: batch-1 decode and DFlash2 verify (block 8, or 9..16 with
+// --draft-block-size). Launch geometry matches the unpaired arm (GQH3 N=1 uses
+// GQH_MATVEC_ROWS; N=2..8 uses GQH_MULTICOL_ROWS; N=9..16 uses ROWS=1).
 bool ggml_cuda_gqh_mul_mat_vec_pair(
         ggml_type type,
         const void * vx_a, float * y_a, const void * vx_b, float * y_b,
@@ -79,6 +79,66 @@ bool ggml_cuda_gqh_glu_quant(
         const float * gate, const float * up, float * glu, int nc, int ncols,
         int64_t gate_col_stride, int64_t up_col_stride, int64_t glu_col_stride,
         cudaStream_t stream);
+
+// common.cuh hard-codes qk = 256 for these rungs rather than including
+// gqh-tables.h (see the GQH traits comment there). Pin the two together here,
+// where both headers are in scope.
+static_assert(ggml_cuda_type_traits<GGML_TYPE_GQH3>::qk   == GQH_SUPERBLOCK, "GQH3 qk");
+static_assert(ggml_cuda_type_traits<GGML_TYPE_GQH2_H>::qk == GQH_SUPERBLOCK, "GQH2_H qk");
+static_assert(ggml_cuda_type_traits<GGML_TYPE_GQH2_C>::qk == GQH_SUPERBLOCK, "GQH2_C qk");
+static_assert(ggml_cuda_type_traits<GGML_TYPE_GQH4>::qk   == GQH_SUPERBLOCK, "GQH4 qk");
+
+// ---- MMQ (batched quantised matmul) side data ----------------------------
+// PREFILL used to dequantise the whole weight set to fp16 and hand it to cuBLAS,
+// a fixed per-request cost proportional to the ARTIFACT, not the prompt. MMQ
+// instead reads the wire bytes into LDS tiles and dots them against int8
+// activations, so nothing is materialised.
+//
+// The bridge is that a GQH code indexes a CURVED grid, while MMQ's tile is int8.
+// Quantising the GRID rather than the weights carries that: grid amax is exactly
+// 1.0 for every gqh4/gqh3/gqh2_h grid, so a level becomes round(level*127) and
+// the tile's float scale absorbs 1/127 along with the per-tensor scale. The grid
+// is 4-16 floats resolved once at graph time, so it travels by value in the
+// kernarg struct instead of through a device lookup -- which is what the
+// by-value gqh_grid8/gqh_grid16 note at the top of gqh.cu anticipated.
+//
+// int8 cannot hold EVERY grid: past roughly 127:1 dynamic range the innermost
+// levels lose resolution, and by gqh4 codes 10/11 two of the sixteen round to
+// zero outright, which is silent and severe. ggml_cuda_gqh_mmq_info refuses
+// those and the caller keeps the dequant path.
+//
+// The MMQ tile struct itself lives in mmq.cuh next to the other tile-side data
+// (cf. rocmfp3_mix_mmq_lut), so this interface is primitive-typed: `lut` takes
+// the four packed int8 words, `dscale` the tile-scale prefactor.
+bool ggml_cuda_gqh_mmq_info(ggml_type type, const void * vx, int lut[4], float * dscale);
+
+// True for the rungs that HAVE an MMQ path compiled. gqh2_c is absent by design:
+// it carries no per-tensor header and its own in-block fp16 scale, so it needs a
+// different loader than the three header-bearing rungs share.
+bool ggml_cuda_gqh_mmq_type(ggml_type type);
+
+// ON by default; GGML_GQH_MMQ=0 opts back out. It stays the same-binary A/B
+// switch the other GQH and mix hooks use (GGML_GQH_FUSED, DFLASH_MIX_FUSED,
+// LUCE_MMQ_BIG_PREFILL), because the dequant->cuBLAS route is still the
+// reference every MMQ case is verified against.
+//
+// The default flipped on measured evidence, not on the path being finished.
+// Dispatch is width-gated (gqh_mmq_max_ne11 in mmq.cu), so MMQ now runs only
+// where it wins; ungated it costs ~7% of prefill. On-vs-off, order-balanced to
+// cancel a run-order thermal drift worth ~1%: prefill +1.0%, decode +1.1%, with
+// an IQ4_XS control flat to 0.3% and provably inert (its ne11 census records no
+// GQH mul_mat at all).
+//
+// Enabling it DOES change generated tokens -- MMQ is int8 where the dequant path
+// is fp16, and the ragged sub-chunk prefill widths take MMQ. On HumanEval+ at
+// greedy that changed 12 of 164 completions textually and 0 of 164 verdicts:
+// pass@1 145/164 in both arms, the identical pass SET item for item, reproduced
+// twice per arm on an instrument whose same-arm churn is 0.
+bool ggml_cuda_gqh_mmq_enabled(void);
+
+// Whether this specific tensor may take MMQ: registered, an MMQ rung, an int8
+// representable grid, and 2-D (there is no expert-batched arm yet).
+bool ggml_cuda_gqh_mmq_eligible(const ggml_tensor * src0);
 
 // Registry-aware converters for ggml_get_to_fp16_cuda / ggml_get_to_fp32_cuda.
 // The per-tensor header comes from the shared ggml-base registry (ggml_gqh_lookup),

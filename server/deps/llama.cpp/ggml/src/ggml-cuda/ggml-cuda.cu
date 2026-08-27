@@ -2890,6 +2890,69 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     return false;
 }
 
+// ---- GQH ne11 census (diagnostic, env-gated) --------------------------------
+// The MMQ width gate (gqh_mmq_max_ne11 in mmq.cu) is justified by the KERNEL
+// crossover curve. That is only half a justification: it says where MMQ stops
+// paying, not whether the workload ever goes there. This answers the other half
+// by counting the ne11 a real run actually dispatches for GQH weights.
+//
+// "calls" is every GQH mul_mat. "past_matvec" is those that got past
+// ggml_cuda_gqh_mul_mat_vec -- the only ones the gate can possibly affect, since
+// the matvec owns 1..GQH_MAX_COLS and returns before the gate is ever read.
+// Set GGML_GQH_NE11_LOG=1; the table goes to stderr at process exit.
+#define GQH_NE11_CENSUS_MAX 8192
+static std::atomic<uint64_t> gqh_ne11_seen[GQH_NE11_CENSUS_MAX + 2];
+static std::atomic<uint64_t> gqh_ne11_wide[GQH_NE11_CENSUS_MAX + 2];
+
+static void gqh_ne11_census_dump() {
+    uint64_t tot = 0, totw = 0;
+    for (int i = 0; i < GQH_NE11_CENSUS_MAX + 2; ++i) {
+        tot  += gqh_ne11_seen[i].load(std::memory_order_relaxed);
+        totw += gqh_ne11_wide[i].load(std::memory_order_relaxed);
+    }
+    if (tot == 0) {
+        fprintf(stderr, "=== GQH ne11 census: no GQH mul_mat calls ===\n");
+        return;
+    }
+    fprintf(stderr, "=== GQH ne11 census: %llu GQH mul_mat calls, %llu past the matvec ===\n",
+            (unsigned long long) tot, (unsigned long long) totw);
+    fprintf(stderr, "CENSUS %8s %14s %14s\n", "ne11", "calls", "past_matvec");
+    for (int i = 0; i < GQH_NE11_CENSUS_MAX + 2; ++i) {
+        const uint64_t c = gqh_ne11_seen[i].load(std::memory_order_relaxed);
+        const uint64_t w = gqh_ne11_wide[i].load(std::memory_order_relaxed);
+        if (!c && !w) continue;
+        if (i == GQH_NE11_CENSUS_MAX + 1) {
+            fprintf(stderr, "CENSUS  >%7d %14llu %14llu\n", GQH_NE11_CENSUS_MAX,
+                    (unsigned long long) c, (unsigned long long) w);
+        } else {
+            fprintf(stderr, "CENSUS %8d %14llu %14llu\n", i,
+                    (unsigned long long) c, (unsigned long long) w);
+        }
+    }
+    fflush(stderr);
+}
+
+static bool gqh_ne11_census_on() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_GQH_NE11_LOG");
+        const bool v = e && atoi(e) != 0;
+        if (v) { atexit(gqh_ne11_census_dump); }
+        return v;
+    }();
+    return on;
+}
+
+static void gqh_ne11_census_note(int64_t ne11, std::atomic<uint64_t> * tab) {
+    const int idx = (ne11 >= 0 && ne11 <= GQH_NE11_CENSUS_MAX)
+                  ? (int) ne11 : GQH_NE11_CENSUS_MAX + 1;
+    tab[idx].fetch_add(1, std::memory_order_relaxed);
+}
+
+static bool gqh_census_type(enum ggml_type t) {
+    return t == GGML_TYPE_GQH3 || t == GGML_TYPE_GQH4
+        || t == GGML_TYPE_GQH2_H || t == GGML_TYPE_GQH2_C;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
     const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
@@ -2963,6 +3026,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const int cc            = ggml_cuda_info().devices[id].cc;
             const int warp_size     = ggml_cuda_info().devices[id].warp_size;
             use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        // GQH carries per-tensor state (scale + grid code) out of band, so MMQ
+        // eligibility is a property of the TENSOR, not just the type:
+        // should_use_mmq's signature cannot see an unregistered tensor or a grid
+        // outside int8's range. Declining here keeps the dequant fallback.
+        use_mul_mat_q           = use_mul_mat_q             && (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0));
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -2971,6 +3039,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
         const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
         use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        // GQH carries per-tensor state (scale + grid code) out of band, so MMQ
+        // eligibility is a property of the TENSOR, not just the type:
+        // should_use_mmq's signature cannot see an unregistered tensor or a grid
+        // outside int8's range. Declining here keeps the dequant fallback.
+        use_mul_mat_q           = use_mul_mat_q             && (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0));
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -3015,6 +3088,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const char * e = getenv("GGML_GQH_FUSED");
         return e ? atoi(e) != 0 : true;
     }();
+    if (gqh_ne11_census_on() && gqh_census_type(src0->type)) {
+        gqh_ne11_census_note(src1->ne[1], gqh_ne11_seen);
+    }
     if (gqh_fused_on && !split
             && (src0->type == GGML_TYPE_GQH3 || src0->type == GGML_TYPE_GQH2_H
                 || src0->type == GGML_TYPE_GQH2_C || src0->type == GGML_TYPE_GQH4)
@@ -3027,6 +3103,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                    (int64_t) (src1->nb[1] / sizeof(float)),
                    (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
         return;
+    }
+    if (gqh_ne11_census_on() && gqh_census_type(src0->type)) {
+        gqh_ne11_census_note(src1->ne[1], gqh_ne11_wide);
     }
     if (mix_fused_on && is_rocmfp3_mix && !split
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
@@ -3210,7 +3289,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02) &&
+            (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0))) {
             log_dispatch("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -4003,7 +4083,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 node->ne[2] <= mmvq_mmid_max;
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
                 ggml_cuda_should_use_mmq(node->src[0]->type, cc,
-                                         node->src[1]->ne[2], node->src[0]->ne[2]);
+                                         node->src[1]->ne[2], node->src[0]->ne[2]) &&
+                (!ggml_cuda_gqh_mmq_type(node->src[0]->type) ||
+                 ggml_cuda_gqh_mmq_eligible(node->src[0]));
             // qtype-105 takes the stream-sync-free MoE path above (no host
             // synchronize), so it is safe to capture. Mirror that path's gate
             // exactly, incl. the registry check, so we never skip-disable while
