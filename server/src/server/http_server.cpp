@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "engine/luce_engine.h"
 #include "admission.h"
 #include "common/concurrency/seq_engine.h"
 #include "response_error.h"
@@ -1226,10 +1227,11 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
-HttpServer::HttpServer(ModelBackend & backend,
+HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
-    : backend_(backend)
+    : engine_(engine)
+    , backend_(engine.backend())
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
@@ -1240,7 +1242,7 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
-                   config.disk_cache_cold_max_tokens}, backend)
+                   config.disk_cache_cold_max_tokens}, backend_)
 {
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1444,9 +1446,7 @@ void HttpServer::shutdown() {
         socket_close(listen_fd_);
         listen_fd_ = kInvalidSocket;
     }
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
+    engine_.stop_serving();
 
     // Close SSE client connections.
     {
@@ -1484,17 +1484,25 @@ void HttpServer::shutdown() {
     }
 }
 
-void HttpServer::start_worker() {
-    // A backend-provided sequence engine replaces the one-request worker
-    // with the concurrent scheduler. Upstream forwarding stays on the
-    // classic path even when the local backend exposes an engine.
-    if (SeqEngine * engine = backend_.seq_engine();
-        engine && config_.pflash_upstream_base.empty()) {
-        worker_thread_ =
-            std::thread([this, engine]() { scheduler_loop(*engine); });
-    } else {
-        worker_thread_ = std::thread([this]() { worker_loop(); });
+bool HttpServer::start_worker() {
+    // LuceEngine owns the serving thread: a backend-provided sequence engine
+    // replaces the one-request worker with the concurrent scheduler.
+    // Upstream forwarding stays on the classic path even when the local
+    // backend exposes an engine.
+    dflash::engine::LuceEngine::ServingLoops loops;
+    loops.serial = [this]() { worker_loop(); };
+    loops.concurrent =
+        [this](SeqEngine & engine) { scheduler_loop(engine); };
+    loops.request_stop = [this]() {
+        request_stop();
+        queue_cv_.notify_all();
+    };
+    if (!engine_.start_serving(
+            std::move(loops), config_.pflash_upstream_base.empty())) {
+        std::fprintf(stderr, "[server] failed to start LuceEngine\n");
+        return false;
     }
+    return true;
 }
 
 int HttpServer::run(const std::vector<HttpServer *> & models) {
@@ -1508,7 +1516,7 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         for (HttpServer * model : models) {
             SeqEngine * engine = model ? model->backend_.seq_engine() : nullptr;
             if (!model || (engine && engine->slot_count() < 1) ||
-                model->worker_thread_.joinable() ||
+                model->engine_.is_serving() ||
                 !model->config_.pflash_upstream_base.empty() ||
                 model->config_.model_name.empty() || model->config_.model_name == "auto" ||
                 !names.insert(model->config_.model_name).second ||
@@ -1592,9 +1600,15 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
                  config_.host.c_str(), config_.port);
 
     if (models_.empty()) {
-        start_worker();
+        if (!start_worker()) return 1;
     } else {
-        for (auto & model : models_) model.server->start_worker();
+        for (size_t i = 0; i < models_.size(); ++i) {
+            if (!models_[i].server->start_worker()) {
+                for (size_t j = 0; j < i; ++j)
+                    models_[j].server->engine_.stop_serving();
+                return 1;
+            }
+        }
     }
 
     // Accept loop.
@@ -1642,10 +1656,8 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
     routing_cv_.notify_all();
     stop_worker(this);
     for (auto & model : models_) stop_worker(model.server);
-    if (worker_thread_.joinable()) worker_thread_.join();
-    for (auto & model : models_) {
-        if (model.server->worker_thread_.joinable()) model.server->worker_thread_.join();
-    }
+    engine_.stop_serving();
+    for (auto & model : models_) model.server->engine_.stop_serving();
 
     // Every handler borrows a model context. Do not destroy those contexts
     // after an arbitrary grace period. Reads poll stopping_; workers have
@@ -3991,8 +4003,8 @@ void HttpServer::remember_agent_turn(
     }
 }
 
-// Generation setup owns backing storage for every pointer placed in
-// GenerateRequest, keeping those pointers valid through the decode call.
+// Populate model-ready input. GenerateRequest owns every retained token
+// sequence, eliminating pointer lifetime coupling to GenerationInputs.
 void HttpServer::prepare_generation_inputs(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         GenerationInputs & inputs) {
@@ -4028,8 +4040,7 @@ void HttpServer::prepare_generation_inputs(
         ToolHintGenerator hint_generator(tokenizer_);
         auto hint = hint_generator.build_hint(req.tools, req.tool_choice);
         if (!hint.empty()) {
-            inputs.hint_tokens = std::move(hint.prefix_tokens);
-            inputs.request.hint_tokens = &inputs.hint_tokens;
+            inputs.request.hint_tokens = std::move(hint.prefix_tokens);
         }
     }
 
@@ -4037,9 +4048,9 @@ void HttpServer::prepare_generation_inputs(
         return;
     }
 
-    inputs.stall_tool_prefix_tokens = tokenizer_.encode(
+    inputs.request.stall_tool_prefix_tokens = tokenizer_.encode(
         build_stall_tool_prefix(req.tools, req.tool_choice));
-    inputs.stall_action_suffix_tokens = tokenizer_.encode(":");
+    inputs.request.stall_action_suffix_tokens = tokenizer_.encode(":");
 
     // The detector matches recent terminal tokens, not the full action
     // prefix. Collect the final token for common colon spellings.
@@ -4047,22 +4058,17 @@ void HttpServer::prepare_generation_inputs(
         const auto ids = tokenizer_.encode(text);
         if (ids.empty()) return;
         const int32_t token = ids.back();
-        if (std::find(inputs.stall_action_suffix_tokens.begin(),
-                      inputs.stall_action_suffix_tokens.end(), token) ==
-            inputs.stall_action_suffix_tokens.end()) {
-            inputs.stall_action_suffix_tokens.push_back(token);
+        if (std::find(inputs.request.stall_action_suffix_tokens.begin(),
+                      inputs.request.stall_action_suffix_tokens.end(), token) ==
+            inputs.request.stall_action_suffix_tokens.end()) {
+            inputs.request.stall_action_suffix_tokens.push_back(token);
         }
     };
     add_suffix_terminal("`:");
     add_suffix_terminal("):");
     add_suffix_terminal("\":");
 
-    inputs.stall_skip_tokens = tokenizer_.encode(" done");
-    inputs.request.stall_tool_prefix_tokens =
-        &inputs.stall_tool_prefix_tokens;
-    inputs.request.stall_action_suffix_tokens =
-        &inputs.stall_action_suffix_tokens;
-    inputs.request.stall_skip_tokens = &inputs.stall_skip_tokens;
+    inputs.request.stall_skip_tokens = tokenizer_.encode(" done");
 }
 
 void HttpServer::configure_generation_io(

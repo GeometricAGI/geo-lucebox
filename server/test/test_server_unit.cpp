@@ -20,6 +20,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/sampler.h"
@@ -81,6 +82,7 @@
 
 using json = nlohmann::json;
 using namespace dflash::common;
+using dflash::engine::LuceEngine;
 namespace fs = std::filesystem;
 
 static fs::path test_tmp_path(const char * name) {
@@ -5138,10 +5140,12 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    ShortInlineSnapshotBackend backend;
+    auto backend_owner = std::make_unique<ShortInlineSnapshotBackend>();
+    ShortInlineSnapshotBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.prefix_cache_cap = 2;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     const std::vector<int32_t> prompt = {1, 100, 3, 101};
     auto reservation = cache.reserve_inline_snap(
@@ -5323,8 +5327,10 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
     backend.engine.defer_restore.store(true, std::memory_order_relaxed);
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5332,7 +5338,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
@@ -5397,8 +5403,10 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
     backend.engine.malformed_restore.store(true, std::memory_order_relaxed);
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5406,7 +5414,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
@@ -5455,8 +5463,10 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
     backend.engine.unrequested_restore.store(true, std::memory_order_relaxed);
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5464,7 +5474,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
@@ -5509,7 +5519,9 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5517,7 +5529,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
