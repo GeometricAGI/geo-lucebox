@@ -359,7 +359,7 @@ struct DeepSeek4Head4Tail2Routes {
 // ─── Configuration ──────────────────────────────────────────────────────
 
 struct DeepSeek4BackendConfig {
-    const char * model_path   = nullptr;
+    std::string  model_path;
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
