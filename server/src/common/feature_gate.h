@@ -69,7 +69,6 @@ std::string check_feature_compatibility(
 // configuration has no useful warnings to report.
 std::vector<std::string> collect_feature_warnings(
     const BackendArgs & args,
-    const BackendAdmissionContext & admission,
     const std::string & arch);
 
 }  // namespace dflash::common

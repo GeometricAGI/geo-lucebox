@@ -45,8 +45,8 @@ struct BackendAdmissionContext {
     }
 };
 
-// A superset of all per-architecture config fields. The factory reads only
-// those relevant to the resolved architecture; unused fields are ignored.
+// A superset of all per-architecture config fields. Preparation projects only
+// the effective fields into BackendPlan's concern-specific snapshots.
 struct BackendArgs {
     // Required
     std::string model_path;  // target .gguf

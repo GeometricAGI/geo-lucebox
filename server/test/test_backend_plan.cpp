@@ -26,12 +26,22 @@ struct CanCreateBackend<
     std::void_t<decltype(create_backend(std::declval<T>()))>>
     : std::true_type {};
 
+template <typename T, typename = void>
+struct HasFlatArgsView : std::false_type {};
+
+template <typename T>
+struct HasFlatArgsView<
+    T,
+    std::void_t<decltype(std::declval<const T &>().args())>>
+    : std::true_type {};
+
 static_assert(CanCreateBackend<BackendPlan>::value);
 static_assert(CanCreateBackend<const BackendPlan &>::value);
 static_assert(!CanCreateBackend<BackendArgs>::value);
 static_assert(std::is_same_v<
     decltype(create_backend(std::declval<const BackendPlan &>())),
     std::unique_ptr<ModelBackend>>);
+static_assert(!HasFlatArgsView<BackendPlan>::value);
 static_assert(std::is_move_constructible_v<BackendPlan>);
 static_assert(!std::is_move_assignable_v<BackendPlan>);
 
@@ -64,6 +74,9 @@ void test_plan_owns_the_effective_request() {
     BackendArgs args = plain_args();
     args.model_path = target;
     args.draft_path = draft;
+    args.device.gpu = 3;
+    args.fa_window = 128;
+    args.chunk = 256;
 
     BackendPreparation result = resolve(std::move(args), "qwen35");
     CHECK(std::holds_alternative<BackendPlan>(result));
@@ -71,8 +84,12 @@ void test_plan_owns_the_effective_request() {
 
     target.assign("changed");
     draft.assign("changed");
-    CHECK(plan.args().model_path == "/models/target.gguf");
-    CHECK(plan.args().draft_path == "/models/draft.gguf");
+    CHECK(plan.model().path == "/models/target.gguf");
+    CHECK(plan.model().metadata.name == "test-model");
+    CHECK(plan.speculation().draft_path == "/models/draft.gguf");
+    CHECK(plan.placement().target.gpu == 3);
+    CHECK(plan.cache().fa_window == 128);
+    CHECK(plan.execution().chunk == 256);
     CHECK(plan.arch() == "qwen35");
 }
 
@@ -84,10 +101,21 @@ void test_supported_specla_selects_ddtree() {
     BackendPreparation result = resolve(std::move(args), "qwen35");
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(plan.args().specla_mode);
-    CHECK(plan.args().ddtree_mode);
-    CHECK(plan.args().ddtree_tau == 6.0f);
+    CHECK(plan.speculation().specla_mode);
+    CHECK(plan.speculation().ddtree_mode);
+    CHECK(plan.speculation().ddtree_tau == 6.0f);
     CHECK(plan.warnings().empty());
+}
+
+void test_deepseek_options_have_an_explicit_group() {
+    BackendArgs args = plain_args();
+    args.ds4_expert_top_k = 4;
+
+    BackendPreparation result = resolve(std::move(args), "deepseek4");
+    CHECK(std::holds_alternative<BackendPlan>(result));
+    const BackendPlan & plan = std::get<BackendPlan>(result);
+    CHECK(plan.deepseek4().expert_top_k == 4);
+    CHECK(plan.execution().chunk == 512);
 }
 
 void test_explicit_specla_tau_is_preserved() {
@@ -100,9 +128,9 @@ void test_explicit_specla_tau_is_preserved() {
     BackendPreparation result = resolve(std::move(args), "qwen35");
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(plan.args().specla_mode);
-    CHECK(plan.args().ddtree_mode);
-    CHECK(plan.args().ddtree_tau == 2.5f);
+    CHECK(plan.speculation().specla_mode);
+    CHECK(plan.speculation().ddtree_mode);
+    CHECK(plan.speculation().ddtree_tau == 2.5f);
 }
 
 void test_kvflash_falls_back_to_ordinary_ddtree() {
@@ -116,9 +144,9 @@ void test_kvflash_falls_back_to_ordinary_ddtree() {
         resolve(std::move(args), "qwen35", admission);
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(!plan.args().specla_mode);
-    CHECK(plan.args().ddtree_mode);
-    CHECK(std::isinf(plan.args().ddtree_tau));
+    CHECK(!plan.speculation().specla_mode);
+    CHECK(plan.speculation().ddtree_mode);
+    CHECK(std::isinf(plan.speculation().ddtree_tau));
     CHECK(plan.warnings().size() == 1);
 }
 
@@ -135,9 +163,9 @@ void test_kvflash_fallback_preserves_explicit_tau() {
         resolve(std::move(args), "qwen35", admission);
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(!plan.args().specla_mode);
-    CHECK(plan.args().ddtree_mode);
-    CHECK(plan.args().ddtree_tau == 2.5f);
+    CHECK(!plan.speculation().specla_mode);
+    CHECK(plan.speculation().ddtree_mode);
+    CHECK(plan.speculation().ddtree_tau == 2.5f);
 }
 
 void test_unsupported_specla_falls_back_without_hidden_tau() {
@@ -147,9 +175,25 @@ void test_unsupported_specla_falls_back_without_hidden_tau() {
     BackendPreparation result = resolve(std::move(args), "qwen3");
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(!plan.args().specla_mode);
-    CHECK(!plan.args().ddtree_mode);
-    CHECK(std::isinf(plan.args().ddtree_tau));
+    CHECK(!plan.speculation().specla_mode);
+    CHECK(!plan.speculation().ddtree_mode);
+    CHECK(std::isinf(plan.speculation().ddtree_tau));
+    CHECK(plan.warnings().size() == 1);
+}
+
+void test_unsupported_specla_preserves_explicit_ddtree_options() {
+    BackendArgs args = plain_args();
+    args.specla_mode = true;
+    args.ddtree_mode = true;
+    args.ddtree_tau = 2.5f;
+    args.ddtree_tau_explicit = true;
+
+    BackendPreparation result = resolve(std::move(args), "qwen35moe");
+    CHECK(std::holds_alternative<BackendPlan>(result));
+    const BackendPlan & plan = std::get<BackendPlan>(result);
+    CHECK(!plan.speculation().specla_mode);
+    CHECK(plan.speculation().ddtree_mode);
+    CHECK(plan.speculation().ddtree_tau == 2.5f);
     CHECK(plan.warnings().size() == 1);
 }
 
@@ -171,10 +215,12 @@ void test_supported_specla_requires_a_draft() {
 
 TEST_CASE(BackendPlanFixture, backend_plan_suite) {
     test_plan_owns_the_effective_request();
+    test_deepseek_options_have_an_explicit_group();
     test_supported_specla_selects_ddtree();
     test_explicit_specla_tau_is_preserved();
     test_kvflash_falls_back_to_ordinary_ddtree();
     test_kvflash_fallback_preserves_explicit_tau();
     test_unsupported_specla_falls_back_without_hidden_tau();
+    test_unsupported_specla_preserves_explicit_ddtree_options();
     test_supported_specla_requires_a_draft();
 }

@@ -152,26 +152,32 @@ static_assert(std::is_same_v<
     decltype(DeepSeek4LayerSplitAdapterConfig{}.target_path), std::string>);
 
 std::unique_ptr<ModelBackend> construct_backend(
-    const BackendArgs & args,
-    const std::string & arch) {
+    const BackendPlan & plan) {
+    const BackendPlan::Model & model = plan.model();
+    const BackendPlan::Placement & placement = plan.placement();
+    const BackendPlan::Cache & cache = plan.cache();
+    const BackendPlan::Speculation & speculation = plan.speculation();
+    const BackendPlan::Execution & execution = plan.execution();
+    const BackendPlan::DeepSeek4 & deepseek4 = plan.deepseek4();
+    const std::string & arch = plan.arch();
     if (arch == "qwen35") {
-        if (args.device.is_layer_split()) {
+        if (placement.target.is_layer_split()) {
             Qwen35LayerSplitAdapterConfig cfg;
-            cfg.target_path        = args.model_path;
-            cfg.draft_path         = args.draft_path;
-            cfg.device             = args.device;
-            cfg.draft_gpu          = args.draft_device.gpu;
-            cfg.remote_draft       = args.remote_draft;
-            cfg.remote_target_shard = args.remote_target_shard;
-            cfg.fa_window          = args.fa_window;
-            cfg.kq_stride_pad      = args.kq_stride_pad;
-            cfg.draft_swa_window   = args.draft_swa_window;
-            cfg.draft_ctx_max      = args.draft_ctx_max;
-            cfg.chunk              = args.chunk;
-            cfg.max_verify_tokens  = args.ddtree_mode
-                ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, args.ddtree_budget + 1)
+            cfg.target_path        = model.path;
+            cfg.draft_path         = speculation.draft_path;
+            cfg.device             = placement.target;
+            cfg.draft_gpu          = placement.draft.gpu;
+            cfg.remote_draft       = placement.remote_draft;
+            cfg.remote_target_shard = placement.remote_target_shard;
+            cfg.fa_window          = cache.fa_window;
+            cfg.kq_stride_pad      = cache.kq_stride_pad;
+            cfg.draft_swa_window   = cache.draft_swa_window;
+            cfg.draft_ctx_max      = cache.draft_ctx_max;
+            cfg.chunk              = execution.chunk;
+            cfg.max_verify_tokens  = speculation.ddtree_mode
+                ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, speculation.ddtree_budget + 1)
                 : DFLASH27B_DRAFT_BLOCK_SIZE;
-            cfg.run_dflash         = args.draft_path.has_value();
+            cfg.run_dflash         = speculation.draft_path.has_value();
 
             auto adapter = std::make_unique<Qwen35LayerSplitAdapter>(
                 std::move(cfg));
@@ -184,30 +190,30 @@ std::unique_ptr<ModelBackend> construct_backend(
         }
 
         Qwen35Config cfg;
-        cfg.target_path        = args.model_path;
-        cfg.draft_path         = args.draft_path;
-        cfg.device             = args.device;
-        cfg.draft_gpu          = args.draft_device.gpu;
-        cfg.remote_draft       = args.remote_draft;
-        cfg.stream_fd          = args.stream_fd;
-        cfg.fa_window          = args.fa_window;
-        cfg.cache_type_k       = args.cache_type_k;
-        cfg.cache_type_v       = args.cache_type_v;
-        cfg.paged_attention    = args.paged_attention;
-        cfg.max_concurrency    = args.max_concurrency;
-        cfg.kv_pool_tokens     = args.kv_pool_tokens;
-        cfg.kq_stride_pad      = args.kq_stride_pad;
-        cfg.draft_block_size   = args.draft_block_size;
-        cfg.draft_swa_window   = args.draft_swa_window;
-        cfg.draft_ctx_max      = args.draft_ctx_max;
-        cfg.fast_rollback      = args.fast_rollback;
-        cfg.seq_verify         = args.seq_verify;
-        cfg.ddtree_mode        = args.ddtree_mode;
-        cfg.ddtree_budget      = args.ddtree_budget;
-        cfg.ddtree_temp        = args.ddtree_temp;
-        cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
-        cfg.ddtree_tau         = args.ddtree_tau;
-        cfg.use_feature_mirror = args.use_feature_mirror;
+        cfg.target_path        = model.path;
+        cfg.draft_path         = speculation.draft_path;
+        cfg.device             = placement.target;
+        cfg.draft_gpu          = placement.draft.gpu;
+        cfg.remote_draft       = placement.remote_draft;
+        cfg.stream_fd          = execution.stream_fd;
+        cfg.fa_window          = cache.fa_window;
+        cfg.cache_type_k       = cache.cache_type_k;
+        cfg.cache_type_v       = cache.cache_type_v;
+        cfg.paged_attention    = cache.paged_attention;
+        cfg.max_concurrency    = cache.max_concurrency;
+        cfg.kv_pool_tokens     = cache.kv_pool_tokens;
+        cfg.kq_stride_pad      = cache.kq_stride_pad;
+        cfg.draft_block_size   = speculation.draft_block_size;
+        cfg.draft_swa_window   = cache.draft_swa_window;
+        cfg.draft_ctx_max      = cache.draft_ctx_max;
+        cfg.fast_rollback      = speculation.fast_rollback;
+        cfg.seq_verify         = speculation.seq_verify;
+        cfg.ddtree_mode        = speculation.ddtree_mode;
+        cfg.ddtree_budget      = speculation.ddtree_budget;
+        cfg.ddtree_temp        = speculation.ddtree_temp;
+        cfg.ddtree_chain_seed  = speculation.ddtree_chain_seed;
+        cfg.ddtree_tau         = speculation.ddtree_tau;
+        cfg.use_feature_mirror = speculation.use_feature_mirror;
 
         auto backend = std::make_unique<Qwen35Backend>(std::move(cfg));
         if (!backend->init()) {
@@ -218,23 +224,23 @@ std::unique_ptr<ModelBackend> construct_backend(
 
     } else if (arch == "qwen35moe") {
         Qwen35Config cfg;
-        cfg.target_path        = args.model_path;
-        cfg.draft_path         = args.draft_path;
-        cfg.device             = args.device;
-        cfg.draft_gpu          = args.draft_device.gpu;
-        cfg.stream_fd          = args.stream_fd;
-        cfg.fa_window          = args.fa_window;
-        cfg.kq_stride_pad      = args.kq_stride_pad;
-        cfg.draft_swa_window   = args.draft_swa_window;
-        cfg.draft_ctx_max      = args.draft_ctx_max;
-        cfg.fast_rollback      = args.fast_rollback;
-        cfg.seq_verify         = args.seq_verify;
-        cfg.ddtree_mode        = args.ddtree_mode;
-        cfg.ddtree_budget      = args.ddtree_budget;
-        cfg.ddtree_temp        = args.ddtree_temp;
-        cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
-        cfg.ddtree_tau         = args.ddtree_tau;
-        cfg.use_feature_mirror = args.use_feature_mirror;
+        cfg.target_path        = model.path;
+        cfg.draft_path         = speculation.draft_path;
+        cfg.device             = placement.target;
+        cfg.draft_gpu          = placement.draft.gpu;
+        cfg.stream_fd          = execution.stream_fd;
+        cfg.fa_window          = cache.fa_window;
+        cfg.kq_stride_pad      = cache.kq_stride_pad;
+        cfg.draft_swa_window   = cache.draft_swa_window;
+        cfg.draft_ctx_max      = cache.draft_ctx_max;
+        cfg.fast_rollback      = speculation.fast_rollback;
+        cfg.seq_verify         = speculation.seq_verify;
+        cfg.ddtree_mode        = speculation.ddtree_mode;
+        cfg.ddtree_budget      = speculation.ddtree_budget;
+        cfg.ddtree_temp        = speculation.ddtree_temp;
+        cfg.ddtree_chain_seed  = speculation.ddtree_chain_seed;
+        cfg.ddtree_tau         = speculation.ddtree_tau;
+        cfg.use_feature_mirror = speculation.use_feature_mirror;
 
         auto backend = std::make_unique<Qwen35MoeBackend>(std::move(cfg));
         if (!backend->init()) {
@@ -245,9 +251,9 @@ std::unique_ptr<ModelBackend> construct_backend(
 
     } else if (arch == "bailingmoe3") {
         BailingMoe3Config cfg;
-        cfg.model_path = args.model_path;
-        cfg.device = args.device;
-        cfg.stream_fd = args.stream_fd;
+        cfg.model_path = model.path;
+        cfg.device = placement.target;
+        cfg.stream_fd = execution.stream_fd;
 
         auto backend = std::make_unique<BailingMoe3Backend>(std::move(cfg));
         if (!backend->init()) {
@@ -257,12 +263,12 @@ std::unique_ptr<ModelBackend> construct_backend(
         return backend;
 
     } else if (arch == "laguna") {
-        if (args.device.is_layer_split()) {
+        if (placement.target.is_layer_split()) {
             LagunaLayerSplitAdapterConfig cfg;
-            cfg.target_path = args.model_path;
-            cfg.device      = args.device;
-            cfg.remote_target_shard = args.remote_target_shard;
-            cfg.chunk       = args.chunk;
+            cfg.target_path = model.path;
+            cfg.device      = placement.target;
+            cfg.remote_target_shard = placement.remote_target_shard;
+            cfg.chunk       = execution.chunk;
 
             auto adapter = std::make_unique<LagunaLayerSplitAdapter>(
                 std::move(cfg));
@@ -275,17 +281,17 @@ std::unique_ptr<ModelBackend> construct_backend(
         }
 
         LagunaBackendArgs lcfg;
-        lcfg.target_path = args.model_path;
-        lcfg.draft_path  = args.draft_path.value_or("");
-        lcfg.draft_gpu   = args.draft_device.gpu;
-        lcfg.draft_ctx_max = args.draft_ctx_max;
-        lcfg.ddtree_mode = args.ddtree_mode;
-        lcfg.ddtree_budget = args.ddtree_budget;
-        lcfg.ddtree_temp = args.ddtree_temp;
-        lcfg.verify_width = args.verify_width;
-        lcfg.device      = args.device;
-        lcfg.max_ctx     = args.device.max_ctx;
-        lcfg.chunk       = args.chunk;
+        lcfg.target_path = model.path;
+        lcfg.draft_path  = speculation.draft_path.value_or("");
+        lcfg.draft_gpu   = placement.draft.gpu;
+        lcfg.draft_ctx_max = cache.draft_ctx_max;
+        lcfg.ddtree_mode = speculation.ddtree_mode;
+        lcfg.ddtree_budget = speculation.ddtree_budget;
+        lcfg.ddtree_temp = speculation.ddtree_temp;
+        lcfg.verify_width = speculation.verify_width;
+        lcfg.device      = placement.target;
+        lcfg.max_ctx     = placement.target.max_ctx;
+        lcfg.chunk       = execution.chunk;
         // kv_type defaults to Q8_0 in LagunaBackendArgs
 
         auto backend = std::make_unique<LagunaBackend>(std::move(lcfg));
@@ -297,10 +303,10 @@ std::unique_ptr<ModelBackend> construct_backend(
 
     } else if (arch == "qwen3") {
         Qwen3BackendConfig qcfg;
-        qcfg.model_path = args.model_path;
-        qcfg.device     = args.device;
-        qcfg.stream_fd  = args.stream_fd;
-        qcfg.chunk      = args.chunk;
+        qcfg.model_path = model.path;
+        qcfg.device     = placement.target;
+        qcfg.stream_fd  = execution.stream_fd;
+        qcfg.chunk      = execution.chunk;
 
         auto backend = std::make_unique<Qwen3Backend>(std::move(qcfg));
         if (!backend->init()) {
@@ -310,13 +316,13 @@ std::unique_ptr<ModelBackend> construct_backend(
         return backend;
 
     } else if (arch == "gemma4") {
-        if (args.device.is_layer_split()) {
+        if (placement.target.is_layer_split()) {
             Gemma4LayerSplitAdapterConfig cfg;
-            cfg.target_path = args.model_path;
-            cfg.device      = args.device;
-            cfg.remote_target_shard = args.remote_target_shard;
-            cfg.chunk       = args.chunk;
-            cfg.fa_window   = args.fa_window;
+            cfg.target_path = model.path;
+            cfg.device      = placement.target;
+            cfg.remote_target_shard = placement.remote_target_shard;
+            cfg.chunk       = execution.chunk;
+            cfg.fa_window   = cache.fa_window;
 
             auto adapter = std::make_unique<Gemma4LayerSplitAdapter>(
                 std::move(cfg));
@@ -329,17 +335,17 @@ std::unique_ptr<ModelBackend> construct_backend(
         }
 
         Gemma4BackendConfig gcfg;
-        gcfg.model_path    = args.model_path;
-        gcfg.draft_path    = args.draft_path;
-        gcfg.draft_gpu     = args.draft_device.gpu;
-        gcfg.draft_ctx_max = args.draft_ctx_max;
-        gcfg.device        = args.device;
-        gcfg.stream_fd     = args.stream_fd;
-        gcfg.chunk         = args.chunk;
+        gcfg.model_path    = model.path;
+        gcfg.draft_path    = speculation.draft_path;
+        gcfg.draft_gpu     = placement.draft.gpu;
+        gcfg.draft_ctx_max = cache.draft_ctx_max;
+        gcfg.device        = placement.target;
+        gcfg.stream_fd     = execution.stream_fd;
+        gcfg.chunk         = execution.chunk;
         // Gemma4Backend reads this into its cache (gemma4_backend.cpp) exactly
         // as the layer-split adapter does; leaving it unset silently dropped
         // --fa-window on single-device gemma4.
-        gcfg.fa_window     = args.fa_window;
+        gcfg.fa_window     = cache.fa_window;
 
         auto backend = std::make_unique<Gemma4Backend>(std::move(gcfg));
         if (!backend->init()) {
@@ -355,21 +361,21 @@ std::unique_ptr<ModelBackend> construct_backend(
         // A single local device uses the monolithic backend. Reserve the
         // layer-split adapter for explicit multi-device placement or remote
         // target shards.
-        if (!args.device.is_layer_split() &&
-            !args.remote_target_shard.enabled()) {
+        if (!placement.target.is_layer_split() &&
+            !placement.remote_target_shard.enabled()) {
             DeepSeek4BackendConfig cfg;
-            cfg.model_path = args.model_path;
-            cfg.device     = args.device;
-            cfg.stream_fd  = args.stream_fd;
-            cfg.max_ctx    = args.device.max_ctx;
-            cfg.chunk      = args.chunk;
-            cfg.expert_top_k = args.ds4_expert_top_k;
-            cfg.fused_decode = args.ds4_fused_decode;
-            cfg.fused_verify_f16_kv = args.ds4_fused_verify_f16_kv;
-            cfg.prefill_mode = args.ds4_prefill_mode;
-            cfg.paged_attention = args.paged_attention;
-            cfg.max_concurrency = args.max_concurrency;
-            cfg.kv_pool_tokens = args.kv_pool_tokens;
+            cfg.model_path = model.path;
+            cfg.device     = placement.target;
+            cfg.stream_fd  = execution.stream_fd;
+            cfg.max_ctx    = placement.target.max_ctx;
+            cfg.chunk      = execution.chunk;
+            cfg.expert_top_k = deepseek4.expert_top_k;
+            cfg.fused_decode = deepseek4.fused_decode;
+            cfg.fused_verify_f16_kv = deepseek4.fused_verify_f16_kv;
+            cfg.prefill_mode = deepseek4.prefill_mode;
+            cfg.paged_attention = cache.paged_attention;
+            cfg.max_concurrency = cache.max_concurrency;
+            cfg.kv_pool_tokens = cache.kv_pool_tokens;
 
             auto backend = std::make_unique<DeepSeek4Backend>(std::move(cfg));
             if (!backend->init()) {
@@ -381,10 +387,10 @@ std::unique_ptr<ModelBackend> construct_backend(
 
         // Explicit local splits and CUDA/HIP remote splits use the adapter.
         DeepSeek4LayerSplitAdapterConfig cfg;
-        cfg.target_path        = args.model_path;
-        cfg.device             = args.device;
-        cfg.remote_target_shard = args.remote_target_shard;
-        cfg.chunk              = args.chunk;
+        cfg.target_path        = model.path;
+        cfg.device             = placement.target;
+        cfg.remote_target_shard = placement.remote_target_shard;
+        cfg.chunk              = execution.chunk;
 
         auto adapter = std::make_unique<DeepSeek4LayerSplitAdapter>(
             std::move(cfg));
@@ -428,9 +434,9 @@ std::unique_ptr<ModelBackend> create_backend(const BackendPlan & plan) {
             break;
         case BackendPlan::SpeclaEnvironmentAction::Enable:
             set_environment_variable("DFLASH_SPECLA", "1", true);
-            if (plan.args_.specla_top_k_explicit) {
+            if (plan.speculation_.specla_top_k_explicit) {
                 const std::string top_k =
-                    std::to_string(plan.args_.specla_top_k);
+                    std::to_string(plan.speculation_.specla_top_k);
                 set_environment_variable(
                     "DFLASH_SPECLA_TOPK", top_k.c_str(), true);
             }
@@ -444,7 +450,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendPlan & plan) {
         stderr,
         "[backend_factory] detected arch=%s\n",
         plan.arch().c_str());
-    return construct_backend(plan.args_, plan.arch());
+    return construct_backend(plan);
 }
 
 }  // namespace dflash::common

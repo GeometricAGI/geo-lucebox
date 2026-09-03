@@ -621,7 +621,7 @@ std::vector<std::string> warn_result(
     CHECK(check_feature_compatibility(
         args, features, arch, compiled_placement_backend(),
         compiled_placement_backend()).empty());
-    return collect_feature_warnings(args, features, arch);
+    return collect_feature_warnings(args, arch);
 }
 
 static bool warns_about(const std::vector<std::string> & warnings,
@@ -658,7 +658,7 @@ void test_feature_warnings_report_inert_draft() {
 
     BackendArgs split = args;
     CHECK(parse_placement_device_list("cuda:0,cuda:1", split.device));
-    const std::vector<std::string> w = collect_feature_warnings(split, {}, "laguna");
+    const std::vector<std::string> w = collect_feature_warnings(split, "laguna");
     CHECK(warns_about(w, "--draft"));
     CHECK(w[0].find("single-device placement") != std::string::npos);
 }

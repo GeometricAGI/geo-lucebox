@@ -376,7 +376,6 @@ void warn_inert(std::vector<std::string> & out,
 
 std::vector<std::string> collect_feature_warnings(
     const BackendArgs & args,
-    const BackendAdmissionContext & admission,
     const std::string & arch)
 {
     std::vector<std::string> out;
