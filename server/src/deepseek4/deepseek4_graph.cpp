@@ -5276,6 +5276,7 @@ bool deepseek4_step(
                                      expert_runtime, need_logits);
     }
 
+    if (!need_logits) out_logits.clear();
     std::vector<float> hc_state;
     return deepseek4_step_layer_range(
         backend, device, w, cache, hc_state, embed, n_tokens, kv_start,

@@ -430,6 +430,12 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
             cache.invalidate();
             return false;
         }
+        if (cache.allocator && cache.backend != backend) {
+            // The allocator is bound to a buffer type; a new backend needs
+            // its own or the graph lands in the previous device's buffers.
+            ggml_gallocr_free(cache.allocator);
+            cache.allocator = nullptr;
+        }
         if (!cache.allocator) {
             cache.allocator = ggml_gallocr_new(
                 ggml_backend_get_default_buffer_type(backend));

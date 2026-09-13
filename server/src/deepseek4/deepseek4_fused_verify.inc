@@ -324,7 +324,9 @@ static size_t ds4_fused_verify_hybrid_slot_limit() {
         // were model-qualified at 28.5 GiB peak on the 31.9 GiB R9700.
         // q5 (adaptive q2..q5): four widths across four ratio-4 phases plus
         // the boundary shapes, i.e. every one of the kSlotCount resident
-        // shapes (about 20 MiB) stays warm.
+        // shapes stays warm. Device scratch is shared (about 0.8 MiB per
+        // slot); each built slot also keeps its 32 MiB host metadata arena,
+        // so a fully populated q5 cache holds up to 768 MiB of host memory.
         const long default_slots = ds4_env_flag("DFLASH_DS4_Q5_VERIFY")
             ? (long) Ds4FusedVerifyCache::kSlotCount : 8;
         const long requested = raw ? std::strtol(raw, nullptr, 10)

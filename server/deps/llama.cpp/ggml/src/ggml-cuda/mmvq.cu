@@ -2061,14 +2061,17 @@ static void mul_mat_vec_q_moe_launch(
             std::getenv("DFLASH_CUDA_MMVQ_MOE_Q4_WARP_GROUPS");
         return e && e[0] == '2' && e[1] == '\0';
     }();
-    static const bool fp3_packed24_configured = []() {
+    // Explicit DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24 wins; unset defaults to the
+    // packed kernel on gfx1151 only.
+    static const int fp3_packed24_setting = []() {
         const char * e =
             std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
-        return e && e[0] == '1' && e[1] == '\0';
+        if (e == nullptr || e[0] == '\0') return -1;
+        return (e[0] == '1' && e[1] == '\0') ? 1 : 0;
     }();
     const bool fp3_packed24 =
-        (fp3_packed24_configured ||
-         gfx1151) &&
+        (fp3_packed24_setting >= 0 ? fp3_packed24_setting == 1
+                                   : gfx1151) &&
         std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") == nullptr;
     static const bool fp2_packed32 = []() {
         const char * e =

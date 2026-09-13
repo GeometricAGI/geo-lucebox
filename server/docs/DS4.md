@@ -513,7 +513,7 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL` | Analytic causal window for layer-major sliding-window layers instead of the quadratic mask upload. Part of the `gfx1151` sparse-prefill defaults (measured +10% prefill, identical output); set `0` to restore the explicit mask. |
 | `DFLASH_DS4_INDEXER_F16_Q` / `DFLASH_DS4_PREFILL_F16_KV_ALL` | F16 indexer queries and F16 selected-KV transport for sparse prefill. Part of the `gfx1151` sparse-prefill defaults; set `0` to restore F32. |
 | `GGML_CUDA_MLA_SEGMENTED_KV` | Segmented compressed/preserved-tail KV operands for the D512 flash-attention path. Defaults on for HIP backends; set `0` to disable. |
-| `GGML_CUDA_MLA_STREAM_WMMA` / `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` / `GGML_CUDA_MLA_DENSE_WMMA` / `GGML_CUDA_MLA_DENSE_HIGH_RATIO` | rocWMMA streaming and dense high-ratio D512 attention paths. Part of the `gfx1151` sparse-prefill defaults (removing them costs about 28% prefill at 8K); set `0` to fall back to the scalar paths. |
+| `GGML_CUDA_MLA_STREAM_WMMA` / `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` / `GGML_CUDA_MLA_DENSE_WMMA` / `GGML_CUDA_MLA_DENSE_HIGH_RATIO` | rocWMMA streaming and dense high-ratio D512 attention paths, part of the `gfx1151` sparse-prefill defaults (removing them costs about 28% prefill at 8K). `GGML_CUDA_MLA_STREAM_WMMA=0` restores scalar streaming; `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` selects one or two head groups (the profile sets `2`; it does not disable the path); either dense switch at `0` disables the dense high-ratio path. |
 | `DFLASH_ROCMFP3_WIDE_TWO_PASS` / `GGML_CUDA_MLA_SPARSE_VALUE_SKIP` | `gfx1151` kernel defaults (wide two-pass ROCmFP3 MMQ, skipping zero-weight value rows in sparse attention). Set `0` to disable either. |
 | `DFLASH_ROCMFP3_ROW3` | Three-row ROCmFP3 MMQ tiles for the q3 to q5 verifier shapes. Defaults on for `gfx1151`; set `0` to fall back to two rows. |
 | `GGML_DS4_INDEXER_M32` / `GGML_DS4_INDEXER_M32_CACHE_B` | rocWMMA m32 indexer score kernel and its cached B operand. The kernel defaults on for RDNA 3.5; the cached operand is part of the `gfx1151` sparse-prefill defaults. Set `0` to disable either. |
@@ -888,14 +888,16 @@ DSpark alone therefore does not guarantee 30 tok/s. Set
 `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
 and other HIP architectures retain the shared dispatch default.
 
-Adaptive width defaults on for `gfx1151` DSpark serving (acceptance-and-cost, q2 to q5) and is opt-in elsewhere. Set
-`DFLASH_ADAPTIVE_SPEC_WIDTH=1`, or `DFLASH_DS4_ADAPTIVE_WIDTH=1` to enable it
-only for DS4. A compatible confidence projection selects q=2, q=3, or q=4
-from cumulative proposal confidence; artifacts without one use target
-acceptance feedback. Fixed width remains the production default because
-switching q=3/q=4 did not reduce verifier time on the qualified gfx1151
-kernels. Re-run workload-level speed and quality checks before enabling it on
-another target or drafter.
+Adaptive width defaults on for `gfx1151` DSpark serving and is opt-in
+elsewhere (`DFLASH_ADAPTIVE_SPEC_WIDTH=1`, or `DFLASH_DS4_ADAPTIVE_WIDTH=1`
+for DS4 only). The width of every step, q2 to q5 on the q5 verifier, comes
+from the drafter's confidence head where the artifact carries one (three
+depths from the head, the fourth from target feedback, each depth calibrated
+online against the target's acceptance); artifacts without a head use the
+learned acceptance-and-cost policy. `DFLASH_DS4_CONFIDENCE_WIDTH=0` forces
+that fallback and `DFLASH_DS4_ADAPTIVE_WIDTH=0` restores a fixed width.
+Re-run workload-level speed and quality checks before enabling it on another
+target or drafter.
 
 ## PFlash prompt compression
 

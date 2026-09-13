@@ -5672,6 +5672,8 @@ void ggml_flash_attn_ext_set_ds4_kv_segments(
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     // src[6] carries optional RoPE positions (main); segments use src[7]/src[8].
     GGML_ASSERT(a->src[7] == NULL && a->src[8] == NULL);
+    // The only segmented kernel reads one latent K/V tensor (MLA).
+    GGML_ASSERT(a->src[1] == a->src[2]);
     GGML_ASSERT(compressed && preserved_tail);
     GGML_ASSERT(compressed->type == a->src[1]->type);
     GGML_ASSERT(preserved_tail->type == a->src[1]->type);

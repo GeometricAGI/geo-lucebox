@@ -199,7 +199,7 @@ int main(int argc, char ** argv) {
                         backend, d, noise.data(), feats.data(), ctx_len,
                         committed, hidden, &confidence_hidden);
                     const auto end = std::chrono::steady_clock::now();
-                    need(run_ok, "benchmark draft forward");
+                    need(run_ok, "successful benchmark draft forward");
                     if (!run_ok) break;
                     if (i >= warmups) {
                         timings.push_back(

@@ -359,12 +359,14 @@ int main() {
     const char * shape_filter = std::getenv("DFLASH_TEST_SHAPE");
     const char * quant_filter = std::getenv("DFLASH_TEST_QUANT");
     bool matched_shape = false;
+    bool matched_quant = false;
 
     bool ok = true;
     for (const QuantCase & quant : quant_cases) {
         if (quant_filter && std::strcmp(quant.label, quant_filter) != 0) {
             continue;
         }
+        matched_quant = true;
         for (const Shape & shape : shapes) {
             if (shape_filter && std::strcmp(shape.label, shape_filter) != 0) {
                 continue;
@@ -397,6 +399,11 @@ int main() {
     if (shape_filter && !matched_shape) {
         std::fprintf(stderr, "DFLASH_TEST_SHAPE matched no shape: %s\n",
                      shape_filter);
+        ok = false;
+    }
+    if (quant_filter && !matched_quant) {
+        std::fprintf(stderr, "DFLASH_TEST_QUANT matched no quant: %s\n",
+                     quant_filter);
         ok = false;
     }
 

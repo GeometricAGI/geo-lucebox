@@ -336,11 +336,13 @@ static bool apply_gfx1151_profile_defaults(
 // DFLASH_DS4_SPARSE_DECODE_FLASH is deliberately not part of the profile:
 // it can change generated tokens and stays an explicit opt-in (64ed6f97a;
 // test_failed_init_preserves_sparse_opt_in asserts init() leaves it alone).
-static void configure_gfx1151_dspark_verifier_defaults(int gpu) {
+// Returns false when a default could not be installed, so init() never
+// continues with a partially applied verifier profile.
+static bool configure_gfx1151_dspark_verifier_defaults(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
         !is_gfx_device(gpu, "gfx1151")) {
-        return;
+        return true;
     }
 
     constexpr Gfx1151ProfileDefault defaults[] = {
@@ -369,16 +371,20 @@ static void configure_gfx1151_dspark_verifier_defaults(int gpu) {
         {"DFLASH_DS4_GPU_ARGMAX_VERIFY", "1"},
     };
     bool changed = false;
-    apply_gfx1151_profile_defaults(
-        defaults, sizeof(defaults) / sizeof(defaults[0]), changed);
+    if (!apply_gfx1151_profile_defaults(
+            defaults, sizeof(defaults) / sizeof(defaults[0]), changed)) {
+        return false;
+    }
     if (changed) {
         std::fprintf(stderr,
                      "[deepseek4] gfx1151 DSpark: defaulting fused verify with "
                      "adaptive width (q2-q5), 128-row graph padding, pinned "
                      "rollback state, and GPU argmax on\n");
     }
+    return true;
 #else
     (void) gpu;
+    return true;
 #endif
 }
 
@@ -1312,7 +1318,9 @@ bool DeepSeek4Backend::init() {
 
     // Install the gfx1151 DSpark verifier profile first: the MMVQ crossover
     // below reads DFLASH_DS4_Q5_VERIFY.
-    configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu);
+    if (!configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu)) {
+        return false;
+    }
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
     // and preserve LUCE_MMVQ_MAX_NCOLS as an explicit override.

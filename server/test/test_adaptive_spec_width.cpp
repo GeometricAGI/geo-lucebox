@@ -10,6 +10,10 @@ using namespace dflash::common;
 namespace {
 struct AdaptiveSpecWidthFixture {};
 
+// The DS4 gfx1151 step-cost curve, seed-inclusive width 0..5: q3 and q4 cost
+// almost as much as q5, so acceptance decides between q2 and q5.
+const std::vector<float> kDs4StepCosts = {0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f};
+
 bool near(float lhs, float rhs, float tolerance = 1e-6f) {
     return std::fabs(lhs - rhs) <= tolerance;
 }
@@ -220,7 +224,7 @@ TEST_CASE(AdaptiveSpecWidthFixture, full_rejection_is_the_strongest_narrowing_si
 TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_collapses_from_q5_to_q2_under_full_rejections) {
     // The gfx1151 DS4 cost curve: q3 and q4 cost almost as much as q5.
     AdaptiveSpecWidth width(5, 2, true);
-    width.set_relative_costs({0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f});
+    width.set_relative_costs(kDs4StepCosts);
     CHECK(width.next_width_cost_aware({}) == 5);
     int full_rejections = 0;
     while (width.next_width_cost_aware({}) != 2 && full_rejections < 32) {
@@ -283,7 +287,7 @@ TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_never_exceeds_the_proposal) {
 TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_re_widens_from_q2_when_acceptance_recovers) {
     // DS4 gfx1151 relative step costs for widths 2..5.
     AdaptiveSpecWidth width(5, 2);
-    width.set_relative_costs({0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f});
+    width.set_relative_costs(kDs4StepCosts);
     // A prose-like regime: full rejections at q5 collapse the width to q2.
     for (int step = 0; step < 8 && width.next_width_cost_aware({}) != 2; ++step) {
         width.observe(1, width.next_width_cost_aware({}));
@@ -315,7 +319,7 @@ TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_re_widens_from_q2_when_acceptance
 
 TEST_CASE(AdaptiveSpecWidthFixture, rejection_below_offered_width_zeroes_deeper_prefixes) {
     AdaptiveSpecWidth width(5, 2);
-    width.set_relative_costs({0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f});
+    width.set_relative_costs(kDs4StepCosts);
     // Drive every depth to a confident survival first.
     for (int step = 0; step < 32; ++step) width.observe(5, 5);
     REQUIRE(width.next_width_cost_aware({}) == 5);
@@ -331,7 +335,7 @@ TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_stays_narrow_under_prose_like_acc
     // from clean q2 drafts alone; the geometric extrapolation keeps the q3
     // estimate near 0.36 while rejections keep pulling it down.
     AdaptiveSpecWidth width(5, 2);
-    width.set_relative_costs({0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f});
+    width.set_relative_costs(kDs4StepCosts);
     for (int step = 0; step < 8 && width.next_width_cost_aware({}) != 2; ++step) {
         width.observe(1, width.next_width_cost_aware({}));
     }
@@ -354,7 +358,7 @@ TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_stays_narrow_under_prose_like_acc
 
 TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_extends_a_short_confidence_vector_with_learned_depths) {
     AdaptiveSpecWidth width(5, 2);
-    width.set_relative_costs({0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f});
+    width.set_relative_costs(kDs4StepCosts);
     // Learn a confident regime at every depth from clean q5 drafts.
     for (int step = 0; step < 32; ++step) width.observe(5, 5);
     // A head that scores only three candidates, all confident: the fourth
@@ -373,7 +377,7 @@ TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_extends_a_short_confidence_vector
 
 TEST_CASE(AdaptiveSpecWidthFixture, confidence_scores_are_calibrated_against_the_target) {
     AdaptiveSpecWidth width(5, 2);
-    width.set_relative_costs({0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f});
+    width.set_relative_costs(kDs4StepCosts);
     // An optimistic head: it scores the second candidate 0.8 while the target
     // accepts it two times in five. Uncalibrated, q3 looks worth its cost.
     const std::vector<float> head = {0.9f, 0.8f, 0.7f};
@@ -396,4 +400,23 @@ TEST_CASE(AdaptiveSpecWidthFixture, confidence_scores_are_calibrated_against_the
     // A new request starts uncalibrated.
     width.reset();
     CHECK(near(width.confidence_scale(2), 1.0f));
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, clean_draft_explores_one_width_up_on_a_near_tie) {
+    AdaptiveSpecWidth width(5, 2);
+    width.set_relative_costs(kDs4StepCosts);
+    // Head scores that put q4 within 2% of q3 and q5 just behind them.
+    const std::vector<float> head = {0.95f, 0.90f, 0.66f, 0.10f};
+    CHECK(width.next_width_cost_aware(head) == 3);
+    // A rejected draft does not explore.
+    width.observe(2, 3);
+    CHECK(width.next_width_cost_aware(head) == 3);
+    // A clean draft steps one width up on the near tie, never two.
+    width.observe(3, 3);
+    CHECK(width.next_width_cost_aware(head) == 4);
+    // Prose-like scores keep q2: q3 is 8% short, beyond the margin.
+    AdaptiveSpecWidth prose(5, 2);
+    prose.set_relative_costs(kDs4StepCosts);
+    prose.observe(2, 2);
+    CHECK(prose.next_width_cost_aware({0.60f, 0.60f, 0.60f, 0.60f}) == 2);
 }

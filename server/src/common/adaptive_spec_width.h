@@ -25,7 +25,9 @@
 //    sample). A vector shorter than the proposal is extended with the
 //    learned conditional acceptance of the uncovered depths, so a head
 //    calibrated for fewer candidates than the verifier width still decides
-//    the depths it knows and the target feedback decides the rest. Head scores
+//    the depths it knows and the target feedback decides the rest. After a clean
+//    draft the next wider width is taken when it is within kExploreMargin of
+//    the best, so a near tie does not freeze the width below the cap. Head scores
 //    are calibrated online: observe_confidence() tracks predicted against
 //    observed acceptance per depth and each score is scaled by their ratio,
 //    so an optimistic head stops buying widths the target does not pay for.
@@ -62,6 +64,7 @@
 // device. Backend-specific fixed-width overrides still take precedence.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -99,6 +102,11 @@ public:
     // Bounds on the per-depth correction applied to a confidence score.
     static constexpr float kCalibrationMinScale = 0.25f;
     static constexpr float kCalibrationMaxScale = 1.50f;
+    // After a clean draft the next wider width is taken when its expected
+    // value is within this fraction of the best: a near tie is worth one
+    // step of exploration, since a width that is never offered never gets
+    // its survival and calibration measured.
+    static constexpr float kExploreMargin = 0.03f;
 
     // max_width is the hard cap and min_width the floor the feedback policies
     // narrow to; a floor above the cap is clamped to the cap.
@@ -189,7 +197,8 @@ public:
         float best_utility = -1.0f;
         float survival = 1.0f;
         float expected_commits = 1.0f; // target bonus after the seed
-        for (int width = 2; width <= proposed; ++width) {
+        std::array<float, 1 + 64> utilities{};
+        for (int width = 2; width <= proposed && width < (int) utilities.size(); ++width) {
             const int depth = width - 1;
             if ((size_t) depth <= conditional_acceptance.size()) {
                 // The drafter's own per-candidate score for this step,
@@ -210,10 +219,17 @@ public:
             const float cost = width_cost_ema_[(size_t) width];
             if (!std::isfinite(cost) || cost <= 0.0f) continue;
             const float utility = expected_commits / cost;
+            utilities[(size_t) width] = utility;
             if (utility > best_utility) {
                 best_utility = utility;
                 best_width = width;
             }
+        }
+        if (best_width >= 2 && last_draft_clean_ && best_width < proposed &&
+            best_width + 1 < (int) utilities.size() &&
+            utilities[(size_t) best_width + 1] >=
+                best_utility * (1.0f - kExploreMargin)) {
+            best_width += 1;
         }
         return best_width >= 0 ? best_width : next_width(proposed);
     }
@@ -313,6 +329,7 @@ public:
             }
         }
 
+        last_draft_clean_ = accepted_candidates >= offered_candidates;
         if (accepted_candidates >= offered_candidates) {
             // Censored lower bound: do not average it downward; probe wider.
             accepted_candidates_ema_ = std::min(
@@ -327,8 +344,8 @@ public:
     }
 
     // Calibrate the drafter's confidence head against the target: for every
-    // offered candidate depth, track the predicted score and the observed
-    // acceptance. next_width_cost_aware() scales each depth's score by the
+    // verified candidate depth (offered, and every shallower candidate
+    // accepted), track the predicted score and the observed acceptance. next_width_cost_aware() scales each depth's score by the
     // ratio of the two, so a head that is optimistic on this text (a common
     // pattern at the deeper depths) stops buying widths the target does not
     // pay for, and a pessimistic head does not hold the width down.
@@ -341,6 +358,10 @@ public:
         const int accepted = std::clamp(accepted_width, 1, offered);
         for (int depth = 1; depth < offered; ++depth) {
             if ((size_t) depth > predicted.size()) break;
+            // Candidate `depth` was verified only if every shallower one
+            // was accepted; after a rejection the deeper scores are
+            // conditional predictions with no outcome to score against.
+            if (accepted < depth) break;
             const float score = predicted[(size_t) depth - 1];
             if (!std::isfinite(score)) continue;
             float & pred = confidence_pred_ema_[(size_t) depth];
@@ -385,6 +406,7 @@ public:
         full_accept_streak_ = 0;
         max_width_cooldown_remaining_ = 0;
         max_width_active_ = max_width_initially_active_;
+        last_draft_clean_ = false;
     }
 
     bool enabled() const { return enabled_; }
@@ -431,6 +453,7 @@ private:
     std::vector<int> width_cost_samples_;
     std::vector<float> confidence_pred_ema_;
     std::vector<float> confidence_actual_ema_;
+    bool last_draft_clean_ = false;
     int max_width_probe_streak_ = 0;
     int max_width_rejection_cooldown_ = 0;
     int full_accept_streak_ = 0;

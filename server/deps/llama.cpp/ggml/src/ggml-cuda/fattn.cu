@@ -2396,8 +2396,10 @@ __global__ static void ds4_flash_attn_d512_streaming_wmma_kernel(
                 const int local_dim = accum_tile::get_j(element);
                 const int dim = wave * OUTPUT_TILES_PER_WAVE * 16 +
                     output_slice * 16 + local_dim;
-                float value = output_acc[head_group][output_slice].x[element] *
-                    old_scale[state] / row_sum[state];
+                float value = row_sum[state] > 0.0f
+                    ? output_acc[head_group][output_slice].x[element] *
+                      old_scale[state] / row_sum[state]
+                    : 0.0f;
                 if (inverse_rope.enabled && dim >= D - 64) {
                     const float partner = __shfl_xor_sync(
                         0xffffffffu, value, 1, WAVE);

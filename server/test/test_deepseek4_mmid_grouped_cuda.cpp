@@ -332,6 +332,13 @@ static int run_child(const char * mode, const char * output_path) {
     int type_filter = -1;
     if (const char * raw = std::getenv("DFLASH_MMID_TEST_TYPE")) {
         type_filter = std::atoi(raw);
+        if (std::find(std::begin(k_test_types), std::end(k_test_types),
+                      (ggml_type) type_filter) == std::end(k_test_types)) {
+            std::fprintf(stderr,
+                         "DFLASH_MMID_TEST_TYPE %d matches no test type\n",
+                         type_filter);
+            return 2;
+        }
     }
     const std::vector<int> widths = width_filter > 0
         ? std::vector<int>{width_filter}
@@ -725,6 +732,12 @@ int main(int argc, char ** argv) {
     if (!combine_only && width_filter && std::atoi(width_filter) > 0) {
         std::fprintf(stderr,
                      "DFLASH_MMID_TEST_WIDTH is supported only with --child; "
+                     "the parent validates the complete dispatch matrix\n");
+        return 2;
+    }
+    if (!combine_only && std::getenv("DFLASH_MMID_TEST_TYPE")) {
+        std::fprintf(stderr,
+                     "DFLASH_MMID_TEST_TYPE is supported only with --child; "
                      "the parent validates the complete dispatch matrix\n");
         return 2;
     }

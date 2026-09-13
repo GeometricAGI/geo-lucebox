@@ -35,7 +35,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | unset | BURN-IN: reduce each mixed-vendor owner's routed outputs locally before the final owner add. This changes floating-point association and is not the byte-identity mode. |
 | `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | unset | BURN-IN: expose independent mixed-vendor expert branches to the common multi-backend scheduler. |
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
-| `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
+| `DFLASH_DS4_COMP_PAD_STRIDE` | 16, 128 on `gfx1151` DSpark | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
 | `DFLASH_DS4_MIX_MMQ_PREFILL` | enabled for DS4 approximate prefill on gfx1151 | BURN-IN KILL SWITCH: =0 disables registry-aware mixed ROCmFP MMQ; =1 explicitly enables it on supported HIP devices. Automatic selection is model/graph-local and never writes the process environment. Exact prefill retains its existing dispatch defaults, including the specialized paired FP2 path. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` | 1 for masks at least 4 MiB | BURN-IN KILL SWITCH: =0 rebuilds and transfers the complete fused-verifier attention mask from the host on every step. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` | 4194304 | DEBUG/A-B: minimum fused-verifier mask size for GPU zeroing plus negative-range updates. |
@@ -50,7 +50,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_TP_BATCH_SPLIT_COPIES` | unset | OPT-IN: establish destination readiness once per DS4 scheduler split while retaining each backend copy's dependency publication. The qualified dual-ROCm launcher enables it. |
 | `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: additionally combine HIP peer-copy dependency publication. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. Keep these event-batching variables unset for the exact qualified profile. |
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
-| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 2 | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 8, 24 with `DFLASH_DS4_Q5_VERIFY` | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
@@ -115,6 +115,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
 - `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_CONFIDENCE_WIDTH` - deepseek4_dspark_spec.cpp (KILL SWITCH: =0 falls back from the drafter confidence head to the learned-acceptance width policy)
+- `DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned drafter context window; =0 restores pageable copies)
+- `DFLASH_DS4_GPU_ARGMAX_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc (gfx1151 DSpark default =1: on-device argmax of verifier logits; =0 copies the logits back)
+- `DFLASH_DS4_PINNED_ROLLBACK` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned host rollback state; =0 restores pageable copies)
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp

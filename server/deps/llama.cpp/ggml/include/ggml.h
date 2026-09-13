@@ -2470,7 +2470,8 @@ extern "C" {
             struct ggml_tensor * selected);
 
     // Present a logical DS4 KV sequence as three contiguous row segments
-    // without materializing their concatenation. `a` keeps the raw segment in
+    // without materializing their concatenation. Requires K and V to be the
+    // same tensor (MLA latent KV); only the split-KV decode kernel consumes it. `a` keeps the raw segment in
     // src[1]/src[2]; `compressed` and `preserved_tail` (K's type and D,
     // contiguous [D, rows]) are appended in that order and stored in
     // src[7]/src[8]. Row indices, the mask width and the raw-row count in
