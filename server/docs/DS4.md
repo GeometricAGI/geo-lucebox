@@ -173,7 +173,6 @@ Halo machine:
 cmake -S server -B server/build-hip-dual \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
-  -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip-dual -j
 ```
@@ -221,7 +220,6 @@ cmake -S server -B server/build-hip-dual \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES='gfx1100;gfx1151' \
   -DDFLASH27B_ROCMFP2_AFFINE=ON \
-  -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip-dual -j
 ```
@@ -373,7 +371,6 @@ cmake -S server -B server/build-hip \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
   -DDFLASH27B_SERVER=ON \
-  -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip -j
 
@@ -747,6 +744,12 @@ buffers. The production default is therefore two slots. Do not copy the old
 12-slot benchmark override into a long-lived service without measuring free
 VRAM across every intended context shape.
 
+HIP graph replay (`-DGGML_HIP_GRAPHS=ON`) is measured as a loss on gfx1151 and
+stays off, as the CMake default is: a bare HIP replay saves about 0.2 us per
+kernel on ROCm 7.2, the cached verifier graphs already skip every rebuild, and
+capturing a 7,000-node graph costs 25 to 30 ms per shape, so short replies ran
+8 to 10 percent slower with it on and long ones gained nothing.
+
 Native CUDA/HIP graph executables are cached below the ggml scheduler. Before a
 DS4 slot is rebuilt, the runtime now synchronizes its backends and retires every
 native graph key that points into that slot's metadata arena. Forced replay is
@@ -898,6 +901,14 @@ learned acceptance-and-cost policy. `DFLASH_DS4_CONFIDENCE_WIDTH=0` forces
 that fallback and `DFLASH_DS4_ADAPTIVE_WIDTH=0` restores a fixed width.
 Re-run workload-level speed and quality checks before enabling it on another
 target or drafter.
+
+The qualified `gfx1151` launch is the plain one: `DFLASH_DS4_SPEC=1`,
+`DFLASH_DS4_DRAFT=<DSpark draft GGUF>`, the release CLI with `--chunk 8192`
+and a 128K context. Every kernel and policy default above is installed by the
+device profile at start, and the published Strix Halo numbers (8K 320 / 42
+prefill / decode tok/s, 123K 284 / 36, code and math suites 39 tok/s at q5,
+prose 25 at q2) are measured exactly that way. Use `--chunk 8192` on the
+128 GB Strix Halo part; smaller chunks cost prefill and change nothing else.
 
 ## PFlash prompt compression
 
