@@ -118,11 +118,14 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
     std::vector<int> out;
     // Boundaries normally start after the system role prefix. A prompt with
     // no system message (common for API clients) still has role boundaries,
-    // so fall back to the first role start marker instead of caching nothing.
+    // so start from the first role marker instead of caching nothing. Take
+    // whichever comes first: a system prefix quoted inside a later message
+    // (literal ChatML in content) must not displace the real leading role.
+    const auto first_start = find_first_seq_any(ids, markers.next_role_starts);
     int start_idx = find_first_seq(ids, markers.sys_role_prefix);
     int start_len = (int)markers.sys_role_prefix.size();
-    if (start_idx < 0) {
-        auto first_start = find_first_seq_any(ids, markers.next_role_starts);
+    if (first_start.first >= 0 &&
+        (start_idx < 0 || first_start.first < start_idx)) {
         start_idx = first_start.first;
         start_len = first_start.second;
     }

@@ -2998,6 +2998,22 @@ TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_system_first) {
     TEST_ASSERT(bounds[1] == 11);
 }
 
+TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_user_first_quoted_system) {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // User-first prompt whose second message quotes a literal system prefix
+    // ({100,200}) in its content. The leading user role must still anchor the
+    // boundaries; the quoted prefix is just content.
+    std::vector<int32_t> ids = {
+        100, 201, 10, 11, 101,
+        100, 202, 100, 200, 12, 101,
+        100, 201, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 12);
+}
+
 TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_user_first) {
     auto markers = make_qwen_boundary_markers_for_test();
     // No system message: <im_start> user ... <im_end> <im_start> assistant
