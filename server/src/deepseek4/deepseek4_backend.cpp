@@ -177,6 +177,30 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
         return true;
     }
 
+    cudaDeviceProp prop{};
+    const bool have_prop = cudaGetDeviceProperties(&prop, gpu) == cudaSuccess;
+    const bool qualified_wave32 = have_prop &&
+        (std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0 ||
+         std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
+    // DSpark verifies five nearby proposals whose routed-expert sets overlap.
+    // The grouped ROCmFP4 kernel preserves every dot/reduction order while
+    // reusing those expert rows. Scope the default type mask to ROCmFP4-fast;
+    // explicit process settings always win.
+    if (qualified_wave32) {
+        if (std::getenv("DFLASH_MMID_GROUPED") == nullptr &&
+            set_environment_variable("DFLASH_MMID_GROUPED", "1", false) != 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to enable grouped ROCmFP4 MMID\n");
+            return false;
+        }
+        if (std::getenv("DFLASH_MMID_GROUPED_TYPES") == nullptr &&
+            set_environment_variable("DFLASH_MMID_GROUPED_TYPES", "16", false) != 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to select grouped ROCmFP4 MMID\n");
+            return false;
+        }
+    }
+
     // q=5 verification is an explicit AMD-only path and needs the plain quantized
     // verifier matmuls to stay on MMVQ. The process-wide crossover applies to
     // both owners in the heterogeneous graph, so set it before inspecting the
@@ -210,15 +234,14 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
             return false;
         }
 
-        cudaDeviceProp prop{};
         if (std::strcmp(fp4_x4, "1") == 0 &&
             std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1") == nullptr &&
-            cudaGetDeviceProperties(&prop, gpu) == cudaSuccess &&
-            std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0 &&
+            qualified_wave32 &&
             set_environment_variable("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1", "1", false) == 0) {
             std::fprintf(stderr,
-                         "[deepseek4] gfx1201 DSpark q5: defaulting "
-                         "ROCmFP4 x4+1 MMVQ\n");
+                         "[deepseek4] %s DSpark q5: defaulting "
+                         "ROCmFP4 x4+1 MMVQ\n",
+                         prop.gcnArchName);
         }
         return true;
     }
@@ -227,8 +250,7 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
         return true;
     }
 
-    cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
+    if (!have_prop ||
         std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
         return true;
     }
@@ -273,6 +295,93 @@ static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) 
 #endif
 }
 
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+// One gfx1151 device-profile entry: a process default installed only when
+// the variable is unset. An explicit value, including 0, is an operator
+// override and the per-path kill switch, so it is never overwritten.
+struct Gfx1151ProfileDefault {
+    const char * name;
+    const char * value;
+};
+
+// Returns false only when the environment could not be updated. `changed`
+// reports whether at least one default was installed, so the caller prints
+// its banner once and only when the profile actually acted.
+static bool apply_gfx1151_profile_defaults(
+        const Gfx1151ProfileDefault * defaults, size_t count, bool & changed) {
+    for (size_t i = 0; i < count; ++i) {
+        const Gfx1151ProfileDefault & setting = defaults[i];
+        if (std::getenv(setting.name) != nullptr) {
+            continue;
+        }
+        if (set_environment_variable(setting.name, setting.value, false) != 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to set %s=%s\n",
+                         setting.name, setting.value);
+            return false;
+        }
+        changed = true;
+    }
+    return true;
+}
+#endif
+
+// gfx1151 DSpark device profile. The qualified Strix Halo configuration is
+// the fused whole-model verifier driven by the acceptance-and-cost adaptive
+// width controller over q2..q5 (q5 is the cap, not a fixed width), plus the
+// exact-path buffer and padding defaults it was measured with (8K 317/42,
+// 123K 281/36 tok/s, identical output). It runs before the MMVQ crossover
+// defaults, which read DFLASH_DS4_Q5_VERIFY.
+//
+// DFLASH_DS4_SPARSE_DECODE_FLASH is deliberately not part of the profile:
+// it can change generated tokens and stays an explicit opt-in (64ed6f97a;
+// test_failed_init_preserves_sparse_opt_in asserts init() leaves it alone).
+static void configure_gfx1151_dspark_verifier_defaults(int gpu) {
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
+        !is_gfx_device(gpu, "gfx1151")) {
+        return;
+    }
+
+    constexpr Gfx1151ProfileDefault defaults[] = {
+        // Fused verify is part of the qualified configuration: without it
+        // the dense full-expert verify path makes q5 cost more than q4 and
+        // the controller never promotes.
+        {"DFLASH_DS4_Q5_VERIFY", "1"},
+        {"DFLASH_DS4_ADAPTIVE_WIDTH", "1"},
+        {"DFLASH_DS4_FUSED_VERIFY", "1"},
+        // A q5 verifier advances through four ratio-4 phases. Narrow
+        // compressed-history buckets create short-lived graph shapes and
+        // repeatedly recapture the native HIP graph. A 128-row bucket
+        // reduced a 256-token 123K run from ten verifier shapes to six, while
+        // the extra masked work stayed below the saved build/recapture cost
+        // at both 32K and 123K.
+        {"DFLASH_DS4_COMP_PAD_STRIDE", "128"},
+        // Compact pinned host buffers remove repeated pageable copies from
+        // rollback and from the three-layer drafter context without changing
+        // the target graph or accepted tokens.
+        {"DFLASH_DS4_PINNED_ROLLBACK", "1"},
+        {"DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE", "1"},
+        // Greedy speculative verification consumes only the winning token
+        // per lane. Reducing the vocabulary logits on-device avoids copying
+        // q*n_vocab floats back to the host and selects the same IDs.
+        // Callers that explicitly request verifier logits still receive them.
+        {"DFLASH_DS4_GPU_ARGMAX_VERIFY", "1"},
+    };
+    bool changed = false;
+    apply_gfx1151_profile_defaults(
+        defaults, sizeof(defaults) / sizeof(defaults[0]), changed);
+    if (changed) {
+        std::fprintf(stderr,
+                     "[deepseek4] gfx1151 DSpark: defaulting fused verify with "
+                     "adaptive width (q2-q5), 128-row graph padding, pinned "
+                     "rollback state, and GPU argmax on\n");
+    }
+#else
+    (void) gpu;
+#endif
+}
+
 static ggml_mixed_mmq_policy gfx1151_mix_mmq_prefill_policy(
         int gpu, PrefillAttentionMode mode) {
     // Read explicit policy without changing the process environment. The
@@ -288,6 +397,51 @@ static ggml_mixed_mmq_policy gfx1151_mix_mmq_prefill_policy(
     (void) mode;
 #endif
     return deepseek4_mix_mmq_prefill_policy(mode, nullptr, value);
+}
+
+static bool configure_gfx1151_sparse_prefill_kernel_defaults(
+        int gpu, PrefillAttentionMode mode) {
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (mode != PrefillAttentionMode::Sparse) {
+        return true;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
+        return true;
+    }
+
+    // gfx1151 sparse-prefill kernel profile: the rocWMMA streaming and dense
+    // high-ratio attention paths, the indexer m32 cache, F16 indexer queries,
+    // F16 selected-KV transport, and the analytic causal window were
+    // qualified together (identical output, +10% prefill from the causal
+    // window alone).
+    constexpr Gfx1151ProfileDefault defaults[] = {
+        {"GGML_CUDA_MLA_STREAM_WMMA", "1"},
+        {"GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS", "2"},
+        {"GGML_CUDA_MLA_DENSE_WMMA", "1"},
+        {"GGML_CUDA_MLA_DENSE_HIGH_RATIO", "1"},
+        {"GGML_DS4_INDEXER_M32_CACHE_B", "1"},
+        {"DFLASH_DS4_INDEXER_F16_Q", "1"},
+        {"DFLASH_DS4_PREFILL_F16_KV_ALL", "1"},
+        {"DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL", "1"},
+    };
+    bool changed = false;
+    if (!apply_gfx1151_profile_defaults(
+            defaults, sizeof(defaults) / sizeof(defaults[0]), changed)) {
+        return false;
+    }
+    if (changed) {
+        std::fprintf(stderr,
+                     "[deepseek4] gfx1151 sparse prefill: defaulting "
+                     "qualified WMMA, F16-KV, and indexer kernels on\n");
+    }
+#else
+    (void) gpu;
+    (void) mode;
+#endif
+    return true;
 }
 
 static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
@@ -1156,6 +1310,9 @@ bool DeepSeek4Backend::init() {
         }
     }
 
+    // Install the gfx1151 DSpark verifier profile first: the MMVQ crossover
+    // below reads DFLASH_DS4_Q5_VERIFY.
+    configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu);
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
     // and preserve LUCE_MMVQ_MAX_NCOLS as an explicit override.
@@ -1163,6 +1320,10 @@ bool DeepSeek4Backend::init() {
         return false;
     }
     configure_gfx1151_paged_mmvq_default(cfg_.device.gpu, cfg_.paged_attention);
+    if (!configure_gfx1151_sparse_prefill_kernel_defaults(
+            cfg_.device.gpu, cfg_.prefill_mode)) {
+        return false;
+    }
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     if (cfg_.paged_attention &&
@@ -2271,6 +2432,12 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         DeepSeek4StepTelemetry step_tel;
         if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
+        // Only the terminal chunk (or an exact snapshot boundary) feeds a
+        // sampler.  Avoid streaming the 129K-vocabulary output projection
+        // through every earlier long-prefill chunk.
+        const bool at_snap_boundary =
+            save_snapshot && !snapshot_saved && pos + n_tok >= snap_pos;
+        const bool need_logits = i + n_tok >= n_total || at_snap_boundary;
         std::vector<float> logits;
         bool ok = false;
         std::vector<float> hc_state;
@@ -2313,7 +2480,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
                 embed.data(), n_tok, pos,
-                0, w_.n_layer, &logits,
+                0, w_.n_layer, need_logits ? &logits : nullptr,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
                 /*allow_decode_graph_reuse=*/true, hp,
@@ -2327,11 +2494,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                 timing ? &step_tel : nullptr,
                                 routing_stats_.get(),
                                 hp,
-                                expert_runtime_.compute ? &expert_runtime_ : nullptr);
+                                expert_runtime_.compute ? &expert_runtime_ : nullptr,
+                                need_logits);
         } else {
             ok = deepseek4_step_layer_range(backend_, cfg_.device.gpu, w_, cache_, hc_state,
                                             embed.data(), n_tok, pos,
-                                            0, w_.n_layer, &logits,
+                                            0, w_.n_layer,
+                                            need_logits ? &logits : nullptr,
                                             tokens.data() + i,
                                             timing ? &step_tel : nullptr,
                                             cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
@@ -2358,7 +2527,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             add_step_tel(tel_acc, step_tel);
             steps++;
         }
-        last_logits_ = std::move(logits);
+        if (need_logits) {
+            last_logits_ = std::move(logits);
+        }
         pos += n_tok;
         last_logits_pos_ = cache_.cur_pos;
         i += n_tok;
@@ -2412,7 +2583,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     if (timing) {
         log_deepseek4_step_telemetry("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
     }
-    if (spec_enabled_ && spec_drafter_) {
+    // Prompts wider than one verify step (DS4_CONSERVATIVE_VERIFY_MAX_TOKENS)
+    // ran a layer-major prefill; its arenas are not reused by decode or
+    // verify graphs, so retire them here regardless of the decode mode.
+    if (n_total > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
         deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
     }
     return pos;
