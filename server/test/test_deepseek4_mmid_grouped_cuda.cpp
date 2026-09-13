@@ -187,6 +187,12 @@ static bool run_case(
     const bool masked_owner_routes =
         width >= 32 &&
         (type == GGML_TYPE_Q2_0_ROCMFP2 || type == GGML_TYPE_Q3_0_ROCMFPX);
+    int route_period = 0;
+    if (benchmark) {
+        route_period = env_positive(
+            "DFLASH_MMID_BENCH_ROUTE_PERIOD", n_experts);
+        route_period = std::min(route_period, n_experts);
+    }
     for (int token = 0; token < width; ++token) {
         for (int slot = 0; slot < top_k; ++slot) {
             // Exercise the owner-split contract as well as dense routing:
@@ -195,7 +201,9 @@ static bool run_case(
             ids_h[(size_t) token * top_k + slot] =
                 masked_owner_routes && (token + slot) % 5 == 0
                     ? -1
-                    : (token * 3 + slot * 5) % n_experts;
+                    : route_period > 0
+                        ? (token * top_k + slot) % route_period
+                        : (token * 3 + slot * 5) % n_experts;
         }
     }
 
@@ -274,7 +282,9 @@ static bool grouped_supported_device();
 static int run_child(const char * mode, const char * output_path) {
     const bool grouped = std::strcmp(mode, "grouped") == 0;
     const bool masked_fused = std::strcmp(mode, "masked-fused") == 0;
-    if (!grouped && !masked_fused && std::strcmp(mode, "legacy") != 0) {
+    const bool direct = std::strcmp(mode, "direct") == 0;
+    if (!grouped && !masked_fused && !direct &&
+        std::strcmp(mode, "legacy") != 0) {
         return 2;
     }
     if (!grouped_supported_device()) {
@@ -282,16 +292,22 @@ static int run_child(const char * mode, const char * output_path) {
         return 77;
     }
 #if defined(_WIN32)
-    if (!grouped && !masked_fused) {
+    if (!grouped && !masked_fused && !direct) {
         _putenv_s("GGML_CUDA_DISABLE_FUSION", "1");
     } else {
         _putenv_s("GGML_CUDA_DISABLE_FUSION", "");
     }
+    if (direct) {
+        _putenv_s("DFLASH_MMID_GROUPED", "0");
+    }
 #else
-    if (!grouped && !masked_fused) {
+    if (!grouped && !masked_fused && !direct) {
         setenv("GGML_CUDA_DISABLE_FUSION", "1", 1);
     } else {
         unsetenv("GGML_CUDA_DISABLE_FUSION");
+    }
+    if (direct) {
+        setenv("DFLASH_MMID_GROUPED", "0", 1);
     }
 #endif
 
@@ -313,11 +329,18 @@ static int run_child(const char * mode, const char * output_path) {
     if (const char * raw = std::getenv("DFLASH_MMID_TEST_WIDTH")) {
         width_filter = std::max(0, std::atoi(raw));
     }
+    int type_filter = -1;
+    if (const char * raw = std::getenv("DFLASH_MMID_TEST_TYPE")) {
+        type_filter = std::atoi(raw);
+    }
     const std::vector<int> widths = width_filter > 0
         ? std::vector<int>{width_filter}
         : std::vector<int>(std::begin(k_test_widths), std::end(k_test_widths));
     bool ok = output.good();
     for (ggml_type type : k_test_types) {
+        if (type_filter >= 0 && (int) type != type_filter) {
+            continue;
+        }
         for (int width : widths) {
             if ((width_filter > 0 && width != width_filter) ||
                 (width >= 32 &&
@@ -327,7 +350,9 @@ static int run_child(const char * mode, const char * output_path) {
                 continue;
             }
             ok = run_case(backend, type, width, false, true, output) && ok;
-            if (width < 32 && width_filter == 0) {
+            const bool force_fused_width =
+                std::getenv("DFLASH_MMID_TEST_FUSED_WIDTH") != nullptr;
+            if (width < 32 && (width_filter == 0 || force_fused_width)) {
                 ok = run_case(backend, type, width, true, true, output) && ok;
             }
         }
@@ -692,7 +717,7 @@ int main(int argc, char ** argv) {
         argc == 2 && std::strcmp(argv[1], "--mmid-only") == 0;
     if (argc != 1 && !combine_only && !mmid_only) {
         std::fprintf(stderr,
-                     "usage: %s [--combine-only|--mmid-only|--test-benchmark-iterations|--child legacy|grouped|masked-fused OUTPUT]\n",
+                     "usage: %s [--combine-only|--mmid-only|--test-benchmark-iterations|--child legacy|grouped|masked-fused|direct OUTPUT]\n",
                      argv[0]);
         return 2;
     }
@@ -802,7 +827,8 @@ int main(int argc, char ** argv) {
                         grouped_log, type, width, "grouped") && grouped_dispatch;
                 } else if (width <= 16) {
                     grouped_dispatch =
-                        has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
+                        has_mmvq_record(grouped_log, type, width, "grouped") &&
+                        grouped_dispatch;
                 }
                 if (output_parity) {
                     output_parity = compare_case_outputs(
@@ -827,7 +853,8 @@ int main(int argc, char ** argv) {
     const bool masked_fused_zero = masked_fused.size() == masked_case_bytes;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
         masked_fused_status == 0 && masked_fused_zero &&
-        output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 105;
+        output_parity && grouped_dispatch && legacy_grouped == 0 &&
+        grouped_grouped == 105;
     if (pass) {
         std::remove(legacy_path.c_str());
         std::remove(grouped_path.c_str());
@@ -838,7 +865,8 @@ int main(int argc, char ** argv) {
     }
     std::printf("[mmid-grouped-test] legacy_status=%d grouped_status=%d bytes=%zu "
                 "compared_cases=%d exact_cases=%d tolerant_cases=%d compared_bytes=%zu "
-                "legacy_grouped=%zu grouped_grouped=%zu masked_fused_zero=%s "
+                "legacy_grouped=%zu grouped_grouped=%zu "
+                "masked_fused_zero=%s "
                 "parity=%s\n",
                 legacy_status, grouped_status, legacy.size(), compared_cases, exact_cases,
                 tolerant_cases, compared_bytes, legacy_grouped, grouped_grouped,
