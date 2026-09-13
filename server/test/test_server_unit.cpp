@@ -2972,6 +2972,64 @@ TEST_CASE(ServerUnitFixture, test_find_boundaries_empty) {
     TEST_ASSERT(bounds.empty());
 }
 
+// Boundary detection with and without a system message. Qwen-shaped
+// synthetic markers: {100,200} = "<im_start>system", {101} = "<im_end>",
+// {100} = "<im_start>" as the next-role start.
+static ChatMarkers make_qwen_boundary_markers_for_test() {
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {100, 200};
+    markers.end_msg_seqs = {{101}};
+    markers.next_role_starts = {{100}};
+    return markers;
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_system_first) {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // <im_start> system ... <im_end> <im_start> user ... <im_end> <im_start> assistant ...
+    std::vector<int32_t> ids = {
+        100, 200, 10, 11, 101,
+        100, 201, 12, 13, 101,
+        100, 202, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 11);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_user_first_quoted_system) {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // User-first prompt whose second message quotes a literal system prefix
+    // ({100,200}) in its content. The leading user role must still anchor the
+    // boundaries; the quoted prefix is just content.
+    std::vector<int32_t> ids = {
+        100, 201, 10, 11, 101,
+        100, 202, 100, 200, 12, 101,
+        100, 201, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 12);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_user_first) {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // No system message: <im_start> user ... <im_end> <im_start> assistant
+    // ... <im_end> <im_start> user ... must still yield the role boundaries
+    // instead of an empty list (which disabled the prefix cache entirely).
+    std::vector<int32_t> ids = {
+        100, 201, 10, 11, 101,
+        100, 202, 12, 13, 101,
+        100, 201, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 11);
+}
+
 TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary) {
     // Synthetic Qwen-shaped prompt:
     //   <system> TOOL_SCHEMA </system> <user> question </user> <assistant>
