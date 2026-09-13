@@ -114,11 +114,14 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
 - `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_CONFIDENCE_WIDTH` - deepseek4_dspark_spec.cpp (KILL SWITCH: =0 falls back from the drafter confidence head to the learned-acceptance width policy)
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
+- `DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL` - deepseek4_backend.cpp, deepseek4_graph.cpp (gfx1151 sparse-prefill default; KILL SWITCH: =0 restores the explicit causal mask)
+- `DFLASH_DS4_DISABLE_BOUNDARY_CHECKPOINT` - deepseek4_dspark_spec.cpp (KILL SWITCH: =1 replays a two-boundary q5 rejection from a full snapshot instead of the boundary checkpoint)
 - `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` - deepseek4_graph.cpp
 - `DFLASH_DS4_DIRECT_INDEXER_TOPK` - deepseek4_graph.cpp
 - `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
@@ -129,6 +132,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
 - `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_INDEXER_F16_Q` - deepseek4_backend.cpp, deepseek4_graph.cpp (gfx1151 sparse-prefill default; KILL SWITCH: =0 restores F32 indexer queries)
 - `DFLASH_DS4_MIX_MMQ_PREFILL` - deepseek4_backend.cpp, ggml-cuda/mmq.cu
 - `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_BACKEND` - deepseek4_backend.cpp
@@ -136,8 +140,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_MOE_TP_GPU` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_INPROC` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_PEER_HOT` - deepseek4_backend.cpp
+- `DFLASH_DS4_PREFILL_F16_KV_ALL` - deepseek4_backend.cpp, deepseek4_graph.cpp (gfx1151 sparse-prefill default; KILL SWITCH: =0 restores F32 selected-KV transport)
 - `DFLASH_DS4_ROUTING_STATS_OUT` - deepseek4_backend.cpp
 - `DFLASH_DS4_ROCTX` - deepseek4_roctx.cpp
+- `DFLASH_DS4_TOKEN_TRACE` - deepseek4_dspark_spec.cpp (DIAGNOSTIC: per-token speculative trace on stderr)
+- `DFLASH_DS4_VERIFY_BUILD_TIMING` - deepseek4_fused_verify.inc (DIAGNOSTIC: fused-verify graph build timing)
+- `DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE` - dspark_head.cpp (KILL SWITCH: =1 rebuilds the DSpark Markov chain graph on every call)
 - `DFLASH_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `DFLASH_ROCMFP2_ROW4` - rocmfp2_mix.cu
@@ -272,6 +280,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_QWEN35_NO_FUSED_KERNELS` - qwen35_target_graph.cpp (KILL SWITCH: =1 rebuilds the pre-fusion decode graph)
 - `DFLASH_QWEN35_NO_STACK` - gguf_target_loader.cpp (KILL SWITCH: =1 disables zero-copy stacked weight aliases)
 - `DFLASH_QWEN35_SPEC_STEP_RATIO` - qwen35_backend.cpp (adaptive policy spec/plain step-time ratio override)
+- `DFLASH_ROCMFP3_WIDE_TWO_PASS` - rocmfp3_mix.cu
+- `DFLASH_ROCMFP3_ROW3` - rocmfp3_mix.cu (KILL SWITCH: =0 restores two-row tiles on gfx1151)
 - `DFLASH_SAMPLED_VERIFY` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_SHARE_DIR` - http_server.cpp
 - `DFLASH_SINGLE_CHAIN_CHECKPOINT_F32` - chain_rollback_policy.h
@@ -289,7 +299,17 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
+- `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_CUDA_MLA_SEGMENTED_KV` - deepseek4_graph.cpp
+- `GGML_CUDA_MLA_SPARSE_VALUE_SKIP` - fattn.cu
+- `GGML_CUDA_MLA_STREAM_WMMA` - fattn.cu, deepseek4_backend.cpp
+- `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` - fattn.cu, deepseek4_backend.cpp
+- `GGML_DS4_INDEXER_M32` - ds4-indexer.cu (KILL SWITCH: =0 disables the rocWMMA m32 indexer kernel on RDNA 3.5)
+- `GGML_DS4_INDEXER_M32_CACHE_B` - ds4-indexer.cu, deepseek4_backend.cpp (gfx1151 default: cached B operand)
+- `GGML_DS4_INDEXER_M32_PREFILL` - ds4-indexer.cu (DIAGNOSTIC: m32 prefill crossover override)
+- `GGML_DS4_INDEXER_M32_DIRECT_B` - ds4-indexer.cu (DIAGNOSTIC: m32 direct-B crossover override)
 - `GGML_CUDA_MMQ_X` - ggml-cuda/mmq.cuh
 - `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` - ggml-cuda/mmq.cuh
 - `GGML_CUDA_MMQ_MOE_PERSISTENT` - ggml-cuda/mmq.cuh
