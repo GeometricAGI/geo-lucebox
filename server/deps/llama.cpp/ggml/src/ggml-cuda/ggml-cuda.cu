@@ -6069,7 +6069,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->ne[0] == 128 &&
                    ggml_is_contiguous(op->src[0]);
         case GGML_OP_DS4_INDEXER_SCORE:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return (op->src[0]->type == GGML_TYPE_F32 ||
+                    op->src[0]->type == GGML_TYPE_F16) &&
                    op->src[0]->ne[0] == 128 &&
                    op->src[0]->ne[3] == 1 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
