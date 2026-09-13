@@ -2066,7 +2066,7 @@ static void mul_mat_vec_q_moe_launch(
     static const int fp3_packed24_setting = []() {
         const char * e =
             std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
-        if (e == nullptr || e[0] == '\0') return -1;
+        if (e == nullptr) return -1;
         return (e[0] == '1' && e[1] == '\0') ? 1 : 0;
     }();
     const bool fp3_packed24 =

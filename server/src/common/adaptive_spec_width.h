@@ -64,7 +64,6 @@
 // device. Backend-specific fixed-width overrides still take precedence.
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -128,6 +127,7 @@ public:
           width_cost_ema_((size_t) std::max(1, max_width_) + 1,
                           std::numeric_limits<float>::quiet_NaN()),
           width_cost_samples_((size_t) std::max(1, max_width_) + 1, 0),
+          utility_scratch_((size_t) std::max(1, max_width_) + 1, 0.0f),
           confidence_pred_ema_((size_t) std::max(1, max_width_), kSurvivalPrior),
           confidence_actual_ema_((size_t) std::max(1, max_width_), kSurvivalPrior) {}
 
@@ -197,8 +197,9 @@ public:
         float best_utility = -1.0f;
         float survival = 1.0f;
         float expected_commits = 1.0f; // target bonus after the seed
-        std::array<float, 1 + 64> utilities{};
-        for (int width = 2; width <= proposed && width < (int) utilities.size(); ++width) {
+        std::vector<float> & utilities = utility_scratch_;
+        std::fill(utilities.begin(), utilities.end(), 0.0f);
+        for (int width = 2; width <= proposed; ++width) {
             const int depth = width - 1;
             if ((size_t) depth <= conditional_acceptance.size()) {
                 // The drafter's own per-candidate score for this step,
@@ -226,7 +227,6 @@ public:
             }
         }
         if (best_width >= 2 && last_draft_clean_ && best_width < proposed &&
-            best_width + 1 < (int) utilities.size() &&
             utilities[(size_t) best_width + 1] >=
                 best_utility * (1.0f - kExploreMargin)) {
             best_width += 1;
@@ -245,6 +245,9 @@ public:
     // positive are ignored.
     void observe(int accepted_width, int offered_width,
                  float observed_step_cost = -1.0f) {
+        // A one-row step carries no draft; it must not leave a stale clean
+        // flag from the previous step behind.
+        if (offered_width <= 1) last_draft_clean_ = false;
         if (!enabled_ || offered_width <= 1 || max_width_ <= 1) return;
 
         const int offered = std::clamp(offered_width, 1, max_width_);
@@ -451,6 +454,9 @@ private:
     std::vector<float> prefix_survival_ema_;
     std::vector<float> width_cost_ema_;
     std::vector<int> width_cost_samples_;
+    // Per-width expected value of the current cost-aware decision; kept as
+    // a member so the const decision path allocates nothing.
+    mutable std::vector<float> utility_scratch_;
     std::vector<float> confidence_pred_ema_;
     std::vector<float> confidence_actual_ema_;
     bool last_draft_clean_ = false;

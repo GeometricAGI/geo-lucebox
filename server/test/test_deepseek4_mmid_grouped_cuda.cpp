@@ -344,6 +344,7 @@ static int run_child(const char * mode, const char * output_path) {
         ? std::vector<int>{width_filter}
         : std::vector<int>(std::begin(k_test_widths), std::end(k_test_widths));
     bool ok = output.good();
+    int cases_run = 0;
     for (ggml_type type : k_test_types) {
         if (type_filter >= 0 && (int) type != type_filter) {
             continue;
@@ -356,6 +357,7 @@ static int run_child(const char * mode, const char * output_path) {
                 type != GGML_TYPE_Q4_0_ROCMFP4_FAST)) {
                 continue;
             }
+            ++cases_run;
             ok = run_case(backend, type, width, false, true, output) && ok;
             const bool force_fused_width =
                 std::getenv("DFLASH_MMID_TEST_FUSED_WIDTH") != nullptr;
@@ -363,6 +365,11 @@ static int run_child(const char * mode, const char * output_path) {
                 ok = run_case(backend, type, width, true, true, output) && ok;
             }
         }
+    }
+    if ((type_filter >= 0 || width_filter > 0) && cases_run == 0) {
+        std::fprintf(stderr,
+                     "DFLASH_MMID_TEST_TYPE/DFLASH_MMID_TEST_WIDTH selected no runnable case\n");
+        ok = false;
     }
     output.close();
     ggml_backend_free(backend);
