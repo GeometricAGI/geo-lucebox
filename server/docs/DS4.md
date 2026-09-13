@@ -875,11 +875,14 @@ split/copy dispatches or parallelizing work outside the routed-expert fork;
 adding the two devices' headline bandwidths is not a valid throughput model
 because attention, routing, HC boundaries, and every layer join remain ordered.
 
-On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
-the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
-Strix Halo Radeon 8060S using ROCm 7.2.4, the rebased candidate measured 32.12
-tok/s weighted at fixed q=4 and 31.94 tok/s with confidence-adaptive width,
-versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
+On HIP `gfx1151`, enabling DSpark installs the five-row fused verifier
+(`DFLASH_DS4_Q5_VERIFY=1`) and `LUCE_MMVQ_MAX_NCOLS=5` when the variables are
+unset, so the q5 verifier runs its projections on MMVQ; the plain launch below
+measures 39 tok/s at q5 on the code and math suites. The earlier four-row
+qualification is kept here for reference: with `LUCE_MMVQ_MAX_NCOLS=4` on a
+128 GiB Strix Halo Radeon 8060S using ROCm 7.2.4, the rebased candidate
+measured 32.12 tok/s weighted at fixed q=4 and 31.94 tok/s with
+confidence-adaptive width, versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
 same five GSM and five Math prompts. The run used `--ds4-expert-top-k 4`, the
 platform `performance` profile, and the GPU `high` performance level; fixed
 q=4 with the model-default six routed experts measured 28.26 tok/s. Those
