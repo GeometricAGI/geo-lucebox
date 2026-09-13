@@ -5993,6 +5993,12 @@ static void test_ds4_topk_block_radix_gpu(int ncols) {
 
 static void test_ds4_flash_attention_position_replay_gpu(bool require_gpu = false) {
     std::fprintf(stderr, "  test_ds4_flash_attention_position_replay_gpu ...\n");
+#if !defined(GGML_USE_HIP)
+    // The D512 DeepSeek4 flash-attention kernel exists on HIP only.
+    (void) require_gpu;
+    std::fprintf(stderr, "    skipped (HIP-only contract)\n");
+    return;
+#endif
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         TEST_ASSERT_MSG(!require_gpu, "position replay requires a GPU");
