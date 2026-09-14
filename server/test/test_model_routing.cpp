@@ -113,6 +113,12 @@ public:
             cv.wait(lock, [&] { return !block_step; });
         }
         StepResult result;
+        if (speculative_pressure && plan.decode.size() > 1 &&
+            std::any_of(plan.decode.begin(), plan.decode.end(),
+                [](const auto & input) { return input.allow_speculation; })) {
+            result.error = "unreserved speculative step";
+            return result;
+        }
         for (const auto & slice : plan.prefills) {
             result.prefills.push_back({slice.slot,
                 release ? PrefillOutput::Status::completed : PrefillOutput::Status::advanced,
@@ -121,6 +127,9 @@ public:
         for (const auto & input : plan.decode) {
             ROUTING_CHECK(!suspended[(size_t)input.slot]);
             auto & steps = decode_steps[(size_t)input.slot];
+            if (steps == 0 && first_decode_delay.count() > 0) {
+                std::this_thread::sleep_for(first_decode_delay);
+            }
             const int token = non_eos[(size_t)input.slot] ? 1 :
                 decode_pressure && !suspensions && steps < 2 ? 1 : 2;
             ++steps;
@@ -142,6 +151,12 @@ public:
     }
     bool reserve_decode(const StepPlan & plan) override {
         std::lock_guard<std::mutex> lock(mu);
+        if (speculative_pressure && plan.decode.size() > 1 &&
+            std::any_of(plan.decode.begin(), plan.decode.end(),
+                [](const auto & input) { return input.allow_speculation; })) {
+            ++speculative_retries;
+            return false;
+        }
         return !decode_pressure || plan.decode.size() < 2 ||
                decode_steps[0] == 0 || decode_steps[1] == 0;
     }
@@ -164,8 +179,17 @@ public:
     }
     bool restore_kv(int slot, std::string & error) override {
         std::lock_guard<std::mutex> lock(mu);
-        // Only a checkpoint copy can fail; a recompute resume is pure
-        // host-side reservation and always succeeds.
+        ++restore_attempts;
+        if (defer_restore_while_resident) {
+            for (size_t other = 0; other < active.size(); ++other) {
+                if ((int)other != slot && active[other] && !suspended[other]) {
+                    error.clear();
+                    return false;
+                }
+            }
+        }
+        // Inject a copy failure only for RAM checkpoints. Recompute has no
+        // payload to copy, but can still wait for capacity above.
         if (fail_restore && !recompute.at((size_t)slot)) {
             error = "injected restore failure";
             return false;
@@ -188,6 +212,7 @@ public:
         suspended[(size_t)slot] = true;
         recompute[(size_t)slot] = true;
         ++evictions;
+        block_step = hold_on_suspend;
         cv.notify_all();
         return true;
     }
@@ -203,7 +228,7 @@ public:
     }
     void wait_suspension() {
         std::unique_lock<std::mutex> lock(mu);
-        ROUTING_CHECK(cv.wait_for(lock, 5s, [&] { return suspensions == 1 && inside_block; }));
+        ROUTING_CHECK(cv.wait_for(lock, 5s, [&] { return suspensions + evictions == 1 && inside_block; }));
     }
     void wait_suspensions(int count) {
         std::unique_lock<std::mutex> lock(mu);
@@ -235,8 +260,13 @@ public:
     std::condition_variable cv;
     std::array<bool, 2> active{}, suspended{}, recompute{}, non_eos{};
     std::array<int, 2> decode_steps{};
+    std::chrono::milliseconds first_decode_delay{0};
     bool decode_pressure = false, hold_on_suspend = false, fail_restore = false;
+    bool speculative_pressure = false;
+    int speculative_retries = 0;
     bool fail_evict = false, feasible_restore = false;
+    bool defer_restore_while_resident = false;
+    int restore_attempts = 0;
     bool resumed_with_resident = false;
     int suspensions = 0, resumptions = 0, evictions = 0;
     size_t prompt_capacity = 64;
@@ -967,8 +997,8 @@ TEST_CASE(ModelRoutingFixture, test_decode_pressure_preserves_stream_and_routes_
 }
 
 TEST_CASE(ModelRoutingFixture, test_suspended_disconnect_and_shutdown_release_all_state) {
-    for (bool shutdown : {false, true}) {
-        RunningModels models(false, false, true, 1, false, 64);
+    for (bool shutdown : {false, true}) for (size_t budget : {size_t(64), size_t(1)}) {
+        RunningModels models(false, false, true, 1, false, budget);
         auto a = models.post(chat());
         models.first.engine.wait_admissions(1);
         auto b = models.post(chat());
@@ -1006,13 +1036,18 @@ TEST_CASE(ModelRoutingFixture, test_evict_for_recompute_preserves_request) {
         models.first.engine.wait_admissions(1);
         auto b = models.post(chat());
         models.first.engine.wait_admissions(2);
-        if (restore_error) {
+        {
             std::lock_guard<std::mutex> lock(models.first.engine.mu);
-            models.first.engine.fail_restore = true;
+            models.first.engine.fail_restore = restore_error;
+            // Both requests decode before B is evicted. Its response timings
+            // must retain this interval across completion of the re-prefill.
+            models.first.engine.first_decode_delay = 100ms;
         }
         models.first.engine.start_decode_pressure(false);
         ROUTING_CHECK(response_body(a.read())["model"] == "qwen");
-        ROUTING_CHECK(response_body(b.read())["model"] == "qwen");
+        const auto resumed = response_body(b.read());
+        ROUTING_CHECK(resumed["model"] == "qwen");
+        ROUTING_CHECK(resumed["usage"]["timings"]["decode_ms"].get<double>() >= 100.0);
         models.wait_load(0, 0);
         ROUTING_CHECK(models.first.engine.evictions == 1);
         ROUTING_CHECK(models.first.engine.retirements == 2);
@@ -1053,6 +1088,63 @@ TEST_CASE(ModelRoutingFixture, test_suspension_resumes_before_drain_when_feasibl
     models.wait_load(0, 0);
     ROUTING_CHECK(models.first.engine.suspensions >= 1);
     ROUTING_CHECK(models.first.engine.retirements == 2);
+}
+
+// Disabling RAM recovery must not disable preflight: speculation can still
+// shrink to one token, and an impossible AR row must not poison the cohort.
+TEST_CASE(ModelRoutingFixture, test_disabled_offload_still_preflights_decode) {
+    for (bool speculation_only : {true, false}) {
+        RunningModels models(false, false, true, 1, false, 0);
+        auto a = models.post(chat());
+        models.first.engine.wait_admissions(1);
+        auto b = models.post(chat());
+        models.first.engine.wait_admissions(2);
+        {
+            std::lock_guard<std::mutex> lock(models.first.engine.mu);
+            models.first.engine.speculative_pressure = speculation_only;
+            models.first.engine.decode_pressure = !speculation_only;
+            models.first.engine.release = true;
+        }
+        ROUTING_CHECK(response_body(a.read())["model"] == "qwen");
+        const auto result = response_body(b.read(), speculation_only ? 200 : 500);
+        if (speculation_only) {
+            ROUTING_CHECK(result["model"] == "qwen");
+            ROUTING_CHECK(models.first.engine.speculative_retries > 0);
+        } else {
+            ROUTING_CHECK(result["error"]["code"] == "decode_failed");
+        }
+        models.wait_load(0, 0);
+        ROUTING_CHECK(models.first.engine.suspensions == 0);
+        ROUTING_CHECK(models.first.engine.evictions == 0);
+        ROUTING_CHECK(models.first.engine.retirements == 2);
+    }
+}
+
+// A feasibility hint is not a reservation. If restore cannot obtain capacity,
+// the resident must still decode and eventually release its allocation.
+TEST_CASE(ModelRoutingFixture, test_deferred_restore_keeps_resident_progressing) {
+    for (size_t budget : {size_t(64), size_t(1)}) {
+        RunningModels models(false, false, true, 1, false, budget);
+        auto request = chat();
+        auto a = models.post(request);
+        models.first.engine.wait_admissions(1);
+        auto b = models.post(request);
+        models.first.engine.wait_admissions(2);
+        {
+            std::lock_guard<std::mutex> lock(models.first.engine.mu);
+            models.first.engine.non_eos[0] = true;
+            models.first.engine.feasible_restore = true;
+            models.first.engine.defer_restore_while_resident = true;
+        }
+        models.first.engine.start_decode_pressure(false);
+        const auto resident = response_body(a.read());
+        ROUTING_CHECK(resident["usage"]["completion_tokens"] == 4);
+        ROUTING_CHECK(response_body(b.read())["model"] == "qwen");
+        models.wait_load(0, 0);
+        ROUTING_CHECK(models.first.engine.restore_attempts > 1);
+        ROUTING_CHECK(models.first.engine.resumptions == 1);
+        ROUTING_CHECK(models.first.engine.retirements == 2);
+    }
 }
 
 // Termination is now reserved for requests whose context cannot fit the

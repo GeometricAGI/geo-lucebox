@@ -320,7 +320,8 @@ public:
     // True when a parked slot's resume reservation fits current free pool
     // capacity with headroom for the resident cohort's next step — the
     // scheduler's early-resume probe ahead of a full drain. A conservative
-    // false simply restores on drain only.
+    // false simply restores on drain only. This is a hint, not a reservation:
+    // restore_kv() may still report insufficient capacity.
     virtual bool kv_restore_feasible(int) const { return false; }
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.

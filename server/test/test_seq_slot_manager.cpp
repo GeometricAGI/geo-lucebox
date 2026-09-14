@@ -622,6 +622,8 @@ int main() {
         mgr.commit_prefill(b.slot);
         CHECK(mgr.append_token(b.slot, 41).ok);
         mgr.commit_step(b.slot);
+        // Preserve an advanced RNG, not merely its initial seed.
+        mgr.slot(b.slot).rng.discard(17);
         const auto saved_rng = mgr.slot(b.slot).rng;
 
         // A staged step boundary forbids eviction, as suspension does.
@@ -653,7 +655,32 @@ int main() {
         CHECK(mgr.append_prefill(b.slot, 6).ok);
         mgr.commit_prefill(b.slot);
         CHECK(mgr.slot(b.slot).decoding() && mgr.slot(b.slot).cur_pos == 6);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 2);
         CHECK(mgr.append_token(b.slot, 50).ok);
+        mgr.commit_step(b.slot);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 3);
+        // A second replay must still count from the original prompt, including
+        // the newly folded pending token, even while prefill is incomplete.
+        CHECK(mgr.evict_for_recompute(b.slot, 51));
+        CHECK(mgr.slot(b.slot).generated_tokens() == 4);
+        CHECK(mgr.resume_recompute(b.slot));
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 4);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        mgr.commit_prefill(b.slot);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 4);
+        CHECK(mgr.slot(b.slot).rng == saved_rng);
+        CHECK((mgr.slot(b.slot).sample_history ==
+               std::vector<int32_t>{1, 1, 1, 1, 41, 42, 50, 51}));
+        mgr.retire(b.slot);
+        auto c = admit(mgr, 3, prompt_tokens(2), greedy_sampler());
+        CHECK(is_admitted(c));
+        CHECK(mgr.slot(c.slot).generated_tokens() == 0);
+        CHECK(mgr.append_prefill(c.slot, 2).ok);
+        mgr.commit_prefill(c.slot);
+        CHECK(mgr.append_token(c.slot, 60).ok);
+        mgr.commit_step(c.slot);
+        CHECK(mgr.slot(c.slot).generated_tokens() == 1);
     }
 
     // A checkpointed suspension still converts to recompute (e.g. after a
@@ -674,6 +701,7 @@ int main() {
         CHECK(mgr.append_prefill(a.slot, 5).ok);
         mgr.commit_prefill(a.slot);
         CHECK(mgr.slot(a.slot).decoding() && mgr.slot(a.slot).cur_pos == 5);
+        CHECK(mgr.slot(a.slot).generated_tokens() == 1);
     }
 
     // A history that can never fit the pool alone refuses eviction, so the

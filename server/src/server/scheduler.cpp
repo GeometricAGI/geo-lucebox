@@ -848,7 +848,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                             : error});
                     retire_slot(oldest);
                 }
-                continue;
+                // A feasibility hint is not a reservation. Even when restore
+                // cannot proceed, let residents advance and release capacity.
             }
         }
 
@@ -872,7 +873,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 prefill_round_robin_start);
         };
         build_plan();
-        while (offload_budget && !engine.reserve_decode(step_plan)) {
+        while (!engine.reserve_decode(step_plan)) {
             // A speculative burst is optional. Try a one-token round before
             // suspending a request to make room for a wider accepted chain.
             for (auto & input : step_plan.decode) input.allow_speculation = false;
@@ -891,7 +892,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             });
             bool saved = false;
             std::string error;
-            if (residents.size() > 1) {
+            if (offload_budget && residents.size() > 1) {
                 const size_t available = offload_budget - std::min(offload_budget, used_bytes);
                 for (int victim : residents) {
                     if (engine.offload_kv(victim, available, error)) {
@@ -905,16 +906,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             if (!saved) {
                 // No checkpoint fit the RAM cap: park the newest decoder for
-                // recompute. Its blocks free immediately at zero RAM cost and
-                // chunked prefill rebuilds its state on resume — termination
-                // remains only for a request that cannot fit the pool alone.
+                // recompute. With recovery disabled, fail only that request
+                // before compute, then retry the remaining cohort.
                 int victim = -1;
                 for (int candidate : residents) {
                     if (!slots[(size_t)candidate].prefilling) { victim = candidate; break; }
                 }
                 if (victim < 0) break; // engines reserve prefills at admission
                 auto & s = slots[(size_t)victim];
-                if (engine.evict_kv(victim, s.pending_tok, error)) {
+                if (offload_budget && engine.evict_kv(victim, s.pending_tok, error)) {
                     std::fprintf(stderr,
                         "[parallel] slot %d parked for KV recompute\n", victim);
                     publish_live_count();
@@ -1014,9 +1014,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 // A prefill lane just became reusable, so the FIFO head may
                 // be admissible even though no KV blocks were retired.
                 deferred_retry_at = {};
-                s.decode_started_at = std::chrono::steady_clock::now();
-                s.prefill_s = std::chrono::duration<double>(
-                    s.decode_started_at - s.started_at).count();
+                // Recompute continues the same generation. Keep its original
+                // timing boundary so decode wall time includes parking and
+                // replay, matching the full response's completion-token count.
+                if (s.gen_tokens.empty()) {
+                    s.decode_started_at = std::chrono::steady_clock::now();
+                    s.prefill_s = std::chrono::duration<double>(
+                        s.decode_started_at - s.started_at).count();
+                }
                 advance_slot(s, out.token);
                 continue;
             }

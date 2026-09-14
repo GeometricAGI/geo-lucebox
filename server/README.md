@@ -336,7 +336,9 @@ This is conservative sizing, not a reservation against other processes.
 Use `--decode-kv-offload-mb 1024` to override the automatic value with a 1 GiB
 per-model cap, or `--decode-kv-offload-mb 0` to disable it. Explicit nonzero
 caps require concurrency greater than one. Automatic mode resolves to zero
-for single-request or unsupported engines.
+for single-request or unsupported engines. Disabling recovery still checks
+decode capacity and reduces speculation when necessary; if one-token decode
+cannot fit, only the selected request fails, before model execution.
 
 Before a decode step, the scheduler reserves its growth; if necessary it
 first reduces speculation to one token, then suspends a newer request.
@@ -350,9 +352,9 @@ admissions wait while any request is parked.
 A request that cannot be checkpointed within the RAM budget — or whose
 checkpoint cannot be copied back — is not terminated: it parks without a
 payload and resumes through ordinary chunked prefill over its retained
-token history, which rebuilds paged KV and slot-local state together. Only
-a request whose context cannot fit the pool even alone still produces an
-error.
+token history, which rebuilds paged KV and slot-local state together.
+Requests whose context cannot fit the pool even alone, and unrecoverable
+engine failures, still produce an error.
 
 This is an in-process checkpoint: it neither survives a server restart nor
 moves a request between models. RAM avoids disk I/O and checkpoint files.

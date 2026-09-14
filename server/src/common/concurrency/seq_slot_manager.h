@@ -39,8 +39,9 @@ enum class SeqSlotPhase {
 struct SeqSlot {
     SeqSlotPhase phase = SeqSlotPhase::free;
     PagedKvSequenceHandle handle;
-    // Prompt tokens are the immutable prefix of sample_history. Decode tokens
-    // append to the same allocation, avoiding a second full prompt copy.
+    // The original prompt boundary stays fixed for generation accounting.
+    // prompt_len is the prefill endpoint and grows when history is replayed.
+    int original_prompt_len = 0;
     int prompt_len = 0;
     int cur_pos = 0;
     SamplerCfg sampler;
@@ -56,8 +57,8 @@ struct SeqSlot {
     std::vector<int32_t> staged_tokens;
 
     int generated_tokens() const {
-        return sample_history.size() > (size_t)prompt_len
-            ? (int)(sample_history.size() - (size_t)prompt_len)
+        return sample_history.size() > (size_t)original_prompt_len
+            ? (int)(sample_history.size() - (size_t)original_prompt_len)
             : 0;
     }
 

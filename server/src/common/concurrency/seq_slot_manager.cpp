@@ -184,6 +184,7 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     s.phase = SeqSlotPhase::prefill;
     s.handle = handle;
     s.cur_pos = 0;
+    s.original_prompt_len = prompt_len;
     s.prompt_len = prompt_len;
     s.sampler = sampler;
     s.sample_history = prompt;
