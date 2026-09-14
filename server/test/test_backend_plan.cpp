@@ -107,15 +107,28 @@ void test_supported_specla_selects_ddtree() {
     CHECK(plan.warnings().empty());
 }
 
-void test_deepseek_options_have_an_explicit_group() {
+void test_deepseek_options_land_in_execution() {
     BackendArgs args = plain_args();
     args.ds4_expert_top_k = 4;
 
     BackendPreparation result = resolve(std::move(args), "deepseek4");
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(plan.deepseek4().expert_top_k == 4);
+    CHECK(plan.execution().expert_top_k == 4);
     CHECK(plan.execution().chunk == 512);
+}
+
+void test_specla_without_fast_rollback_falls_back() {
+    BackendArgs args = plain_args();
+    args.draft_path = "/models/draft.gguf";
+    args.specla_mode = true;
+    args.fast_rollback = false;
+
+    BackendPreparation result = resolve(std::move(args), "qwen35");
+    CHECK(std::holds_alternative<BackendPlan>(result));
+    const BackendPlan & plan = std::get<BackendPlan>(result);
+    CHECK(!plan.speculation().specla_mode);
+    CHECK(plan.warnings().size() == 1);
 }
 
 void test_explicit_specla_tau_is_preserved() {
@@ -215,7 +228,8 @@ void test_supported_specla_requires_a_draft() {
 
 TEST_CASE(BackendPlanFixture, backend_plan_suite) {
     test_plan_owns_the_effective_request();
-    test_deepseek_options_have_an_explicit_group();
+    test_deepseek_options_land_in_execution();
+    test_specla_without_fast_rollback_falls_back();
     test_supported_specla_selects_ddtree();
     test_explicit_specla_tau_is_preserved();
     test_kvflash_falls_back_to_ordinary_ddtree();

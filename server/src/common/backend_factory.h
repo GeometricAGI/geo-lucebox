@@ -49,7 +49,6 @@ public:
     struct Cache {
         int fa_window = 0;
         bool paged_attention = false;
-        int max_concurrency = 1;
         long long kv_pool_tokens = 0;
         ggml_type cache_type_k = GGML_TYPE_COUNT;
         ggml_type cache_type_v = GGML_TYPE_COUNT;
@@ -65,7 +64,6 @@ public:
         bool seq_verify = false;
         bool specla_mode = false;
         int specla_top_k = 4;
-        bool specla_top_k_explicit = false;
         bool ddtree_mode = false;
         int ddtree_budget = 22;
         float ddtree_temp = 1.0f;
@@ -75,12 +73,14 @@ public:
         bool use_feature_mirror = false;
     };
 
+    // How the backend runs: daemon I/O, prefill chunking, decode-slot
+    // scheduling, and the deepseek4 decode knobs (inert elsewhere — the gate
+    // rejects them on other architectures).
     struct Execution {
         int stream_fd = -1;
         int chunk = 512;
-    };
+        int max_concurrency = 1;
 
-    struct DeepSeek4 {
         PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
         int expert_top_k = 0;
         bool fused_decode = false;
@@ -97,17 +97,10 @@ public:
     const Cache & cache() const { return cache_; }
     const Speculation & speculation() const { return speculation_; }
     const Execution & execution() const { return execution_; }
-    const DeepSeek4 & deepseek4() const { return deepseek4_; }
     const std::string & arch() const { return model_.metadata.arch; }
     const std::vector<std::string> & warnings() const { return warnings_; }
 
 private:
-    enum class SpeclaEnvironmentAction {
-        Preserve,
-        Enable,
-        Disable,
-    };
-
     BackendPlan() = default;
 
     Model model_;
@@ -115,14 +108,9 @@ private:
     Cache cache_;
     Speculation speculation_;
     Execution execution_;
-    DeepSeek4 deepseek4_;
     std::vector<std::string> warnings_;
-    SpeclaEnvironmentAction specla_environment_ =
-        SpeclaEnvironmentAction::Preserve;
 
     friend class detail::BackendPlanBuilder;
-    friend std::unique_ptr<ModelBackend> create_backend(
-        const BackendPlan & plan);
 };
 
 enum class BackendPreparationError {

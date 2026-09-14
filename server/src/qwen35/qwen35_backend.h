@@ -14,6 +14,7 @@
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
+#include "common/specla_mode.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
@@ -85,6 +86,12 @@ struct Qwen35Config {
     // Speculative decode strategy
     bool         fast_rollback   = true;
     bool         seq_verify      = false;
+    // SpecLA state-resident verification (--specla). specla_top_k keeps the
+    // DFLASH_SPECLA_TOPK env as its default for non-CLI harnesses
+    // (docs/SPECLA.md); the factory always overwrites both with the
+    // normalized BackendPlan values.
+    bool         specla_mode     = false;
+    int          specla_top_k    = specla_tree_topk();
     bool         ddtree_mode     = false;
     int          ddtree_budget   = 22;
     float        ddtree_temp     = 1.0f;

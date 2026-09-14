@@ -925,8 +925,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         backend_plan.speculation();
     const BackendPlan::Execution & backend_execution =
         backend_plan.execution();
-    const BackendPlan::DeepSeek4 & backend_deepseek4 =
-        backend_plan.deepseek4();
     const std::string & arch = backend_plan.arch();
     if (multi_model && !backend_cache.paged_attention && arch != "deepseek4" && arch != "qwen35") {
         std::fprintf(stderr,
@@ -1398,18 +1396,18 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                  sconfig.admission_coalesce_ms);
     if (arch == "deepseek4") {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
-                     backend_deepseek4.fused_decode ? "ON" : "off");
+                     backend_execution.fused_decode ? "ON" : "off");
         std::fprintf(stderr, "[server] │  ds4_verify_f16kv= %s\n",
-                     backend_deepseek4.fused_verify_f16_kv ? "ON" : "off");
-        if (backend_deepseek4.expert_top_k > 0) {
+                     backend_execution.fused_verify_f16_kv ? "ON" : "off");
+        if (backend_execution.expert_top_k > 0) {
             std::fprintf(stderr, "[server] │  ds4_expert_topk= %d\n",
-                         backend_deepseek4.expert_top_k);
+                         backend_execution.expert_top_k);
         } else {
             std::fprintf(stderr, "[server] │  ds4_expert_topk= model default\n");
         }
         std::fprintf(stderr, "[server] │  ds4_prefill     = %s\n",
                      prefill_attention_mode_name(
-                         backend_deepseek4.prefill_mode));
+                         backend_execution.prefill_mode));
     }
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", backend_cache.fa_window);
     if (backend_cache.fa_window > 0) {

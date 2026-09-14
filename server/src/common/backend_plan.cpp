@@ -72,20 +72,29 @@ BackendPreparation BackendPlanBuilder::resolve(
     std::vector<std::string> warnings =
         collect_feature_warnings(args, model.arch);
 
-    BackendPlan::SpeclaEnvironmentAction specla_environment =
-        BackendPlan::SpeclaEnvironmentAction::Preserve;
-
     if (args.specla_mode) {
         const bool supported =
             model.arch == "qwen35" && !args.device.is_multi_device();
-        if (supported) {
-            if (!args.draft_path.has_value()) {
-                return failure(
-                    BackendPreparationError::FeatureCompatibility,
-                    "Qwen3.6 SpecLA requires --draft <path>",
-                    std::move(warnings));
-            }
-
+        if (!supported) {
+            warnings.push_back(
+                "--specla is unavailable for architecture '" + model.arch +
+                "' with placement " + placement_device_name(args.device) +
+                "; using the architecture's normal decode path");
+            args.specla_mode = false;
+        } else if (!args.fast_rollback) {
+            // The CLI rejects --specla with --no-fast-rollback before
+            // admission; this guard covers callers that build BackendArgs
+            // directly.
+            warnings.push_back(
+                "--specla requires fast rollback; using the normal decode "
+                "path");
+            args.specla_mode = false;
+        } else if (!args.draft_path.has_value()) {
+            return failure(
+                BackendPreparationError::FeatureCompatibility,
+                "Qwen3.6 SpecLA requires --draft <path>",
+                std::move(warnings));
+        } else {
             args.ddtree_mode = true;
             if (admission.kvflash_requested()) {
                 warnings.push_back(
@@ -93,17 +102,7 @@ BackendPreparation BackendPlanBuilder::resolve(
                     "DDTree verification");
                 args.specla_mode = false;
             }
-        } else {
-            warnings.push_back(
-                "--specla is unavailable for architecture '" + model.arch +
-                "' with placement " + placement_device_name(args.device) +
-                "; using the architecture's normal decode path");
-            args.specla_mode = false;
         }
-
-        specla_environment = args.specla_mode
-            ? BackendPlan::SpeclaEnvironmentAction::Enable
-            : BackendPlan::SpeclaEnvironmentAction::Disable;
         if (!args.specla_mode && !args.ddtree_tau_explicit) {
             args.ddtree_tau = std::numeric_limits<float>::infinity();
         }
@@ -132,7 +131,6 @@ BackendPreparation BackendPlanBuilder::resolve(
 
     plan.cache_.fa_window = args.fa_window;
     plan.cache_.paged_attention = args.paged_attention;
-    plan.cache_.max_concurrency = args.max_concurrency;
     plan.cache_.kv_pool_tokens = args.kv_pool_tokens;
     plan.cache_.cache_type_k = args.cache_type_k;
     plan.cache_.cache_type_v = args.cache_type_v;
@@ -146,8 +144,6 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.speculation_.seq_verify = args.seq_verify;
     plan.speculation_.specla_mode = args.specla_mode;
     plan.speculation_.specla_top_k = args.specla_top_k;
-    plan.speculation_.specla_top_k_explicit =
-        args.specla_top_k_explicit;
     plan.speculation_.ddtree_mode = args.ddtree_mode;
     plan.speculation_.ddtree_budget = args.ddtree_budget;
     plan.speculation_.ddtree_temp = args.ddtree_temp;
@@ -158,14 +154,14 @@ BackendPreparation BackendPlanBuilder::resolve(
 
     plan.execution_.stream_fd = args.stream_fd;
     plan.execution_.chunk = args.chunk;
-    plan.deepseek4_.prefill_mode = args.ds4_prefill_mode;
-    plan.deepseek4_.expert_top_k = args.ds4_expert_top_k;
-    plan.deepseek4_.fused_decode = args.ds4_fused_decode;
-    plan.deepseek4_.fused_verify_f16_kv =
+    plan.execution_.max_concurrency = args.max_concurrency;
+    plan.execution_.prefill_mode = args.ds4_prefill_mode;
+    plan.execution_.expert_top_k = args.ds4_expert_top_k;
+    plan.execution_.fused_decode = args.ds4_fused_decode;
+    plan.execution_.fused_verify_f16_kv =
         args.ds4_fused_verify_f16_kv;
 
     plan.warnings_ = std::move(warnings);
-    plan.specla_environment_ = specla_environment;
     return plan;
 }
 

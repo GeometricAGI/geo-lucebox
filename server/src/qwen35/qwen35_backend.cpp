@@ -1782,7 +1782,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const int max_verify_tokens = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size;
-        const bool enable_specla = cfg_.fast_rollback &&
+        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
@@ -2840,7 +2840,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
     if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
-        const bool enable_specla = cfg_.fast_rollback &&
+        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
@@ -3265,7 +3265,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // keep the legacy width only outside SpecLA.
             const int K = (cfg_.ddtree_budget > L)
                 ? (target->exact_fast_rollback()
-                    ? std::min(specla_tree_topk(), w_.n_vocab)
+                    ? std::min(cfg_.specla_top_k, w_.n_vocab)
                     : 8)
                 : 1;
             DDTree tree;

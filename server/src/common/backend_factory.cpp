@@ -4,7 +4,6 @@
 #include "backend_plan_internal.h"
 #include "gguf_inspect.h"
 #include "model_capabilities.h"
-#include "platform_env.h"
 
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
@@ -158,7 +157,6 @@ std::unique_ptr<ModelBackend> construct_backend(
     const BackendPlan::Cache & cache = plan.cache();
     const BackendPlan::Speculation & speculation = plan.speculation();
     const BackendPlan::Execution & execution = plan.execution();
-    const BackendPlan::DeepSeek4 & deepseek4 = plan.deepseek4();
     const std::string & arch = plan.arch();
     if (arch == "qwen35") {
         if (placement.target.is_layer_split()) {
@@ -200,7 +198,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.cache_type_k       = cache.cache_type_k;
         cfg.cache_type_v       = cache.cache_type_v;
         cfg.paged_attention    = cache.paged_attention;
-        cfg.max_concurrency    = cache.max_concurrency;
+        cfg.max_concurrency    = execution.max_concurrency;
         cfg.kv_pool_tokens     = cache.kv_pool_tokens;
         cfg.kq_stride_pad      = cache.kq_stride_pad;
         cfg.draft_block_size   = speculation.draft_block_size;
@@ -208,6 +206,8 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.draft_ctx_max      = cache.draft_ctx_max;
         cfg.fast_rollback      = speculation.fast_rollback;
         cfg.seq_verify         = speculation.seq_verify;
+        cfg.specla_mode        = speculation.specla_mode;
+        cfg.specla_top_k       = speculation.specla_top_k;
         cfg.ddtree_mode        = speculation.ddtree_mode;
         cfg.ddtree_budget      = speculation.ddtree_budget;
         cfg.ddtree_temp        = speculation.ddtree_temp;
@@ -235,6 +235,9 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.draft_ctx_max      = cache.draft_ctx_max;
         cfg.fast_rollback      = speculation.fast_rollback;
         cfg.seq_verify         = speculation.seq_verify;
+        // SpecLA is a qwen35-only path; normalization has already cleared
+        // specla_mode for any other arch, so forward the plan value as-is.
+        cfg.specla_mode        = speculation.specla_mode;
         cfg.ddtree_mode        = speculation.ddtree_mode;
         cfg.ddtree_budget      = speculation.ddtree_budget;
         cfg.ddtree_temp        = speculation.ddtree_temp;
@@ -369,12 +372,12 @@ std::unique_ptr<ModelBackend> construct_backend(
             cfg.stream_fd  = execution.stream_fd;
             cfg.max_ctx    = placement.target.max_ctx;
             cfg.chunk      = execution.chunk;
-            cfg.expert_top_k = deepseek4.expert_top_k;
-            cfg.fused_decode = deepseek4.fused_decode;
-            cfg.fused_verify_f16_kv = deepseek4.fused_verify_f16_kv;
-            cfg.prefill_mode = deepseek4.prefill_mode;
+            cfg.expert_top_k = execution.expert_top_k;
+            cfg.fused_decode = execution.fused_decode;
+            cfg.fused_verify_f16_kv = execution.fused_verify_f16_kv;
+            cfg.prefill_mode = execution.prefill_mode;
             cfg.paged_attention = cache.paged_attention;
-            cfg.max_concurrency = cache.max_concurrency;
+            cfg.max_concurrency = execution.max_concurrency;
             cfg.kv_pool_tokens = cache.kv_pool_tokens;
 
             auto backend = std::make_unique<DeepSeek4Backend>(std::move(cfg));
@@ -429,23 +432,6 @@ BackendPreparation prepare_backend(
 }
 
 std::unique_ptr<ModelBackend> create_backend(const BackendPlan & plan) {
-    switch (plan.specla_environment_) {
-        case BackendPlan::SpeclaEnvironmentAction::Preserve:
-            break;
-        case BackendPlan::SpeclaEnvironmentAction::Enable:
-            set_environment_variable("DFLASH_SPECLA", "1", true);
-            if (plan.speculation_.specla_top_k_explicit) {
-                const std::string top_k =
-                    std::to_string(plan.speculation_.specla_top_k);
-                set_environment_variable(
-                    "DFLASH_SPECLA_TOPK", top_k.c_str(), true);
-            }
-            break;
-        case BackendPlan::SpeclaEnvironmentAction::Disable:
-            unset_environment_variable("DFLASH_SPECLA");
-            break;
-    }
-
     std::fprintf(
         stderr,
         "[backend_factory] detected arch=%s\n",
