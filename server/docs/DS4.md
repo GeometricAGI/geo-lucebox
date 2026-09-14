@@ -219,10 +219,14 @@ Measured with this command on an R9700 + Strix Halo machine (fixed-codebook
 ROCmFPx target, 18432-token context, greedy, every output deterministic
 across repeats and identical between streaming and non-streaming):
 
-| prefill mode | 4772-token prompt | 9487-token prompt | decode on chat prompts |
-| --- | ---: | ---: | ---: |
-| `sparse` (batched) | 16.7 s (286 tok/s) | 33.8 s (281 tok/s) | 25-38 tok/s |
-| `exact` (token-wise) | 334 s (14 tok/s) | 677 s (14 tok/s) | 25-45 tok/s |
+| prefill mode | 4772-token prompt | 9487-token prompt | decode, chat prompts | decode, code prompts |
+| --- | ---: | ---: | ---: | ---: |
+| `sparse` (batched) | 16.7 s (286 tok/s) | 33.8 s (281 tok/s) | 25-38 tok/s | 36-42 tok/s |
+| `exact` (token-wise) | 334 s (14 tok/s) | 677 s (14 tok/s) | 25-45 tok/s | - |
+
+Decode speed follows the drafter's acceptance (about 0.5 on chat, 0.7 on
+code). `DFLASH_DS4_ADAPTIVE_WIDTH=1` is accepted on this path but measured no
+gain over the fixed q5 verifier here (code 36-42 tok/s either way).
 
 `--ds4-prefill sparse` is the batched prefill and the one to use for prompts
 beyond a few hundred tokens. `exact` is the token-wise reference: on this path
