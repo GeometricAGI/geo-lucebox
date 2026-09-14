@@ -5357,6 +5357,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     graph->replay_streak = 0;
                     if (++graph->churn >= ggml_cuda_graph::kMaxChurn) {
                         graph->disable_due_to_churn = true;
+                        // This key evaluates eagerly from now on: release the
+                        // executable and captured graph it would otherwise
+                        // keep resident (its lookups keep it out of the LRU).
+                        if (graph->instance != nullptr || graph->graph != nullptr) {
+                            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        }
+                        if (graph->instance != nullptr) {
+                            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                            graph->instance = nullptr;
+                        }
+                        if (graph->graph != nullptr) {
+                            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                            graph->graph = nullptr;
+                        }
+                        graph->nodes.clear();
+                        graph->nodes.shrink_to_fit();
+                        graph->node_props.clear();
+                        graph->node_props.shrink_to_fit();
                         if (log_graph_warmup) {
                             GGML_LOG_DEBUG("%s: CUDA graph disabled for key %p after %d warmup resets\n",
                                            __func__, graph_key, graph->churn);

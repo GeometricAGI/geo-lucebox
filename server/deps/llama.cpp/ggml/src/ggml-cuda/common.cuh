@@ -1469,15 +1469,27 @@ struct ggml_backend_cuda_context {
             if (raw == nullptr || *raw == '\0') {
                 return (size_t) 512;
             }
-            const long requested = strtol(raw, nullptr, 10);
-            return requested > 0 ? (size_t) requested : (size_t) 0;
+            char * end = nullptr;
+            const long requested = strtol(raw, &end, 10);
+            if (end == raw || *end != '\0' || requested < 0) {
+                return (size_t) 512;      // malformed or negative: keep the default cap
+            }
+            return (size_t) requested;    // an exact 0 disables the cap
         }();
         return cap;
     }
 
-    void cuda_graph_evict_lru(size_t keep_below) {
+    // Retire in batches: one stream drain per kGraphEvictBatch new keys
+    // instead of one per key on the pre-capture path.
+    static constexpr size_t kGraphEvictBatch = 64;
+
+    void cuda_graph_evict_lru(size_t cap) {
+        if (cap == 0 || cuda_graphs.size() < cap) {
+            return;
+        }
+        const size_t target = cap > kGraphEvictBatch ? cap - kGraphEvictBatch : 0;
         bool synchronized = false;
-        while (keep_below > 0 && cuda_graphs.size() >= keep_below) {
+        while (cuda_graphs.size() > target) {
             auto victim = cuda_graphs.end();
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
                 if (victim == cuda_graphs.end() || it->second->last_use < victim->second->last_use) {
@@ -1487,7 +1499,8 @@ struct ggml_backend_cuda_context {
             if (victim == cuda_graphs.end()) {
                 break;
             }
-            if (!synchronized) {
+            if (!synchronized &&
+                (victim->second->instance != nullptr || victim->second->graph != nullptr)) {
                 // An evicted executable may still be queued; retire it only
                 // after the stream has drained.
                 CUDA_CHECK(cudaStreamSynchronize(stream()));

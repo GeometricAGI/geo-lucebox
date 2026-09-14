@@ -5599,6 +5599,7 @@ struct DeepSeek4LayerRangeCache {
     // and the LRU tick.
     size_t decode_attn_cache_bytes = 0;
     size_t decode_attn_cache_budget = 0;
+    size_t decode_attn_cache_max_entry = 0;
     uint64_t decode_attn_cache_tick = 0;
     std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
@@ -5694,6 +5695,7 @@ struct DeepSeek4LayerRangeCache {
         cached_decode_attn_graphs.clear();
         decode_attn_cache_bytes = 0;
         decode_attn_cache_budget = 0;
+        decode_attn_cache_max_entry = 0;
         for (auto & graph : cached_decode_ffn_graphs) {
             graph.free();
         }
@@ -5739,18 +5741,22 @@ static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
         const char * raw = std::getenv("DFLASH_DS4_DECODE_ATTN_CACHE_MB");
         return raw && *raw ? std::strtol(raw, nullptr, 10) : 0L;
     }();
-    size_t budget = 0;
     if (override_mb > 0) {
-        budget = (size_t) override_mb * 1024 * 1024;
-    } else if (rc.device >= 0 && rc.backend && ggml_backend_is_cuda(rc.backend)) {
-        size_t free_bytes = 0;
-        size_t total_bytes = 0;
-        ggml_backend_cuda_get_device_memory(rc.device, &free_bytes, &total_bytes);
-        (void) total_bytes;
-        budget = free_bytes / 4;
+        // An explicit override is taken as given; the floor below only
+        // protects the automatic budget.
+        rc.decode_attn_cache_budget = (size_t) override_mb * 1024 * 1024;
+    } else {
+        size_t budget = 0;
+        if (rc.device >= 0 && rc.backend && ggml_backend_is_cuda(rc.backend)) {
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            ggml_backend_cuda_get_device_memory(rc.device, &free_bytes, &total_bytes);
+            (void) total_bytes;
+            budget = free_bytes / 4;
+        }
+        constexpr size_t kMinBudget = (size_t) 256 * 1024 * 1024;
+        rc.decode_attn_cache_budget = std::max(budget, kMinBudget);
     }
-    constexpr size_t kMinBudget = (size_t) 256 * 1024 * 1024;
-    rc.decode_attn_cache_budget = std::max(budget, kMinBudget);
     std::fprintf(stderr,
                  "[deepseek4] decode attention graph cache budget %.1f MiB\n",
                  rc.decode_attn_cache_budget / (1024.0 * 1024.0));
@@ -5758,22 +5764,24 @@ static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
 }
 
 // Evict the least recently used cached decode attention graphs until
-// `incoming_bytes` more fit the budget. `skip` (the layer vector holding a
-// graph under construction) is left alone.
+// `incoming_bytes` more fit the budget. The entry at `keep_index` of
+// `keep_layer` (the graph just built) is never chosen; every other graph,
+// including older ones of the same layer, is a candidate.
 static void ds4_decode_attn_cache_trim(
         DeepSeek4LayerRangeCache & rc,
         size_t incoming_bytes,
-        const std::vector<DeepSeek4CachedDecodeAttnGraph> * skip) {
+        const std::vector<DeepSeek4CachedDecodeAttnGraph> * keep_layer,
+        size_t keep_index) {
     const size_t budget = ds4_decode_attn_cache_budget(rc);
     while (rc.decode_attn_cache_bytes + incoming_bytes > budget) {
         std::vector<DeepSeek4CachedDecodeAttnGraph> * victim_layer = nullptr;
         size_t victim_index = 0;
         uint64_t oldest = std::numeric_limits<uint64_t>::max();
         for (auto & per_layer : rc.cached_decode_attn_graphs) {
-            if (&per_layer == skip) {
-                continue;
-            }
             for (size_t i = 0; i < per_layer.size(); ++i) {
+                if (&per_layer == keep_layer && i == keep_index) {
+                    continue;
+                }
                 if (per_layer[i].last_use < oldest) {
                     oldest = per_layer[i].last_use;
                     victim_layer = &per_layer;
@@ -8826,11 +8834,14 @@ bool deepseek4_step_layer_range(
                         per_layer.front().free();
                         per_layer.erase(per_layer.begin());
                     }
-                    // Make room first, sized by this layer's newest entry.
+                    // Make room first, reserving the largest graph cached so
+                    // far so a bigger shape does not fail its allocation and
+                    // fall into the evict-everything retry below.
                     ds4_decode_attn_cache_trim(
                         layer_range_cache,
-                        per_layer.empty() ? 0 : per_layer.back().device_bytes,
-                        nullptr);
+                        std::max(layer_range_cache.decode_attn_cache_max_entry,
+                                 per_layer.empty() ? (size_t) 0 : per_layer.back().device_bytes),
+                        nullptr, 0);
                     per_layer.emplace_back();
                     auto & candidate = per_layer.back();
                     const auto attn_build_t0 = Ds4TimingClock::now();
@@ -8876,7 +8887,12 @@ bool deepseek4_step_layer_range(
                     it->device_bytes = it->sg.alloc
                         ? ggml_gallocr_get_buffer_size(it->sg.alloc, 0) : 0;
                     layer_range_cache.decode_attn_cache_bytes += it->device_bytes;
-                    ds4_decode_attn_cache_trim(layer_range_cache, 0, &per_layer);
+                    layer_range_cache.decode_attn_cache_max_entry = std::max(
+                        layer_range_cache.decode_attn_cache_max_entry, it->device_bytes);
+                    // The new graph is the back of its layer; keep exactly it.
+                    ds4_decode_attn_cache_trim(layer_range_cache, 0, &per_layer,
+                                               per_layer.size() - 1);
+                    it = std::prev(per_layer.end());
                     if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
                 }
                 it->last_use = ++layer_range_cache.decode_attn_cache_tick;
