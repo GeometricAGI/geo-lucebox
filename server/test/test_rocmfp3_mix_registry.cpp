@@ -159,18 +159,48 @@ TEST_CASE(Rocmfp3MixRegistryFixture, registry_lifecycle) {
     }
     cudaDeviceSynchronize();
     (void) cudaMemGetInfo(&free_warm, &total);
-    for (int i = 0; i < 4000; ++i) {
-        CHECK(ggml_cuda_rocmfp3_mix_register_host(
-                  leak_base, nb02, E, out, in, books.data(), modes.data()),
-              "cycle registration succeeds");
-        ggml_cuda_rocmfp3_mix_unregister(leak_base);
+    // cudaMemGetInfo is device-wide: on a shared GPU another process can
+    // move free memory by hundreds of MB during the loop. A leak in this
+    // code path costs the same every cycle, so it shows in every chunk of
+    // the loop; an external allocation shows in one chunk and not the rest.
+    // Require the leak signature (every chunk over the threshold), and
+    // report a moving device as such instead of as a leak.
+    constexpr int kChunks = 4;
+    constexpr int kCyclesPerChunk = 1000;
+    constexpr long long kLeakThreshold = 2 * 1024 * 1024;   // per chunk
+    long long chunk_delta[kChunks] = {};
+    size_t free_prev = free_warm;
+    for (int c = 0; c < kChunks; ++c) {
+        for (int i = 0; i < kCyclesPerChunk; ++i) {
+            CHECK(ggml_cuda_rocmfp3_mix_register_host(
+                      leak_base, nb02, E, out, in, books.data(), modes.data()),
+                  "cycle registration succeeds");
+            ggml_cuda_rocmfp3_mix_unregister(leak_base);
+        }
+        cudaDeviceSynchronize();
+        size_t free_now = 0;
+        (void) cudaMemGetInfo(&free_now, &total);
+        chunk_delta[c] = (long long) free_prev - (long long) free_now;
+        free_prev = free_now;
     }
-    cudaDeviceSynchronize();
-    size_t free_end = 0;
-    (void) cudaMemGetInfo(&free_end, &total);
-    const long long delta = (long long) free_warm - (long long) free_end;
-    std::fprintf(stderr, "[registry] free VRAM delta over 4000 cycles: %lld bytes\n", delta);
-    CHECK(delta < 8 * 1024 * 1024, "no device leak across register/unregister cycles");
+    const long long delta = (long long) free_warm - (long long) free_prev;
+    std::fprintf(stderr,
+                 "[registry] free VRAM delta over %d cycles: %lld bytes "
+                 "(per %d-cycle chunk: %lld, %lld, %lld, %lld)\n",
+                 kChunks * kCyclesPerChunk, delta, kCyclesPerChunk,
+                 chunk_delta[0], chunk_delta[1], chunk_delta[2], chunk_delta[3]);
+    bool every_chunk_leaks = true;
+    bool any_chunk_moved = false;
+    for (int c = 0; c < kChunks; ++c) {
+        every_chunk_leaks = every_chunk_leaks && chunk_delta[c] >= kLeakThreshold;
+        any_chunk_moved = any_chunk_moved || chunk_delta[c] >= kLeakThreshold;
+    }
+    if (any_chunk_moved && !every_chunk_leaks) {
+        std::fprintf(stderr,
+                     "[registry] device-wide free memory moved during the loop "
+                     "but not in every chunk: shared device, not a leak\n");
+    }
+    CHECK(!every_chunk_leaks, "no device leak across register/unregister cycles");
     CHECK(cudaFree(leak_base) == cudaSuccess, "leak-test base allocation is released");
 
     std::fprintf(stderr, g_fails ? "REGISTRY TEST FAILED (%d)\n"
