@@ -2007,6 +2007,7 @@ if(DFLASH27B_TESTS)
             test/test_backend_plan.cpp
             src/common/backend_plan.cpp
             src/common/feature_gate.cpp
+            src/kv_quant.cpp
             src/placement/placement_config.cpp)
         target_include_directories(test_feature_gate PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src

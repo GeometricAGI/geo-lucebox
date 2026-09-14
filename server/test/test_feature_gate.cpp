@@ -168,7 +168,7 @@ void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
 
 void test_feature_gate_ds4_pflash_rejects_layer_split() {
     BackendArgs args = gate_args_hip_deepseek4();
-    BackendFeatureConfig features;
+    BackendAdmissionContext features;
     features.pflash_enabled = true;
     features.pflash_drafter_configured = true;
     CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());

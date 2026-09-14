@@ -873,6 +873,14 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         }
     }
 
+    // Explicit --cache-type-* overrides enter the request here; the qwen35
+    // env/default resolution runs inside prepare_backend() once the model
+    // architecture is known. Other families still consume their env vars.
+    if (!cache_type_k.empty())
+        bargs.cache_type_k = dflash::parse_kv_type(cache_type_k.c_str());
+    if (!cache_type_v.empty())
+        bargs.cache_type_v = dflash::parse_kv_type(cache_type_v.c_str());
+
     // Ask the factory to resolve model/placement facts and apply its feature
     // admission policy before any setup work. server_main only maps the
     // categorized result to the existing process exit convention.
@@ -946,7 +954,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // This rewrites ServerConfig rather than rejecting the launch, which is
     // why it lives here and not in the gate.
     if (backend_cache.paged_attention) {
-        if (backend_cache.max_concurrency > 1) {
+        if (backend_execution.max_concurrency > 1) {
             if (sconfig.prefix_cache_cap > 0) {
                 std::fprintf(stderr,
                     "[server] concurrent paged serving enables copied in-memory "
@@ -967,7 +975,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
     sconfig.concurrent_paged_prefix_cache =
-        backend_cache.paged_attention && backend_cache.max_concurrency > 1 &&
+        backend_cache.paged_attention && backend_execution.max_concurrency > 1 &&
         sconfig.prefix_cache_cap > 0;
 
     if (sconfig.agent_turn_cache && backend_cache.paged_attention) {
@@ -1018,13 +1026,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 
     // Monolithic Qwen owns its KV overrides, including allocation/budgeting.
     // DS4 has a family-specific cache layout and never consumed these flags.
-    if (arch == "qwen35" && !bargs.device.is_multi_device()) {
-        if (!cache_type_k.empty()) bargs.cache_type_k = dflash::parse_kv_type(cache_type_k.c_str());
-        if (!cache_type_v.empty()) bargs.cache_type_v = dflash::parse_kv_type(cache_type_v.c_str());
-        dflash::resolve_kv_types(bargs.cache_type_k, bargs.cache_type_v,
-                                bargs.cache_type_k, bargs.cache_type_v);
-        cache_type_k = dflash::kv_type_name(bargs.cache_type_k);
-        cache_type_v = dflash::kv_type_name(bargs.cache_type_v);
+    if (arch == "qwen35" && !backend_placement.target.is_multi_device()) {
+        cache_type_k = dflash::kv_type_name(backend_cache.cache_type_k);
+        cache_type_v = dflash::kv_type_name(backend_cache.cache_type_v);
     } else if (arch == "deepseek4") {
         if (!cache_type_k.empty() || !cache_type_v.empty()) {
             std::fprintf(stderr, "[server] model '%s': --cache-type-k/v are ignored by DeepSeek4's fixed cache layout\n", sconfig.model_name.c_str());

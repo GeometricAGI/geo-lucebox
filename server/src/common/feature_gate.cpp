@@ -52,7 +52,7 @@ std::string check_feature_compatibility(
         !admission.pflash_drafter_configured) {
         return "--prefill-compression requires --prefill-drafter";
     }
-    if (features.pflash_enabled && arch == "deepseek4" &&
+    if (admission.pflash_enabled && arch == "deepseek4" &&
         args.device.is_layer_split()) {
         return "--prefill-compression is not supported with DeepSeek4 layer splitting";
     }

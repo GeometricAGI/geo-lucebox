@@ -2,6 +2,7 @@
 
 #include "feature_gate.h"
 #include "model_capabilities.h"
+#include "kv_quant.h"
 
 #include <limits>
 #include <utility>
@@ -53,6 +54,14 @@ BackendPreparation BackendPlanBuilder::resolve(
 
     const PlacementBackend target_backend =
         resolve_target_backend(args, compiled_backend);
+
+    // Monolithic qwen35 resolves KV cache element types as part of planning:
+    // explicit --cache-type overrides first, then env, then the family
+    // default. Other families keep their own env-driven resolution.
+    if (model.arch == "qwen35" && !args.device.is_multi_device()) {
+        dflash::resolve_kv_types(args.cache_type_k, args.cache_type_v,
+                                 args.cache_type_k, args.cache_type_v);
+    }
 
     if (args.specla_mode && !args.ddtree_tau_explicit) {
         args.ddtree_tau = 6.0f;
