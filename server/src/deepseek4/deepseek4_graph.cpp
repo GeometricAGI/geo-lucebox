@@ -357,11 +357,20 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
 // its executables in destroy(); the heterogeneous path runs on these per-layer
 // caches instead, so give them the same treatment.
 static void ds4_retire_native_graphs(ggml_backend_t backend, const StepGraph & sg) {
-    if (!backend || sg.meta_arena.empty() || !ggml_backend_is_cuda(backend)) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
         return;
     }
-    ggml_backend_cuda_graph_invalidate_range(
-        backend, sg.meta_arena.data(), sg.meta_arena.size());
+    // The per-layer caches build their context with ggml's own metadata
+    // buffer (mem_buffer = nullptr), so the nodes live in the context, not in
+    // sg.meta_arena; cover both.
+    if (!sg.meta_arena.empty()) {
+        ggml_backend_cuda_graph_invalidate_range(
+            backend, sg.meta_arena.data(), sg.meta_arena.size());
+    }
+    if (sg.ctx) {
+        ggml_backend_cuda_graph_invalidate_range(
+            backend, ggml_get_mem_buffer(sg.ctx), ggml_get_mem_size(sg.ctx));
+    }
 }
 
 struct DeepSeek4CachedDecodeFfnGraph {
@@ -5716,10 +5725,12 @@ struct DeepSeek4LayerRangeCache {
 // Twenty of them per layer (43 layers, 4-16 MiB each) exceed what the target
 // GPU has left next to the hot experts and the drafter in the heterogeneous
 // layout, and the out-of-memory retry in the attention path then discards
-// every warm graph on the device. Bound the cache by bytes instead: half of
-// the target GPU's free memory when the first graph is cached
+// every warm graph on the device. Bound the cache by bytes instead: a quarter
+// of the target GPU's free memory when the first graph is cached
 // (DFLASH_DS4_DECODE_ATTN_CACHE_MB overrides), evicting the least recently
-// used shape across all layers.
+// used shape across all layers. A quarter, not half: the captured graph
+// executables, the verify slots and the prefill scratch share that headroom,
+// and half of it still left a 9.5k-token exact prefill at 370 MiB free.
 static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
     if (rc.decode_attn_cache_budget != 0) {
         return rc.decode_attn_cache_budget;
@@ -5736,7 +5747,7 @@ static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
         size_t total_bytes = 0;
         ggml_backend_cuda_get_device_memory(rc.device, &free_bytes, &total_bytes);
         (void) total_bytes;
-        budget = free_bytes / 2;
+        budget = free_bytes / 4;
     }
     constexpr size_t kMinBudget = (size_t) 256 * 1024 * 1024;
     rc.decode_attn_cache_budget = std::max(budget, kMinBudget);

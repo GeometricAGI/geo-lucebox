@@ -1245,7 +1245,18 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    // A key whose node properties keep flipping between evaluations (a
+    // warmup reset after every capture) never replays; it only pays the
+    // capture and re-instantiation each time. After kMaxChurn resets without
+    // a sustained replay streak in between, evaluate that key eagerly.
+    bool disable_due_to_churn = false;
+    int churn = 0;
+    int replay_streak = 0;
+    static constexpr int kMaxChurn = 4;
+    static constexpr int kStableReplays = 16;
     bool warmup_complete = false;
+    // Last-use stamp for the per-context LRU (see cuda_graph()).
+    uint64_t last_use = 0;
     // GGML_CUDA_GRAPH_STATS=1 counters
     uint64_t stat_total = 0, stat_replay = 0, stat_capture = 0, stat_eager = 0;
     uint64_t uid = 0;
@@ -1259,7 +1270,7 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_due_to_churn || disable_cuda_graphs_due_to_env);
     }
 #endif
 };
@@ -1444,13 +1455,58 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    uint64_t cuda_graph_use_counter = 0;
+
+    // Keys are ggml node addresses. Graphs built in short-lived ggml contexts
+    // (and caches that free a context without retiring its executables) leave
+    // entries behind whose key will never be seen again, each holding a
+    // captured executable on the device. Bound the map: when a new key
+    // arrives past the cap, retire the least recently used entries first.
+    // GGML_CUDA_GRAPH_MAX_KEYS overrides the cap (0 disables it).
+    static size_t cuda_graph_max_keys() {
+        static const size_t cap = [] {
+            const char * raw = getenv("GGML_CUDA_GRAPH_MAX_KEYS");
+            if (raw == nullptr || *raw == '\0') {
+                return (size_t) 512;
+            }
+            const long requested = strtol(raw, nullptr, 10);
+            return requested > 0 ? (size_t) requested : (size_t) 0;
+        }();
+        return cap;
+    }
+
+    void cuda_graph_evict_lru(size_t keep_below) {
+        bool synchronized = false;
+        while (keep_below > 0 && cuda_graphs.size() >= keep_below) {
+            auto victim = cuda_graphs.end();
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
+                if (victim == cuda_graphs.end() || it->second->last_use < victim->second->last_use) {
+                    victim = it;
+                }
+            }
+            if (victim == cuda_graphs.end()) {
+                break;
+            }
+            if (!synchronized) {
+                // An evicted executable may still be queued; retire it only
+                // after the stream has drained.
+                CUDA_CHECK(cudaStreamSynchronize(stream()));
+                synchronized = true;
+            }
+            cuda_graphs.erase(victim);
+        }
+    }
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
-            cuda_graphs[first_node_ptr] = std::make_unique<ggml_cuda_graph>();
-            return cuda_graphs[first_node_ptr].get();
+            cuda_graph_evict_lru(cuda_graph_max_keys());
+            auto & slot = cuda_graphs[first_node_ptr];
+            slot = std::make_unique<ggml_cuda_graph>();
+            slot->last_use = ++cuda_graph_use_counter;
+            return slot.get();
         }
+        it->second->last_use = ++cuda_graph_use_counter;
         return it->second.get();
     }
 

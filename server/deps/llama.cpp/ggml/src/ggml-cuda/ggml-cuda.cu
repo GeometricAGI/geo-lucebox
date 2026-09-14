@@ -5354,12 +5354,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    graph->replay_streak = 0;
+                    if (++graph->churn >= ggml_cuda_graph::kMaxChurn) {
+                        graph->disable_due_to_churn = true;
+                        if (log_graph_warmup) {
+                            GGML_LOG_DEBUG("%s: CUDA graph disabled for key %p after %d warmup resets\n",
+                                           __func__, graph_key, graph->churn);
+                        }
+                    }
                     if (log_graph_warmup) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     }
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    if (!cuda_graph_update_required &&
+                        ++graph->replay_streak >= ggml_cuda_graph::kStableReplays) {
+                        graph->churn = 0;
+                    }
                 }
             }
         }
