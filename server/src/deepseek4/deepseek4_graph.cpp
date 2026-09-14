@@ -7926,7 +7926,13 @@ bool deepseek4_paged_gathered_step(
     // The heterogeneous path keeps its long-lived bucketed graphs and replay.
     if (telemetry) telemetry->full_graph_set_us += ds4_elapsed_us(set_t0, Ds4TimingClock::now());
     const auto compute_t0 = Ds4TimingClock::now();
-    ScopedCudaGraphOverrides monolithic_eager_scope(!hybrid);
+    // Keep bounded paged rows on the same registry-aware mixed FP2/FP3
+    // vector arithmetic. The default five-row cutoff sends eight-row prefill
+    // parts to activation-quantized MMQ while four-client decode uses MMV,
+    // which can change the next token for an identical prefix.
+    ScopedCudaGraphOverrides monolithic_eager_scope(
+        !hybrid, 0, false,
+        !hybrid ? GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS : 0);
     const enum ggml_status status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
         : ggml_backend_graph_compute(backend, fg->sg.gf);

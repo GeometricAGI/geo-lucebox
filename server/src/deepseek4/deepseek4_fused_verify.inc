@@ -427,8 +427,9 @@ static bool ds4_build_fused_verify_graph(
             projection_columns = 4;
             // The multi-token expert kernel gives every token its own warp
             // with a fixed per-row K traversal, so a part's arithmetic does
-            // not depend on how many tokens share the launch; eight rows is
-            // the RDNA3 MUL_MAT_ID ceiling for the FP2/FP3 expert types. A
+            // not depend on how many tokens share the launch. The paged
+            // compute scope keeps these eight-row parts on FP2/FP3 MMV;
+            // the default five-row cutoff would instead select MMQ. A
             // single live sequence keeps one-row parts: its decode rounds use
             // the single-token expert kernel, whose arithmetic differs from
             // the multi-token kernel's.

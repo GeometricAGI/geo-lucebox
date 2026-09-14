@@ -1412,6 +1412,7 @@ if(DFLASH27B_TESTS)
             set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
         endif()
         target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
@@ -1492,6 +1493,10 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
         endif()
     endif()
+    # Optional model-backed paged-prefill regression; requires a 0731 target.
+    add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp src/server/tokenizer.cpp)
+    target_include_directories(test_ds4_paged_prefill_model PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_ds4_paged_prefill_model PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
         target_include_directories(test_ds4_dspark_load PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
