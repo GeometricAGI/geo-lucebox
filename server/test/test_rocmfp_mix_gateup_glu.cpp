@@ -143,6 +143,8 @@ void RocmfpMixGateupGluFixture::check_fused_gateup_glu(bool fp3) {
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
         SKIP("no HIP device available");
     }
+    int device = 0;
+    HIP_OK(cudaGetDevice(&device));
 
     // FP2 requires multiples of 128 for its wide block load; FP3 accepts
     // multiples of 32. Use a shape supported by both.
@@ -236,8 +238,10 @@ void RocmfpMixGateupGluFixture::check_fused_gateup_glu(bool fp3) {
     // retain the registry-aware vector dot products, not quantize activations
     // through the larger-batch MMQ fallback. This catches a missing override
     // in either mixed qtype's dispatcher, independently of GLU admission.
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    // Use the device that owns the direct-launch allocations and reference.
+    ggml_backend_t backend = ggml_backend_cuda_init(device);
     REQUIRE_TRUE(backend != nullptr);
+    REQUIRE_TRUE(ggml_backend_cuda_get_device_id(backend) == device);
     ggml_context * ctx = ggml_init({ggml_tensor_overhead()*32 + ggml_graph_overhead_custom(32, false), nullptr, true});
     REQUIRE_TRUE(ctx != nullptr);
     const auto type = fp3 ? GGML_TYPE_Q3_1_ROCMFP3_MIX : GGML_TYPE_Q2_1_ROCMFP2_MIX;
@@ -416,4 +420,24 @@ TEST_CASE(RocmfpMixGateupGluFixture, fp2_fused_gateup_glu_and_paged_dispatch) {
 
 TEST_CASE(RocmfpMixGateupGluFixture, fp3_fused_gateup_glu_and_paged_dispatch) {
     check_fused_gateup_glu(true);
+}
+
+TEST_CASE(RocmfpMixGateupGluFixture, paged_dispatch_on_nonzero_device) {
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 2) {
+        SKIP("requires two visible GPUs");
+    }
+    int previous = 0;
+    HIP_OK(cudaGetDevice(&previous));
+    struct RestoreDevice {
+        int previous;
+        ~RestoreDevice() { (void) cudaSetDevice(previous); }
+    } restore{previous};
+    HIP_OK(cudaSetDevice(ndev - 1));
+    for (bool fp3 : {false, true}) {
+        check_fused_gateup_glu(fp3);
+        int current = 0;
+        HIP_OK(cudaGetDevice(&current));
+        REQUIRE_TRUE(current == ndev - 1);
+    }
 }

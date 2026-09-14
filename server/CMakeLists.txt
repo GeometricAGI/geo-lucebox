@@ -1493,10 +1493,16 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
         endif()
     endif()
-    # Optional model-backed paged-prefill regression; requires a 0731 target.
-    add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp src/server/tokenizer.cpp)
-    target_include_directories(test_ds4_paged_prefill_model PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-    target_link_libraries(test_ds4_paged_prefill_model PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    # Optional Strix Halo regression; reuse the tokenizer in dflash_common.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_paged_prefill_model.cpp")
+        add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp)
+        target_include_directories(test_ds4_paged_prefill_model PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_ds4_paged_prefill_model PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        target_link_libraries(test_ds4_paged_prefill_model PRIVATE
+            dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base hip::host)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
         target_include_directories(test_ds4_dspark_load PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
