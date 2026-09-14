@@ -32,6 +32,7 @@ bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
         out.sys_role_prefix = {ds_bos};
         out.end_msg_seqs = {{ds_eos}};
         out.next_role_starts = {{ds_user}, {ds_assistant}};
+        out.role_starts_delimit = true;
         return true;
     }
 
@@ -132,6 +133,20 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
     if (start_idx < 0 || start_len <= 0) return out;
 
     int cursor = start_idx + start_len;
+    if (markers.role_starts_delimit) {
+        // Each role marker opens a message and closes the previous one, so
+        // the cut after every marker is a reusable prefix: the system text
+        // before the first user marker, each completed turn, and the
+        // generation prompt itself.
+        while (true) {
+            const auto [idx, len] =
+                find_first_seq_any(ids, markers.next_role_starts, cursor);
+            if (idx < 0) break;
+            cursor = idx + len;
+            out.push_back(cursor);
+        }
+        return out;
+    }
     int stray_skips = 0;
     while (true) {
         auto [end_idx, end_len] = find_first_seq_any(ids, markers.end_msg_seqs, cursor);

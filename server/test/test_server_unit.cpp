@@ -2740,15 +2740,32 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
                 std::vector<std::vector<int32_t>>({{2}}));
     TEST_ASSERT(markers.next_role_starts ==
                 std::vector<std::vector<int32_t>>({{3}, {4}}));
+    TEST_ASSERT(markers.role_starts_delimit);
 
-    // Completed assistant turn followed by the next user marker. The reusable
-    // boundary includes that role marker, matching the server's other chat
-    // families and leaving only the new user content for suffix prefill.
+    // Only assistant turns carry an end marker; the system text and user
+    // turns end where the next role starts. Every role marker therefore
+    // opens a reusable boundary: the system text, each completed turn, and
+    // the generation prompt. The marker itself belongs to the boundary,
+    // matching the server's other chat families.
     const std::vector<int32_t> prompt = {
         1, 100, 3, 101, 4, 102, 2, 3, 103, 4,
     };
     TEST_ASSERT(find_all_boundaries(prompt, markers) ==
-                std::vector<int>({8}));
+                std::vector<int>({3, 5, 8, 10}));
+    // The default snapshot cut stays before the current user turn.
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    find_all_boundaries(prompt, markers)) == 8);
+
+    // A first turn snapshots its system text, so a new session on the same
+    // system prompt restores it instead of prefilling it again.
+    const std::vector<int32_t> first_turn = {1, 100, 3, 101, 4};
+    TEST_ASSERT(find_all_boundaries(first_turn, markers) ==
+                std::vector<int>({3, 5}));
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    find_all_boundaries(first_turn, markers)) == 3);
+    // Tool-heavy requests pin the same system head.
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    find_all_boundaries(prompt, markers), 0, true) == 3);
     remove_test_path(path);
 }
 
@@ -5972,6 +5989,17 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_interval_logic) {
     // target=100 < min_tokens=512, so the continued save should NOT fire.
     TEST_ASSERT(target < min_tokens);
     (void)min_tokens;
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
+    // Whole prompt first, then every boundary deepest first, skipping cuts
+    // below the persistence minimum and the prompt end itself.
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(
+                    6000, {300, 2000, 4000, 6000}, 512) ==
+                std::vector<int>({6000, 4000, 2000}));
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(6000, {}, 512) ==
+                std::vector<int>({6000}));
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(0, {100}, 512).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {

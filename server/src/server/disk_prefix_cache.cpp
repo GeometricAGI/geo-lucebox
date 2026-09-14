@@ -129,6 +129,19 @@ static bool valid_boundary(int n, int full_len) {
     return n > 0 && n <= full_len;
 }
 
+std::vector<int> disk_prefix_cache_full_lookup_lengths(
+        int prompt_len,
+        const std::vector<int> & boundaries,
+        int min_tokens) {
+    std::vector<int> out;
+    if (prompt_len <= 0) return out;
+    out.push_back(prompt_len);
+    for (auto it = boundaries.rbegin(); it != boundaries.rend(); ++it) {
+        if (*it >= min_tokens && *it < prompt_len) out.push_back(*it);
+    }
+    return out;
+}
+
 int disk_prefix_cache_fixed_boundary(const DiskPrefixCachePolicy & policy,
                                      int full_len,
                                      int min_tokens) {
