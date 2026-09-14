@@ -165,9 +165,12 @@ TEST_CASE(Rocmfp3MixRegistryFixture, registry_lifecycle) {
     // the loop; an external allocation shows in one chunk and not the rest.
     // Require the leak signature (every chunk over the threshold), and
     // report a moving device as such instead of as a leak.
+    // A chunk of 1000 cycles requests about 264 KiB of side-data device
+    // memory in total, so a leak of those buffers shows as a drop of that
+    // order in every chunk; the threshold sits well below it.
     constexpr int kChunks = 4;
     constexpr int kCyclesPerChunk = 1000;
-    constexpr long long kLeakThreshold = 2 * 1024 * 1024;   // per chunk
+    constexpr long long kLeakThreshold = 64 * 1024;   // per chunk
     long long chunk_delta[kChunks] = {};
     size_t free_prev = free_warm;
     for (int c = 0; c < kChunks; ++c) {
