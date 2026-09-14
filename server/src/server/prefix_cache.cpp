@@ -14,6 +14,7 @@ namespace dflash::common {
 // ─── Chat marker resolution ────────────────────────────────────────────
 
 bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
+    out.role_starts_delimit = false;
     // DeepSeek V4 uses full-width punctuation in its control tokens. Require
     // each marker to encode as its exact vocabulary token so an unrelated BPE
     // tokenizer cannot be misclassified merely because it can spell the text.
@@ -137,7 +138,10 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
         // Each role marker opens a message and closes the previous one, so
         // the cut after every marker is a reusable prefix: the system text
         // before the first user marker, each completed turn, and the
-        // generation prompt itself.
+        // generation prompt itself. A marker quoted inside message content
+        // adds a candidate cut too; cuts are reuse hints and exact token
+        // matching decides every restore, so that costs at most a snapshot
+        // taken at a less useful place.
         while (true) {
             const auto [idx, len] =
                 find_first_seq_any(ids, markers.next_role_starts, cursor);

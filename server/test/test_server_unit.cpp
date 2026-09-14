@@ -6000,6 +6000,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
     TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(6000, {}, 512) ==
                 std::vector<int>({6000}));
     TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(0, {100}, 512).empty());
+    // Below the persistence minimum nothing was ever written: no probes.
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(300, {100}, 512).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {

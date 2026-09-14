@@ -134,8 +134,9 @@ std::vector<int> disk_prefix_cache_full_lookup_lengths(
         const std::vector<int> & boundaries,
         int min_tokens) {
     std::vector<int> out;
-    if (prompt_len <= 0) return out;
-    out.push_back(prompt_len);
+    // Nothing shorter than the persistence minimum is ever written, so such
+    // lengths are not worth a probe.
+    if (prompt_len >= min_tokens) out.push_back(prompt_len);
     for (auto it = boundaries.rbegin(); it != boundaries.rend(); ++it) {
         if (*it >= min_tokens && *it < prompt_len) out.push_back(*it);
     }
