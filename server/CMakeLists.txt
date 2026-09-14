@@ -1412,6 +1412,7 @@ if(DFLASH27B_TESTS)
             set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
         endif()
         target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
@@ -1491,6 +1492,16 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
         endif()
+    endif()
+    # Optional Strix Halo regression; reuse the tokenizer in dflash_common.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_paged_prefill_model.cpp")
+        add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp)
+        target_include_directories(test_ds4_paged_prefill_model PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_ds4_paged_prefill_model PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        target_link_libraries(test_ds4_paged_prefill_model PRIVATE
+            dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base hip::host)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)

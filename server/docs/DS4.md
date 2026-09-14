@@ -358,9 +358,23 @@ The backend keeps raw MLA rows, compressed rows, and indexer state in a
 persistent 128-token paged cache. The shared
 HTTP scheduler performs admission, cancellation, slow-client isolation, and
 fair continuous batching. DeepSeek4 lowers each scheduler plan into one exact
-gathered graph with up to 6 independent lanes. Decode rows share the weight
-pass; each selected prompt advances by one exact token because the graph must
-not contain two rows from the same sequence.
+gathered graph with up to 6 independent sequences and sixteen total rows.
+Decode rows share the weight pass. Monolithic prefill packs up to four
+chronological rows per concurrent prompt, or sixteen for a lone prompt.
+
+Monolithic paged prefill and decode use the same registry-aware mixed FP2/FP3
+vector arithmetic through the sixteen-row graph limit. The override is scoped
+to graph computation on the calling thread; other serving paths retain their
+five-row cutoff. This avoids switching prefill to activation-quantized MMQ
+while decoding uses MMV, which can change the next token for the same prefix.
+
+`test_ds4_paged_prefill_model` checks this regression with the real model and
+four clients: it generates 140 tokens per client, reconstructs their prefixes
+through chunked prefill, and compares the next token at indices 53 and 129.
+Build the optional target and run with `DFLASH_DS4_SPEC=0` and the matching
+`DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` path. The ordinary GPU test
+`test_rocmfp_mix_gateup_glu` covers FP2/FP3 widths 1–16, actual graph dispatch,
+and restoration of the default dispatch policy.
 
 ```bash
 hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
