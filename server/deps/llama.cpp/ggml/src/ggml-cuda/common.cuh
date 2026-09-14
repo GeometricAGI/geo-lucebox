@@ -1463,18 +1463,23 @@ struct ggml_backend_cuda_context {
     // entries behind whose key will never be seen again, each holding a
     // captured executable on the device. Bound the map: when a new key
     // arrives past the cap, retire the least recently used entries first.
-    // GGML_CUDA_GRAPH_MAX_KEYS overrides the cap (0 disables it).
+    // The cap must hold every live graph of the process or the LRU evicts
+    // warm executables and turns replays into re-captures: the heterogeneous
+    // DeepSeek4 verifier alone keeps up to 24 resident scheduler graphs of
+    // ~130 splits each (measured 12,851 distinct keys in one run, and a
+    // 512-key cap left its splits replaying 45% of the time). 8192 keys hold
+    // that with room; GGML_CUDA_GRAPH_MAX_KEYS overrides the cap (0 disables it).
     static size_t cuda_graph_max_keys() {
         static const size_t cap = [] {
             const char * raw = getenv("GGML_CUDA_GRAPH_MAX_KEYS");
             if (raw == nullptr || *raw == '\0') {
-                return (size_t) 512;
+                return (size_t) 8192;
             }
             char * end = nullptr;
             errno = 0;
             const long requested = strtol(raw, &end, 10);
             if (end == raw || *end != '\0' || requested < 0 || errno == ERANGE) {
-                return (size_t) 512;      // malformed, negative or out of range: keep the default cap
+                return (size_t) 8192;     // malformed, negative or out of range: keep the default cap
             }
             return (size_t) requested;    // an exact 0 disables the cap
         }();
