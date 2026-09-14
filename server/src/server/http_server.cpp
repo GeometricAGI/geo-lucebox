@@ -3501,23 +3501,13 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     std::vector<int> lookup_lengths;
     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full &&
         !effective_prompt.empty()) {
-        lookup_lengths.push_back((int) effective_prompt.size());
-        if ((int) effective_prompt.size() >
-            config_.disk_cache_cold_max_tokens) {
-            const auto boundaries = find_all_boundaries(
-                effective_prompt, prefix_cache_.chat_markers());
-            int cold_boundary = 0;
-            for (int boundary : boundaries) {
-                if (boundary <= config_.disk_cache_cold_max_tokens &&
-                    boundary >= config_.disk_cache_min_tokens) {
-                    cold_boundary = boundary;
-                }
-            }
-            if (cold_boundary > 0 &&
-                cold_boundary != (int) effective_prompt.size()) {
-                lookup_lengths.push_back(cold_boundary);
-            }
-        }
+        // Probes are index lookups; only a hit reads a file. A restart then
+        // recovers any inline snapshot the previous process persisted, not
+        // just exact prompts and the short cold prefix.
+        lookup_lengths = disk_prefix_cache_full_lookup_lengths(
+            (int) effective_prompt.size(),
+            find_all_boundaries(effective_prompt, prefix_cache_.chat_markers()),
+            config_.disk_cache_min_tokens);
     } else if (selected_boundary > 0) {
         lookup_lengths.push_back(selected_boundary);
     } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
