@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <memory>
 
@@ -1470,9 +1471,10 @@ struct ggml_backend_cuda_context {
                 return (size_t) 512;
             }
             char * end = nullptr;
+            errno = 0;
             const long requested = strtol(raw, &end, 10);
-            if (end == raw || *end != '\0' || requested < 0) {
-                return (size_t) 512;      // malformed or negative: keep the default cap
+            if (end == raw || *end != '\0' || requested < 0 || errno == ERANGE) {
+                return (size_t) 512;      // malformed, negative or out of range: keep the default cap
             }
             return (size_t) requested;    // an exact 0 disables the cap
         }();
@@ -1487,7 +1489,10 @@ struct ggml_backend_cuda_context {
         if (cap == 0 || cuda_graphs.size() < cap) {
             return;
         }
-        const size_t target = cap > kGraphEvictBatch ? cap - kGraphEvictBatch : 0;
+        // Retire a batch of at most kGraphEvictBatch keys, never more than half
+        // the cap, so a small cap still keeps entries after an overflow.
+        const size_t batch = std::min<size_t>(kGraphEvictBatch, std::max<size_t>(1, cap / 2));
+        const size_t target = cap - batch;
         bool synchronized = false;
         while (cuda_graphs.size() > target) {
             auto victim = cuda_graphs.end();

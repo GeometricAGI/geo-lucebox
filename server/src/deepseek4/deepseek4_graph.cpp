@@ -5764,14 +5764,15 @@ static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
 }
 
 // Evict the least recently used cached decode attention graphs until
-// `incoming_bytes` more fit the budget. The entry at `keep_index` of
-// `keep_layer` (the graph just built) is never chosen; every other graph,
-// including older ones of the same layer, is a candidate.
+// `incoming_bytes` more fit the budget. The newest graph of `keep_layer`
+// (the one just built, always the back of its layer) is never chosen; every
+// other graph, including older ones of the same layer, is a candidate.
+// Erasing an older entry of that layer shifts the kept graph left, so it is
+// identified as the back on every pass rather than by a fixed index.
 static void ds4_decode_attn_cache_trim(
         DeepSeek4LayerRangeCache & rc,
         size_t incoming_bytes,
-        const std::vector<DeepSeek4CachedDecodeAttnGraph> * keep_layer,
-        size_t keep_index) {
+        const std::vector<DeepSeek4CachedDecodeAttnGraph> * keep_layer) {
     const size_t budget = ds4_decode_attn_cache_budget(rc);
     while (rc.decode_attn_cache_bytes + incoming_bytes > budget) {
         std::vector<DeepSeek4CachedDecodeAttnGraph> * victim_layer = nullptr;
@@ -5779,7 +5780,7 @@ static void ds4_decode_attn_cache_trim(
         uint64_t oldest = std::numeric_limits<uint64_t>::max();
         for (auto & per_layer : rc.cached_decode_attn_graphs) {
             for (size_t i = 0; i < per_layer.size(); ++i) {
-                if (&per_layer == keep_layer && i == keep_index) {
+                if (&per_layer == keep_layer && i + 1 == per_layer.size()) {
                     continue;
                 }
                 if (per_layer[i].last_use < oldest) {
@@ -8841,7 +8842,7 @@ bool deepseek4_step_layer_range(
                         layer_range_cache,
                         std::max(layer_range_cache.decode_attn_cache_max_entry,
                                  per_layer.empty() ? (size_t) 0 : per_layer.back().device_bytes),
-                        nullptr, 0);
+                        nullptr);
                     per_layer.emplace_back();
                     auto & candidate = per_layer.back();
                     const auto attn_build_t0 = Ds4TimingClock::now();
@@ -8889,9 +8890,10 @@ bool deepseek4_step_layer_range(
                     layer_range_cache.decode_attn_cache_bytes += it->device_bytes;
                     layer_range_cache.decode_attn_cache_max_entry = std::max(
                         layer_range_cache.decode_attn_cache_max_entry, it->device_bytes);
-                    // The new graph is the back of its layer; keep exactly it.
-                    ds4_decode_attn_cache_trim(layer_range_cache, 0, &per_layer,
-                                               per_layer.size() - 1);
+                    // Stamp the new graph as most recently used, then trim with
+                    // it excluded; it stays the back of its layer, re-fetch.
+                    it->last_use = ++layer_range_cache.decode_attn_cache_tick;
+                    ds4_decode_attn_cache_trim(layer_range_cache, 0, &per_layer);
                     it = std::prev(per_layer.end());
                     if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
                 }
