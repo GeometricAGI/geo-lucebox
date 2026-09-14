@@ -306,6 +306,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
 - `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
