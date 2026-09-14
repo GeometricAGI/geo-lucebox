@@ -2,6 +2,7 @@
 // Protects cross-model admission, tokenization, retirement and worker ownership.
 #include "CppUnitTestFramework.hpp"
 #include "server/http_server.h"
+#include "engine/luce_engine.h"
 #include "common/concurrency/seq_engine.h"
 #include "gguf.h"
 
@@ -23,6 +24,7 @@
 
 namespace {
 using namespace dflash::common;
+using dflash::engine::LuceEngine;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 struct ModelRoutingFixture {};
@@ -240,9 +242,21 @@ void load_tokenizer(Tokenizer & tokenizer, bool second) {
 
 class RunningModels {
 public:
-    RoutedBackend first, second;
-    HeldSingleBackend single;
-    HeldSingleBackend first_single;
+    // Owners precede the refs so refs bind to live backends; whichever owner is
+    // moved into a LuceEngine leaves the ref usable while the engine lives.
+    std::unique_ptr<RoutedBackend> first_owned =
+        std::make_unique<RoutedBackend>();
+    std::unique_ptr<RoutedBackend> second_owned =
+        std::make_unique<RoutedBackend>();
+    std::unique_ptr<HeldSingleBackend> single_owned =
+        std::make_unique<HeldSingleBackend>();
+    std::unique_ptr<HeldSingleBackend> first_single_owned =
+        std::make_unique<HeldSingleBackend>();
+    RoutedBackend & first = *first_owned;
+    RoutedBackend & second = *second_owned;
+    HeldSingleBackend & single = *single_owned;
+    HeldSingleBackend & first_single = *first_single_owned;
+    std::unique_ptr<LuceEngine> listener_engine, peer_engine;
     Tokenizer first_tok, second_tok;
     std::unique_ptr<HttpServer> listener, peer;
     std::thread runner;
@@ -276,13 +290,17 @@ public:
         config.chat_template_src = "{{ messages[0]['content'] }}";
         config.sampler_defaults.has_temperature = true;
         config.sampler_defaults.temperature = 0.2f;
-        ModelBackend & first_backend = single_listener ? static_cast<ModelBackend &>(first_single) : first;
-        listener = std::make_unique<HttpServer>(first_backend, first_tok, config);
+        listener_engine = std::make_unique<LuceEngine>(
+            single_listener ? std::move(first_single_owned)
+                            : std::move(first_owned));
+        listener =
+            std::make_unique<HttpServer>(*listener_engine, first_tok, config);
         config.model_name = "ds4";
         config.chat_template_src = "y{{ messages[0]['content'] }}";
         config.sampler_defaults.temperature = 0.7f;
-        ModelBackend & peer_backend = single_peer ? static_cast<ModelBackend &>(single) : second;
-        peer = std::make_unique<HttpServer>(peer_backend, second_tok, config);
+        peer_engine = std::make_unique<LuceEngine>(
+            single_peer ? std::move(single_owned) : std::move(second_owned));
+        peer = std::make_unique<HttpServer>(*peer_engine, second_tok, config);
         if (reverse_priority) std::swap(listener, peer);
         reservation.close();
         runner = std::thread([this, load_balancing] {

@@ -241,6 +241,7 @@ See [Continuous batching in Lucebox](https://www.lucebox.com/blog/continuous-bat
 | Environment variables | [Environment reference](server/docs/ENVIRONMENT.md) |
 | Server internals | [Architecture](server/docs/ARCHITECTURE.md) |
 | Client integration and qualification | [Harness guide](harness/README.md) |
+| Server engine components | [Engine components](server/docs/ENGINE_COMPONENTS.md) |
 
 Benchmarks stay with each implementation: [DFlash](server/RESULTS.md), [PFlash](optimizations/pflash/), [Spark](optimizations/spark/), [KVFlash](optimizations/kvflash/), and [Megakernel](optimizations/megakernel/).
 

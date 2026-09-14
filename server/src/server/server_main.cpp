@@ -24,6 +24,7 @@
 #include "common/platform_env.h"
 #include "common/peer_access.h"
 #include "common/specla_mode.h"
+#include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
 #include "kvflash_pager.h"
@@ -250,26 +251,29 @@ static void print_usage(const char * prog) {
 struct LoadedModel {
     Tokenizer tokenizer;
     Tokenizer drafter_tokenizer;
-    std::unique_ptr<ModelBackend> backend;
+    std::unique_ptr<dflash::engine::LuceEngine> engine;
     MoeRoutingCollector routing_collector;
     std::unique_ptr<HttpServer> server;
     bool freq_tracking = false;
 
     ~LoadedModel() {
         server.reset();
-        if (!backend) return;
+        if (!engine) return;
+        ModelBackend & backend = engine->backend();
         if (freq_tracking) {
-            if (const auto * stats = backend->get_routing_stats()) {
+            if (const auto * stats = backend.get_routing_stats()) {
                 stats->print_freq_analysis();
             } else {
                 std::fprintf(stderr, "[server] --freq: no routing stats available (model may not be MoE)\n");
             }
         }
         if (routing_collector.is_open()) {
-            backend->set_routing_collector(nullptr);
+            backend.set_routing_collector(nullptr);
             routing_collector.close();
         }
-        backend->shutdown();
+        // engine destruction owns backend shutdown: ~LuceEngine joins the
+        // serving thread (already stopped by server.reset() above), then the
+        // concrete backend destructor performs shutdown().
     }
 };
 
@@ -1153,8 +1157,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                 arch.c_str());
         }
     }
-    auto & backend_owner = loaded.backend;
-    backend_owner = create_backend(backend_plan);
+    auto backend_owner = create_backend(backend_plan);
     if (!backend_owner) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
@@ -1559,7 +1562,10 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         }
     }
 
-    loaded.server = std::make_unique<HttpServer>(*backend, tokenizer, sconfig);
+    loaded.engine =
+        std::make_unique<dflash::engine::LuceEngine>(std::move(backend_owner));
+    loaded.server =
+        std::make_unique<HttpServer>(*loaded.engine, tokenizer, sconfig);
     HttpServer & server = *loaded.server;
     server.set_chat_format(chat_format_for_arch(arch));
     loaded.freq_tracking = sconfig.freq_tracking;

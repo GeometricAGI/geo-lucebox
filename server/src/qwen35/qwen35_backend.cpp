@@ -1494,12 +1494,18 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
         } else {
+            const auto * hint_tokens =
+                req.hint_tokens.empty() ? nullptr : &req.hint_tokens;
+            const auto * stall_prefix = req.stall_tool_prefix_tokens.empty()
+                ? nullptr : &req.stall_tool_prefix_tokens;
+            const auto * stall_suffix = req.stall_action_suffix_tokens.empty()
+                ? nullptr : &req.stall_action_suffix_tokens;
+            const auto * stall_skip = req.stall_skip_tokens.empty()
+                ? nullptr : &req.stall_skip_tokens;
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens,
-                                       req.stall_tool_prefix_tokens,
-                                       req.stall_action_suffix_tokens,
-                                       req.stall_skip_tokens,
+                                       hint_tokens, stall_prefix, stall_suffix,
+                                       stall_skip,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
@@ -1662,12 +1668,18 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
         } else {
+            const auto * hint_tokens =
+                req.hint_tokens.empty() ? nullptr : &req.hint_tokens;
+            const auto * stall_prefix = req.stall_tool_prefix_tokens.empty()
+                ? nullptr : &req.stall_tool_prefix_tokens;
+            const auto * stall_suffix = req.stall_action_suffix_tokens.empty()
+                ? nullptr : &req.stall_action_suffix_tokens;
+            const auto * stall_skip = req.stall_skip_tokens.empty()
+                ? nullptr : &req.stall_skip_tokens;
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens,
-                                       req.stall_tool_prefix_tokens,
-                                       req.stall_action_suffix_tokens,
-                                       req.stall_skip_tokens,
+                                       hint_tokens, stall_prefix, stall_suffix,
+                                       stall_skip,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
