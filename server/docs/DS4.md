@@ -173,34 +173,68 @@ Halo machine:
 cmake -S server -B server/build-hip-dual \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+  -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip-dual -j
 ```
 
-The feature is still a burn-in profile and is disabled by default. The minimum
-placement controls are:
+The feature is disabled by default. The qualified profile below keeps the hot
+experts (14350 MB), the DSpark drafter and the KV cache on the R9700 (`hip:0`)
+and the remaining experts on Strix Halo (`hip:1`), verifies five drafted
+tokens per step with the fused verifier, and prefills in batched sparse mode.
+It needs no calibration files.
 
 ```bash
-export DFLASH_DS4_MOE_TP=1
-export DFLASH_DS4_MOE_TP_INPROC=1
-export DFLASH_DS4_MOE_TP_GPU=1       # Strix Halo
-export DFLASH_EXPERT_BUDGET_MB=11700 # hot experts on the R9700
-export DFLASH_DS4_DRAFT_GPU=0        # local drafter on the R9700
-export LUCE_MMVQ_MAX_NCOLS=4
+export DFLASH_DS4_MOE_TP=1 DFLASH_DS4_MOE_TP_INPROC=1 DFLASH_DS4_MOE_TP_GPU=1
+export DFLASH_EXPERT_BUDGET_MB=14350
+export DFLASH_DS4_SPEC=1 DFLASH_DS4_DRAFT=/path/to/deepseek4-dspark-draft.gguf
+export DFLASH_DS4_DRAFT_GPU=0 DFLASH_DS4_SPEC_Q=5 DFLASH_DS4_Q5_VERIFY=1
+export DFLASH_DS4_FUSED_VERIFY=1 DFLASH_DS4_FUSED_HYBRID_DECODE=1
+export DFLASH_DS4_PINNED_ROLLBACK=1 DFLASH_DS4_GPU_ARGMAX_VERIFY=1
+export DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE=1
+export DFLASH_DS4_TP_ROUTE_PREFORK=1 DFLASH_DS4_TP_DEVICE_JOIN=1 DFLASH_DS4_TP_DEVICE_JOIN_SPLIT=1
+export DFLASH_DS4_TP_FUSED_HC_JOIN=1 DFLASH_DS4_TP_MAIN_ROUTE_WEIGHTS=1
+export DFLASH_DS4_TP_COARSE_OWNER=1 DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH=1
+export DFLASH_DS4_TP_MASKED_ROUTES=1 DFLASH_DS4_TP_GROUPED_MMVQ=1
+export DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS=4
+export DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE=1 DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4=13
+export DFLASH_MOE_DUPLICATE_HOT_ON_COLD=1 DFLASH_MOE_FULL_COLD_PARALLEL=1
+export DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC=1
+export DFLASH_DS4_HYBRID_PREFILL_GPU_HC=1 DFLASH_DS4_HYBRID_PREFILL_EAGER=1
+export GGML_CUDA_BATCH_PEER_COPIES=1
+export DFLASH_MMID_GROUPED=1 DFLASH_MMID_GROUPED_TYPES=8 DFLASH_MMID_GROUPED_DEVICE=1
+export DFLASH_CUDA_MMVQ_MOE_ROWS_PER_BLOCK=2 DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1 DFLASH_CUDA_MMVQ_FP4_X4=1
+export DFLASH_DS4_DIRECT_INDEXER_TOPK=1 GGML_DS4_TOPK_BLOCK_RADIX=1
+export DFLASH_DS4_MIX_MMQ_PREFILL=1 LUCE_CUDA_I32_REPEAT=1
+export ROCBLAS_USE_HIPBLASLT=0
 
 ./server/build-hip-dual/dflash_server /path/to/deepseek4-target.gguf \
-  --target-device hip:0 \
-  --peer-access \
+  --target-device hip:0 --peer-access \
+  --max-ctx 18432 --chunk 2048 \
+  --ds4-fused-decode --ds4-expert-top-k 6 \
   --ds4-prefill sparse
 ```
 
-Top-4 routing and sparse prefill are explicit approximations. Omit them when
-the model-default top-6 route or exact prefill is required. The 2026-07-29
-qualification used a fixed q=4 local drafter, two discarded warm-ups, R9700
-`auto`, and Strix Halo `high`. A 1,956-token prompt measured 51.1 tok/s median
-decode and 415.52 tok/s median sparse prefill. Those numbers require the full
-qualified manifest, including the burn-in kernel switches; they are not a
-claim for the minimal activation example above.
+Measured with this command on an R9700 + Strix Halo machine (fixed-codebook
+ROCmFPx target, 18432-token context, greedy, every output deterministic
+across repeats and identical between streaming and non-streaming):
+
+| prefill mode | 4772-token prompt | 9487-token prompt | decode on chat prompts |
+| --- | ---: | ---: | ---: |
+| `sparse` (batched) | 16.7 s (286 tok/s) | 33.8 s (281 tok/s) | 25-38 tok/s |
+| `exact` (token-wise) | 334 s (14 tok/s) | 677 s (14 tok/s) | 25-45 tok/s |
+
+`--ds4-prefill sparse` is the batched prefill and the one to use for prompts
+beyond a few hundred tokens. `exact` is the token-wise reference: on this path
+it runs one token per step at decode cost, because the batched mixed-owner
+path exists only for sparse prefill. Top-4 routing (`--ds4-expert-top-k 4`)
+is a further approximation that raises decode speed; omit it when the
+model-default top-6 route is required.
+
+The minimal activation (`DFLASH_DS4_MOE_TP=1`, `DFLASH_DS4_MOE_TP_INPROC=1`,
+`DFLASH_DS4_MOE_TP_GPU=1`, `DFLASH_EXPERT_BUDGET_MB=11700`,
+`LUCE_MMVQ_MAX_NCOLS=4`) runs the same model with the fused decode and verify
+paths off and decodes at 12-15 tok/s; it is only useful to check placement.
 
 #### Radeon RX 7900 XT + Strix Halo, true top-k-6
 
