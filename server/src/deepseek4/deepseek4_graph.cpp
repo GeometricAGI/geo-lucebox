@@ -348,6 +348,31 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
                                     int layer_idx,
                                     int n_tokens);
 
+// Every cached per-layer decode/prefill graph below owns a StepGraph whose
+// metadata arena holds the ggml nodes the CUDA/HIP backend keys its captured
+// graph executables on (ggml_cuda_graph_get_key = cgraph->nodes[0]). Freeing
+// the arena without retiring those executables leaks one instance per evicted
+// shape on the target GPU and lets a later graph that lands on the same
+// address inherit a stale executable. The fused decode graph already retires
+// its executables in destroy(); the heterogeneous path runs on these per-layer
+// caches instead, so give them the same treatment.
+static void ds4_retire_native_graphs(ggml_backend_t backend, const StepGraph & sg) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    // The per-layer caches build their context with ggml's own metadata
+    // buffer (mem_buffer = nullptr), so the nodes live in the context, not in
+    // sg.meta_arena; cover both.
+    if (!sg.meta_arena.empty()) {
+        ggml_backend_cuda_graph_invalidate_range(
+            backend, sg.meta_arena.data(), sg.meta_arena.size());
+    }
+    if (sg.ctx) {
+        ggml_backend_cuda_graph_invalidate_range(
+            backend, ggml_get_mem_buffer(sg.ctx), ggml_get_mem_size(sg.ctx));
+    }
+}
+
 struct DeepSeek4CachedDecodeFfnGraph {
     const ggml_context * owner_ctx = nullptr;
     ggml_backend_t backend = nullptr;
@@ -366,6 +391,7 @@ struct DeepSeek4CachedDecodeFfnGraph {
 
     void free() {
         hash_ids = nullptr;
+        ds4_retire_native_graphs(backend, sg);
         step_graph_destroy(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -388,6 +414,7 @@ struct DeepSeek4CachedDecodeOutputGraph {
     }
 
     void free() {
+        ds4_retire_native_graphs(backend, sg);
         step_graph_destroy(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -430,6 +457,10 @@ struct DeepSeek4CachedDecodeAttnGraph {
     bool compressed = false;
     bool indexed = false;
     bool uses_shared_inputs = false;
+    // Device bytes held by sg.alloc and the LRU tick of the last lookup, for
+    // the byte-budgeted cache in DeepSeek4LayerRangeCache.
+    size_t device_bytes = 0;
+    uint64_t last_use = 0;
     StepGraph sg;
     DeepSeek4AttentionGraphInputs inputs;
 
@@ -445,6 +476,7 @@ struct DeepSeek4CachedDecodeAttnGraph {
     }
 
     void free() {
+        ds4_retire_native_graphs(backend, sg);
         step_graph_destroy(sg);
         inputs = {};
         owner_ctx = nullptr;
@@ -459,6 +491,8 @@ struct DeepSeek4CachedDecodeAttnGraph {
         compressed = false;
         indexed = false;
         uses_shared_inputs = false;
+        device_bytes = 0;
+        last_use = 0;
     }
 };
 
@@ -3130,6 +3164,7 @@ struct DeepSeek4CachedDecodeHcPreGraph {
     }
 
     void free() {
+        ds4_retire_native_graphs(backend, sg);
         step_graph_destroy(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -3156,6 +3191,7 @@ struct DeepSeek4CachedDecodeHcPostGraph {
     }
 
     void free() {
+        ds4_retire_native_graphs(backend, sg);
         step_graph_destroy(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -3188,6 +3224,7 @@ struct DeepSeek4PrefillHcPreGraph {
     }
 
     void reset_graph() {
+        ds4_retire_native_graphs(backend, sg);
         step_graph_free(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -3198,6 +3235,7 @@ struct DeepSeek4PrefillHcPreGraph {
     }
 
     void free() {
+        ds4_retire_native_graphs(backend, sg);
         step_graph_destroy(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -3226,6 +3264,7 @@ struct DeepSeek4PrefillHcPostGraph {
     }
 
     void free() {
+        ds4_retire_native_graphs(backend, sg);
         step_graph_destroy(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -5555,6 +5594,13 @@ struct DeepSeek4LayerRangeCache {
     DeepSeek4PrefillHcPostGraph prefill_hc_post_graph;
     DeepSeek4PrefillHcPostGraph prefill_moe_hc_post_graph;
     std::vector<std::vector<DeepSeek4CachedDecodeAttnGraph>> cached_decode_attn_graphs;
+    // Byte accounting for cached_decode_attn_graphs (ds4_decode_attn_cache_trim):
+    // resident device bytes, the budget fixed when the first graph was cached,
+    // and the LRU tick.
+    size_t decode_attn_cache_bytes = 0;
+    size_t decode_attn_cache_budget = 0;
+    size_t decode_attn_cache_max_entry = 0;
+    uint64_t decode_attn_cache_tick = 0;
     std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
     DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
@@ -5598,6 +5644,7 @@ struct DeepSeek4LayerRangeCache {
         for (auto & per_layer : cached_decode_attn_graphs) {
             for (auto & graph : per_layer) graph.free();
         }
+        decode_attn_cache_bytes = 0;
         for (auto & graph : cached_decode_ffn_graphs) graph.free();
         cached_decode_output_graph.free();
         cached_dynamic_output_alloc.free();
@@ -5646,6 +5693,9 @@ struct DeepSeek4LayerRangeCache {
             }
         }
         cached_decode_attn_graphs.clear();
+        decode_attn_cache_bytes = 0;
+        decode_attn_cache_budget = 0;
+        decode_attn_cache_max_entry = 0;
         for (auto & graph : cached_decode_ffn_graphs) {
             graph.free();
         }
@@ -5670,6 +5720,89 @@ struct DeepSeek4LayerRangeCache {
         owns_output = false;
     }
 };
+
+// The cached decode attention graphs are keyed by (layer, shape) and the shape
+// advances with every compressor stride, so a token-wise exact prefill or a
+// long decode walks through shapes that do not recur until the next request.
+// Twenty of them per layer (43 layers, 4-16 MiB each) exceed what the target
+// GPU has left next to the hot experts and the drafter in the heterogeneous
+// layout, and the out-of-memory retry in the attention path then discards
+// every warm graph on the device. Bound the cache by bytes instead: a quarter
+// of the target GPU's free memory when the first graph is cached
+// (DFLASH_DS4_DECODE_ATTN_CACHE_MB overrides), evicting the least recently
+// used shape across all layers. A quarter, not half: the captured graph
+// executables, the verify slots and the prefill scratch share that headroom,
+// and half of it still left a 9.5k-token exact prefill at 370 MiB free.
+static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
+    if (rc.decode_attn_cache_budget != 0) {
+        return rc.decode_attn_cache_budget;
+    }
+    static const long override_mb = [] {
+        const char * raw = std::getenv("DFLASH_DS4_DECODE_ATTN_CACHE_MB");
+        return raw && *raw ? std::strtol(raw, nullptr, 10) : 0L;
+    }();
+    if (override_mb > 0) {
+        // An explicit override is taken as given; the floor below only
+        // protects the automatic budget.
+        rc.decode_attn_cache_budget = (size_t) override_mb * 1024 * 1024;
+    } else {
+        size_t budget = 0;
+        if (rc.device >= 0 && rc.backend && ggml_backend_is_cuda(rc.backend)) {
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            ggml_backend_cuda_get_device_memory(rc.device, &free_bytes, &total_bytes);
+            (void) total_bytes;
+            budget = free_bytes / 4;
+        }
+        constexpr size_t kMinBudget = (size_t) 256 * 1024 * 1024;
+        rc.decode_attn_cache_budget = std::max(budget, kMinBudget);
+    }
+    std::fprintf(stderr,
+                 "[deepseek4] decode attention graph cache budget %.1f MiB\n",
+                 rc.decode_attn_cache_budget / (1024.0 * 1024.0));
+    return rc.decode_attn_cache_budget;
+}
+
+// Evict the least recently used cached decode attention graphs until
+// `incoming_bytes` more fit the budget. The newest graph of `keep_layer`
+// (the one just built, always the back of its layer) is never chosen; every
+// other graph, including older ones of the same layer, is a candidate.
+// Erasing an older entry of that layer shifts the kept graph left, so it is
+// identified as the back on every pass rather than by a fixed index.
+static void ds4_decode_attn_cache_trim(
+        DeepSeek4LayerRangeCache & rc,
+        size_t incoming_bytes,
+        const std::vector<DeepSeek4CachedDecodeAttnGraph> * keep_layer) {
+    const size_t budget = ds4_decode_attn_cache_budget(rc);
+    while (rc.decode_attn_cache_bytes + incoming_bytes > budget) {
+        std::vector<DeepSeek4CachedDecodeAttnGraph> * victim_layer = nullptr;
+        size_t victim_index = 0;
+        uint64_t oldest = std::numeric_limits<uint64_t>::max();
+        for (auto & per_layer : rc.cached_decode_attn_graphs) {
+            for (size_t i = 0; i < per_layer.size(); ++i) {
+                if (&per_layer == keep_layer && i + 1 == per_layer.size()) {
+                    continue;
+                }
+                if (per_layer[i].last_use < oldest) {
+                    oldest = per_layer[i].last_use;
+                    victim_layer = &per_layer;
+                    victim_index = i;
+                }
+            }
+        }
+        if (!victim_layer) {
+            break;
+        }
+        auto & victim = (*victim_layer)[victim_index];
+        if (victim.backend) {
+            ggml_backend_synchronize(victim.backend);
+        }
+        rc.decode_attn_cache_bytes -=
+            std::min(rc.decode_attn_cache_bytes, victim.device_bytes);
+        victim.free();
+        victim_layer->erase(victim_layer->begin() + (std::ptrdiff_t) victim_index);
+    }
+}
 
 static ggml_tensor * ds4_fused_hc_base_f32(ggml_context * ctx, ggml_tensor * base) {
     if (!base) return nullptr;
@@ -8702,9 +8835,20 @@ bool deepseek4_step_layer_range(
                     });
                 if (it == per_layer.end()) {
                     if (per_layer.size() >= 20) {
+                        layer_range_cache.decode_attn_cache_bytes -= std::min(
+                            layer_range_cache.decode_attn_cache_bytes,
+                            per_layer.front().device_bytes);
                         per_layer.front().free();
                         per_layer.erase(per_layer.begin());
                     }
+                    // Make room first, reserving the largest graph cached so
+                    // far so a bigger shape does not fail its allocation and
+                    // fall into the evict-everything retry below.
+                    ds4_decode_attn_cache_trim(
+                        layer_range_cache,
+                        std::max(layer_range_cache.decode_attn_cache_max_entry,
+                                 per_layer.empty() ? (size_t) 0 : per_layer.back().device_bytes),
+                        nullptr);
                     per_layer.emplace_back();
                     auto & candidate = per_layer.back();
                     const auto attn_build_t0 = Ds4TimingClock::now();
@@ -8724,6 +8868,7 @@ bool deepseek4_step_layer_range(
                             for (auto & g : other) g.free();
                             other.clear();
                         }
+                        layer_range_cache.decode_attn_cache_bytes = 0;
                         layer_range_cache.shared_prefill_attn_alloc.free();
                         for (auto & alloc : layer_range_cache.cached_attn_allocs) {
                             alloc.free();
@@ -8746,8 +8891,19 @@ bool deepseek4_step_layer_range(
                     } else {
                         it = std::prev(per_layer.end());
                     }
+                    it->device_bytes = it->sg.alloc
+                        ? ggml_gallocr_get_buffer_size(it->sg.alloc, 0) : 0;
+                    layer_range_cache.decode_attn_cache_bytes += it->device_bytes;
+                    layer_range_cache.decode_attn_cache_max_entry = std::max(
+                        layer_range_cache.decode_attn_cache_max_entry, it->device_bytes);
+                    // Stamp the new graph as most recently used, then trim with
+                    // it excluded; it stays the back of its layer, re-fetch.
+                    it->last_use = ++layer_range_cache.decode_attn_cache_tick;
+                    ds4_decode_attn_cache_trim(layer_range_cache, 0, &per_layer);
+                    it = std::prev(per_layer.end());
                     if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
                 }
+                it->last_use = ++layer_range_cache.decode_attn_cache_tick;
                 cached_attn = &*it;
                 gf = cached_attn->sg.gf;
                 attn_out = cached_attn->sg.hidden_states;

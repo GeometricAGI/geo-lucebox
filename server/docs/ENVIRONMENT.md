@@ -36,6 +36,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | unset | BURN-IN: expose independent mixed-vendor expert branches to the common multi-backend scheduler. |
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
 | `DFLASH_DS4_COMP_PAD_STRIDE` | 16, 128 on `gfx1151` DSpark | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
+| `DFLASH_DS4_DECODE_ATTN_CACHE_MB` | a quarter of the target GPU's free memory when the first decode attention graph is cached, 256 MiB floor | Byte budget of the per-layer decode attention graph cache (heterogeneous and token-wise paths); least recently used shapes are evicted across layers before a new one is built. A positive value is used as given. |
+| `GGML_CUDA_GRAPH_MAX_KEYS` | 4096 | Cap on captured CUDA/HIP graph executables kept per backend context, keyed by graph node address; least recently used entries are retired in batches. It must exceed the number of live graphs (the heterogeneous DeepSeek4 verifier keeps up to 24 scheduler graphs of ~130 splits) or warm graphs stop replaying. `0` disables the cap. |
 | `DFLASH_DS4_MIX_MMQ_PREFILL` | enabled for DS4 approximate prefill on gfx1151 | BURN-IN KILL SWITCH: =0 disables registry-aware mixed ROCmFP MMQ; =1 explicitly enables it on supported HIP devices. Automatic selection is model/graph-local and never writes the process environment. Exact prefill retains its existing dispatch defaults, including the specialized paired FP2 path. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` | 1 for masks at least 4 MiB | BURN-IN KILL SWITCH: =0 rebuilds and transfers the complete fused-verifier attention mask from the host on every step. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` | 4194304 | DEBUG/A-B: minimum fused-verifier mask size for GPU zeroing plus negative-range updates. |
@@ -122,6 +124,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
+- `DFLASH_DS4_DECODE_ATTN_CACHE_MB` - deepseek4_graph.cpp
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
 - `DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL` - deepseek4_backend.cpp, deepseek4_graph.cpp (gfx1151 sparse-prefill default; KILL SWITCH: =0 restores the explicit causal mask)
@@ -303,6 +306,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
 - `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
