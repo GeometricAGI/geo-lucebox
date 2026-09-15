@@ -102,8 +102,11 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `DFLASH_CUDA_BACKEND_PATH` - dynamic_backend.cpp
 - `DFLASH_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
+- `DFLASH_CUDA_MMVQ_FP4_X4` - deepseek4_backend.cpp, mmvq.cu
 - `DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24` - deepseek4_backend.cpp, mmvq.cu
 - `DFLASH_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_CUDA_MMVQ_MOE_ROWS_PER_BLOCK` - mmvq.cu
 - `DFLASH_DISABLE_DRAFT_ATTN` - draft_graph.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN_GATE` - draft_graph.cpp
 - `DFLASH_DISABLE_DRAFT_AUX_NORMS` - draft_graph.cpp
@@ -118,7 +121,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_CONFIDENCE_WIDTH` - deepseek4_dspark_spec.cpp (KILL SWITCH: =0 falls back from the drafter confidence head to the learned-acceptance width policy)
 - `DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned drafter context window; =0 restores pageable copies)
+- `DFLASH_DS4_FUSED_HYBRID_DECODE` - deepseek4_graph.cpp
 - `DFLASH_DS4_GPU_ARGMAX_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc (gfx1151 DSpark default =1: on-device argmax of verifier logits; =0 copies the logits back)
+- `DFLASH_DS4_HYBRID_PREFILL_EAGER` - deepseek4_graph.cpp, moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_HYBRID_PREFILL_GPU_HC` - deepseek4_graph.cpp
 - `DFLASH_DS4_Q5_VERIFY` - deepseek4_backend.cpp, deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc, deepseek4_graph.cpp (gfx1151 DSpark default =1: five-row fused verifier and the 24-slot cache; =0 restores the q<=4 verifier)
 - `DFLASH_DS4_PINNED_ROLLBACK` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned host rollback state; =0 restores pageable copies)
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
@@ -151,8 +157,21 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_ROUTING_STATS_OUT` - deepseek4_backend.cpp
 - `DFLASH_DS4_ROCTX` - deepseek4_roctx.cpp
 - `DFLASH_DS4_TOKEN_TRACE` - deepseek4_dspark_spec.cpp (DIAGNOSTIC: per-token speculative trace on stderr)
+- `DFLASH_DS4_TP_COARSE_OWNER` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_TP_DEVICE_JOIN` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_TP_DEVICE_JOIN_SPLIT` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_FUSED_HC_JOIN` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_MAIN_ROUTE_WEIGHTS` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_MASKED_ROUTES` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_ROUTE_PREFORK` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DS4_VERIFY_BUILD_TIMING` - deepseek4_fused_verify.inc (DIAGNOSTIC: fused-verify graph build timing)
 - `DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE` - dspark_head.cpp (KILL SWITCH: =1 rebuilds the DSpark Markov chain graph on every call)
+- `DFLASH_MMID_GROUPED` - deepseek4_backend.cpp, mmvq.cu
+- `DFLASH_MMID_GROUPED_DEVICE` - mmvq.cu
+- `DFLASH_MMID_GROUPED_TYPES` - deepseek4_backend.cpp, mmvq.cu
+- `DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `DFLASH_ROCMFP2_ROW4` - rocmfp2_mix.cu
@@ -306,6 +325,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `GGML_CUDA_BATCH_PEER_COPIES` - ggml-cuda.cu (ggml-cuda), deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
 - `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
 - `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
@@ -331,6 +351,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `GGML_DS4_FA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_TOPK_BLOCK_RADIX` - top-k.cu
 - `HOME` - spark_corpus.cpp
+- `LUCE_CUDA_I32_REPEAT` - ggml-cuda.cu (ggml-cuda)
 - `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
 - `LUCE_MMQ_BIG_PREFILL` - mmq.cu (=0 disables the RDNA4 128-wide MMQ tiles for large prefill batches)
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
