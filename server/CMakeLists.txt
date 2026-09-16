@@ -1078,6 +1078,8 @@ if(DFLASH27B_TESTS)
         # default HIP build stays independent of the optional package.
         if(GGML_HIP_ROCWMMA_FATTN)
             dflash_add_ggml_gpu_executable(test_rocwmma_layout test/test_rocwmma_layout.cpp)
+            set_source_files_properties(test/test_rocwmma_layout.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocwmma_layout PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
             target_compile_definitions(test_rocwmma_layout PRIVATE GGML_USE_HIP)
             target_include_directories(test_rocwmma_layout PRIVATE ${GGML_HIP_ROCWMMA_INCLUDE_DIR})
             list(APPEND _raw_unit_test_targets test_rocwmma_layout)
