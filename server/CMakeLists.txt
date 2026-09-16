@@ -2235,6 +2235,16 @@ if(DFLASH27B_TESTS)
                 endif()
             endif()
         endforeach()
+        # test_paged_attn_wmma runs one route per process (the env selects it
+        # and the launch counter pins it), so the auto-registered case above
+        # only ever exercises V_DOT2. Register the WMMA pass as a second case;
+        # the test fails on a route mismatch, so CI now gates both routes.
+        if(TARGET test_paged_attn_wmma)
+            add_test(NAME paged_attn_wmma_route COMMAND test_paged_attn_wmma)
+            set_tests_properties(paged_attn_wmma_route PROPERTIES
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "DFLASH27B_PAGED_WMMA=1")
+        endif()
         unset(_unit_ctest_name)
         unset(_cppunit_target_index)
     endif()

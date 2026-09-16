@@ -1,17 +1,19 @@
-# paged_attn_wmma — assembly handoff (GLM-5.3 reviewed, rev 2)
+# paged_attn_wmma — design retrospective (GLM-5.3 reviewed, rev 2)
 
-Status: design complete, contract extracted, adversarial-reviewed. All source
-lines to copy and all deltas enumerated; remaining work is mechanical
-assembly + box iteration. Evidence: PAGED_ATTN_WMMA_PLAN.md (the design
-section of that doc is SUPERSEDED by this file — see correction 7).
+Status: LANDED (see the sessions below for the differential and the perf
+results). The header below is the assembly contract the port was built from,
+kept as the design authority; its fattn line numbers refer to
+fattn-mma-f16.cuh at port time and drift as upstream moves. Read the landed
+code, do not redo the assembly. Evidence: PAGED_ATTN_WMMA_PLAN.md (its design
+section is SUPERSEDED by this file — see correction 7).
 
 ## The kernel = fattn-mma's own code + 6 deltas
 
 Copy verbatim from server/deps/llama.cpp/ggml/src/ggml-cuda/fattn-mma-f16.cuh:
-- `flash_attn_ext_f16_iter` (lines 471-971) — KQ mma, mask, softmax, VKQ.
-- `flash_attn_ext_f16_process_tile` (lines 1010-1554) — Q load, iter loop,
+- `flash_attn_ext_f16_iter` (lines 469-968) — KQ mma, mask, softmax, VKQ.
+- `flash_attn_ext_f16_process_tile` (lines 1006-1548) — Q load, iter loop,
   rowsum reduce, np-combine, write-back.
-- Copy `mma_tile_sizes<ncols>` verbatim (fattn-mma-f16.cuh:991-998). The
+- Copy `mma_tile_sizes<ncols>` verbatim (fattn-mma-f16.cuh:986-993). The
   tiles are `tile<16,16,float>` and `tile<16,8,half2>` with DEFAULT
   I_MAJOR — on RDNA4 the I_MAJOR C layout already IS the transposed A&B
   layout. Do NOT declare J_MAJOR tiles.
@@ -53,9 +55,9 @@ NVIDIA-only). Grid: (n_head_kv, ceil(n_rows/4), n_partitions).
    dead-row SENTINEL WRITE is at :328-348 (an earlier rev pointed at the
    wrong range — the exit block matters).
 
-4. **expf → exp2f** everywhere (softmax :690/:770, KQ_max_scale :784,
-   KQ_cms :1404). Drop FATTN_KQ_MAX_OFFSET (log2 domain). Drop sinks.
-   INVARIANT: keep `KQ_max` init at `-FLT_MAX/2.0f` (fattn-mma:1088).
+4. **expf → exp2f** everywhere (softmax :685/:765, KQ_max_scale :779,
+   KQ_cms :1396). Drop FATTN_KQ_MAX_OFFSET (log2 domain). Drop sinks.
+   INVARIANT: keep `KQ_max` init at `-FLT_MAX/2.0f` (fattn-mma:1083).
    This is load-bearing: paged passes can be FULLY masked (foreign-seq
    passes, dead rows), and `-FLT_MAX/2` makes the exponent
    -inf - finite = -inf → exp2 = 0, never -inf - (-inf) = NaN. Do NOT
@@ -75,7 +77,7 @@ NVIDIA-only). Grid: (n_head_kv, ceil(n_rows/4), n_partitions).
 6. **Write-back** — the most likely source of a silent bug; copy the guard
    set, not just the addresses:
    (a) SKIP dead columns: `c >= gqa_ratio || row >= n_rows || row invalid`
-       (fattn-mma:1506 translates to: head >= n_head || row >= n_rows ||
+       (fattn-mma:1502 translates to: head >= n_head || row >= n_rows ||
        row_seq invalid). Writing them OOB corrupts neighboring rows
        silently.
    (b) Single-partition divide: use decode's guard
@@ -85,17 +87,17 @@ NVIDIA-only). Grid: (n_head_kv, ceil(n_rows/4), n_partitions).
    (d) Multi-partition: partial_acc/partial_meta EXACTLY as
        paged_attn_decode :571-602 (pre-normalized acc, log2 meta,
        sentinel). Reuse `paged_attn_partitions` (:24) and
-       `paged_attn_combine` (:606) verbatim.
+       `paged_attn_combine` (:609) verbatim.
 
 ## Launcher + hook
 
 - `try_launch_paged_attn_wmma(ctx, dst)`: env `DFLASH27B_PAGED_WMMA`
-  (read-once static, default off). Gates: non-tree, K/V ∈ {F16, Q8_0},
+  (read-once static, default off). Gates: non-tree, K/V ∈ {F16, Q8_0, Q4_0},
   supported() passes, **gqa_ratio <= 8** (ncols2=8; without this gate any
   ratio > 8 silently never computes heads 8+ — deterministic silent bug
   on model swap), **block_size == 16**. Compute n_partitions like
-  try_launch_paged_attn :958-995 INCLUDING the
-  GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS override at :1002-1012 (copy it;
+  try_launch_paged_attn :888-1110 INCLUDING the
+  GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS override at :1003-1013 (copy it;
   otherwise whether kv=512 stays single-partition varies by box and the
   direct-write path is untested nondeterministically). When n_partitions > 1
   allocate partials and launch paged_attn_combine after. Bump the counter.

@@ -402,6 +402,7 @@ bool run_case(ggml_backend_t backend,
     bool ok = !k_data.empty() && !v_data.empty() &&
               !k_reference.empty() && !v_reference.empty();
 
+    size_t wmma_launches = 0;
     if (ok) {
         ggml_backend_tensor_set(q, q_data.data(), 0,
                                 q_data.size() * sizeof(q_data[0]));
@@ -432,7 +433,9 @@ bool run_case(ggml_backend_t backend,
                 sizes, tree->tree_sizes.data(), 0,
                 tree->tree_sizes.size() * sizeof(tree->tree_sizes[0]));
         }
+        const size_t wmma_before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - wmma_before;
     }
 
     float max_abs_error = INFINITY;
@@ -457,12 +460,10 @@ bool run_case(ggml_backend_t backend,
         // The WMMA route accumulates the VKQ output in f16 (design: mirrors
         // the contiguous fattn-mma kernel), so long-context rows carry ~1e-3
         // absolute noise against the f32 reference; the decode route
-        // accumulates in f32 (~1e-5). Applies only when the route is enabled:
-        // with DFLASH27B_PAGED_WMMA=1 this test is an A/B against the f32
-        // reference, so it no longer pins the decode path (test_paged_attn_wmma
-        // does that, counter-checked).
-        const char * wmma_env = getenv("DFLASH27B_PAGED_WMMA");
-        const float tol = (wmma_env && atoi(wmma_env) != 0) ? 2.0e-3f : MAX_ABS_ERROR;
+        // accumulates in f32 (~1e-5). Keyed on the launch counter rather than
+        // the env, so cases that fall back to V_DOT2 (tree mode, ineligible
+        // shapes) keep the strict bound.
+        const float tol = wmma_launches > 0 ? 2.0e-3f : MAX_ABS_ERROR;
         ok = ok && max_abs_error < tol;
     }
 

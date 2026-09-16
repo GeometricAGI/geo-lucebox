@@ -76,6 +76,7 @@ bool run_case(ggml_backend_t gpu, const Case & c, FILE * out) {
 
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        if (galloc) ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return false;
     }
@@ -132,7 +133,12 @@ bool run_case(ggml_backend_t gpu, const Case & c, FILE * out) {
     } else {
         for (int r = 0; r < c.n_rows; ++r) {
             asi[r] = 0;
-            qpos[r] = r * c.qpos_stride;
+            // Dense cases are prefill chunks: the rows sit at the end of the
+            // committed prefix, so they attend over the full context (not
+            // just the first n_rows tokens). Sparse cases keep their stride
+            // to span partitions.
+            qpos[r] = c.qpos_stride == 1 ? (c.kv_len - c.n_rows + r)
+                                         : (r * c.qpos_stride);
         }
     }
     ggml_backend_tensor_set(kv_seq_lens, ksl.data(), 0, ksl.size() * sizeof(int32_t));
@@ -178,9 +184,12 @@ bool run_case(ggml_backend_t gpu, const Case & c, FILE * out) {
 int main() {
 #if defined(GGML_USE_HIP)
     hipDeviceProp_t props{};
-    if (hipGetDeviceProperties(&props, 0) != hipSuccess ||
-        std::strncmp(props.gcnArchName, "gfx12", 5) != 0) {
-        std::printf("[paged-wmma] SKIP: requires gfx12 (RDNA4)\n");
+    if (hipGetDeviceProperties(&props, 0) != hipSuccess) {
+        std::printf("[paged-wmma] SKIP: no HIP device\n");
+        return 77;
+    }
+    if (std::strncmp(props.gcnArchName, "gfx12", 5) != 0) {
+        std::printf("[paged-wmma] SKIP: requires gfx12 (RDNA4), got %s\n", props.gcnArchName);
         return 77;
     }
     ggml_backend_t gpu = ggml_backend_cuda_init(0);

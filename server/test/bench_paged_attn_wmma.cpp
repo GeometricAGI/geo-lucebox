@@ -67,6 +67,7 @@ bool run_shape(ggml_backend_t gpu, int nq, int kv_len, int iters, ggml_type kv_t
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         std::printf("[bench-paged-wmma] nq=%d kv=%d alloc failed\n", nq, kv_len);
+        if (galloc) ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return false;
     }
@@ -141,9 +142,12 @@ bool run_shape(ggml_backend_t gpu, int nq, int kv_len, int iters, ggml_type kv_t
 int main(int argc, char ** argv) {
 #if defined(GGML_USE_HIP)
     hipDeviceProp_t props{};
-    if (hipGetDeviceProperties(&props, 0) != hipSuccess ||
-        std::strncmp(props.gcnArchName, "gfx12", 5) != 0) {
-        std::printf("[bench-paged-wmma] SKIP: requires gfx12 (RDNA4)\n");
+    if (hipGetDeviceProperties(&props, 0) != hipSuccess) {
+        std::printf("[bench-paged-wmma] SKIP: no HIP device\n");
+        return 77;
+    }
+    if (std::strncmp(props.gcnArchName, "gfx12", 5) != 0) {
+        std::printf("[bench-paged-wmma] SKIP: requires gfx12 (RDNA4), got %s\n", props.gcnArchName);
         return 77;
     }
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
@@ -155,6 +159,12 @@ int main(int argc, char ** argv) {
 
     const int nq = argc > 1 ? atoi(argv[1]) : 128;
     const char * tname = argc > 2 ? argv[2] : "q8_0";
+    if (std::strcmp(tname, "f16") != 0 && std::strcmp(tname, "q8_0") != 0 &&
+        std::strcmp(tname, "q4_0") != 0) {
+        std::printf("usage: bench_paged_attn_wmma [nq] [f16|q8_0|q4_0]\n");
+        ggml_backend_free(gpu);
+        return 2;
+    }
     const ggml_type kv_type = std::strcmp(tname, "f16") == 0   ? GGML_TYPE_F16  :
                               std::strcmp(tname, "q4_0") == 0  ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
     std::printf("[bench-paged-wmma] kv_type=%s\n", ggml_type_name(kv_type));

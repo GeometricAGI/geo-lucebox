@@ -48,6 +48,12 @@ Set VARIANTS=blog-ddtree with a readable DRAFT_MODEL to run the optional
 DDTree variant; it requires a server build that emits per-response
 [concurrency-metrics] telemetry. The server still uses paged attention
 because this script measures the concurrent implementation, including C=1.
+Set VARIANTS=dflash2 with a readable DRAFT_MODEL for the DFlash2 speculative
+variant (draft on the same device, no DDTree: --ddtree is rejected with
+--paged-attention, and the server requires exactly this shape for a
+same-device draft). KV_TYPE selects the paged pool K/V quantisation (q4_0
+default, q8_0 to match the blog command); PAGED_WMMA forwards
+DFLASH27B_PAGED_WMMA to A/B the paged-attention kernel route.
 GPU_DEVICE is the physical ROCr device exposed exclusively to the server and
 defaults to device 0. Pass GPU_DEVICE=1 for Strix Halo on this dual-GPU
 benchmark host. The resolved value is stored in each case's command and metadata.
@@ -212,7 +218,7 @@ obj={"variant":variant,"suite":suite,"clients":int(c),"repeat":int(repeat),
 "fast_rollback":True,"adaptive":variant == "adaptive-ddtree","n_gen":int(n_gen)} if variant.endswith("ddtree") else None)}
 pathlib.Path(out).write_text(json.dumps(obj,indent=2,sort_keys=True)+"\n")' \
     "$case_dir/server-metadata.json" "$variant" "$suite" "$clients" "$repeat" \
-    "$SERVER_BIN" "$MODEL" "$([[ "$variant" == *ddtree ]] && echo "$DRAFT_MODEL")" \
+    "$SERVER_BIN" "$MODEL" "$([[ "$variant" == *ddtree || "$variant" == dflash2 ]] && echo "$DRAFT_MODEL")" \
     "$OUT/prompts/$suite.jsonl" "$case_dir/server-command.txt" "$MAX_TOKENS" "$REPO" \
     "$GPU_DEVICE" "$SLOTS" "$PREFILL_FIRST_BURST_STEPS" "$EXPECTED_GPU_ARCH" "$IDLE_PREFILL_TOKENS"
 

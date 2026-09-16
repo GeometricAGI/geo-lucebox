@@ -98,6 +98,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH27B_KV_TQ3` - kv_quant.cpp, qwen3_drafter.cpp
 - `DFLASH27B_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `DFLASH27B_LM_HEAD_FIX` - http_server.cpp
+- `DFLASH27B_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
 - `DFLASH27B_PREFILL_UBATCH` - layer_split_daemon.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
 - `DFLASH_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `DFLASH_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
@@ -354,6 +355,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `GGML_CUDA_MLA_STREAM_TOPK` - ggml-cuda/fattn.cu
 - `GGML_DS4_FA_STREAM_TOPK` - ggml-cuda/fattn.cu (compatibility alias)
 - `GGML_CUDA_MLA_STREAM_F32_STAGE` - ggml-cuda/fattn.cu
+- `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` - ggml-cuda/paged-attn.cu (DIAGNOSTIC: force the paged-attention partition count on both routes)
 - `GGML_CUDA_MLA_STREAM_FAST_EXP` - ggml-cuda/fattn.cu
 - `GGML_CUDA_MLA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_FA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)

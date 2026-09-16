@@ -194,6 +194,14 @@ run_case() {
     *)   max_ctx=4096; timeout=1200 ;;
   esac
   capacity=$((SLOTS * max_ctx))
+  # The paged pool is sized in rows (SLOTS x max_ctx) and the paged-attention
+  # worst-case prefill graph is proportional to it; past ~131k rows (16x8192)
+  # the graph no longer fits on a 32 GB card and the server dies mid-run with
+  # an alloc failure. Reject up front instead: xl needs SLOTS<=4, xxl <=2.
+  if (( capacity > 131072 )); then
+    echo "workload=$workload with SLOTS=$SLOTS needs $capacity pool rows (> 131072); lower SLOTS" >&2
+    return 1
+  fi
   local case_dir="$OUT/$workload/c$clients/r$repeat/$variant"
   mkdir -p "$case_dir"
   if [[ "$variant" == llama ]]; then
