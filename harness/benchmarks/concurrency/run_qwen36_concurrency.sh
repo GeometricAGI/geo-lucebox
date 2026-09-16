@@ -26,8 +26,8 @@ MAX_TOKENS="${MAX_TOKENS:-64}"
 WARMUP_TOKENS="${WARMUP_TOKENS:-8}"
 PREFILL_FIRST_BURST_STEPS="${PREFILL_FIRST_BURST_STEPS:-0}"
 IDLE_PREFILL_TOKENS="${IDLE_PREFILL_TOKENS:-4096}"
-# KV quantisation for the paged pool (q4_0 canonical default; q8_0
-# matches the WMMA route's supported types and the blog command).
+# KV quantisation for the paged pool (q4_0 canonical default; q8_0 matches
+# the blog command, and the WMMA route supports f16/q8_0/q4_0).
 KV_TYPE="${KV_TYPE:-q4_0}"
 # Optional pass-through for the paged-attention kernel route
 # (DFLASH27B_PAGED_WMMA). Empty preserves the default kernel.

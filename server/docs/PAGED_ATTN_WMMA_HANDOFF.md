@@ -137,7 +137,8 @@ diff, fix findings, PR.
 
 - 2-arg `mma(D,A,B)` on AMD ACCUMULATES (zero the accumulators anyway).
 - `2*k0` in the VKQ A-load is fattn's token-pair stride — copy exactly.
-- np-combine meta layout: rows strided by tile_stride=68 half2s, meta at
+- np-combine meta layout: rows strided by tile_stride=36 half2s
+  (= nbatch_combine+4; the 68 the K/V tiles use is stride_tile_K/V), meta at
   float2 offset nbatch_combine/2, nmeta=2 when np*cols_per_warp=64>=32.
 - The box's pkill self-match: run server scripts via bash files, never
   inline pkill -f chains.
@@ -146,7 +147,7 @@ diff, fix findings, PR.
 
 Root causes found and fixed (all reproduced numerically before fixing):
 
-1. **Partition overlap** (`ace83956`): the iter hardcoded
+1. **Partition overlap**: the iter hardcoded
    `constexpr k_VKQ_sup = nbatch_fa` and never clamped its 64-token tile to
    the partition's `token_end`. With 16-token-wide partitions, token t was
    staged by every partition whose tile spanned it (tokens 16-31 twice,
@@ -155,7 +156,7 @@ Root causes found and fixed (all reproduced numerically before fixing):
    token weights doubled (2w/(1+w) fit to 4 decimals). Fix:
    `k_VKQ_sup = clamp(token_end - (token_begin + kb0*nbatch_fa), 0, 64)`
    (fattn:1178 semantics). Dropped the differential 0.18 -> 0.07.
-2. **partial_meta cross-block race** (`6ea5a70d`, found by GLM-5.3 review):
+2. **partial_meta cross-block race** (found by a GLM-5.3 review):
    the meta write derived `head = kv_head*gqa_ratio + jc%ncols2` without a
    `c >= gqa_ratio` guard. With ncols2=8 > gqa_ratio=6, block kv_head=kh
    wrote zero-Q padding-column stats into heads (kh+1)*6+{0,1}'s slots,
@@ -164,7 +165,7 @@ Root causes found and fixed (all reproduced numerically before fixing):
    with the guard (the partial_acc write always had it). Also moved the
    FORCE_PARTITIONS override after the occupancy floor (was a no-op <= 32,
    decode launcher order).
-3. **Invalid ragged rows** (`a5195ee7`): decode's `valid_query` (:295-300)
+3. **Invalid ragged rows**: decode's `valid_query` (:295-300)
    kills rows with `query_positions` present, no tree, and pos < 0 (empty
    context, zero output). The wmma metadata fell through to the full
    kv_len. The mixed case's qpos=-1 decode row exposed it: ref = all zeros,
@@ -186,18 +187,18 @@ Analysis-tooling traps that cost hours (do not rediscover):
   "ref row 0 != kdump row 0" and "V[0] != kvf[:,0,0]" mysteries were this.
 - The un-partition-gated dbg dump blocks race across blocks/cases; gate
   dumps to one (kv_head, partition, group) or they hold last-writer data.
-- The kraw/vraw dump loop has a lane-stride bug (16/512 slots written) —
-  those two files are unreliable; delete before PR.
 - Host ground truth: test dumps qv/kvf pre-quantization (hostcase_N.bin,
   header 4xu32 then q [D][rows][Hq] then kvf [D][pool][Hk], dim-major).
+  (The kraw/vraw dump loop the bring-up used had a lane-stride bug and is
+  gone with the debug instrumentation.)
 
-Remaining before PR: strip/reduce debug instrumentation (keep the env-gated
-route counter), 12K/44K paged prefill ladder A/B, concurrency C1/2/5, GLM
-review of the final diff.
+All of the items then remaining - stripping the debug instrumentation (route
+counter kept), the 12K/44K prefill ladder A/B, the concurrency ladders and
+the final reviews - are done.
 
 ## Session 2026-09-16 (cont): performance — parity at batch, win grows with context
 
-Occupancy refactor (`b8465e2d`), partition-floor fix (`239c5ed6`), both on the
+Occupancy refactor and partition-floor fix, both on the
 Radeon (gfx1201, 32 CU, 64 KiB LDS/CU — NOT the Strix Halo iGPU on device 1).
 
 Measured (server, q8_0 KV, same binary, env A/B):
@@ -210,7 +211,7 @@ end-to-end == attention being ~2x faster and ~16% of prefill time. End-to-end
 translation is 8%; there is no missing factor.
 
 What moved the needle:
-1. smem 51 -> 18.4 KiB (`b8465e2d`): aliased phases were summed instead of
+1. smem 51 -> 18.4 KiB: aliased phases were summed instead of
    maxed; dim-split staging (nbatch 128->64), combine strips 64->32, inline
    causal mask (staged tile deleted). Occupancy 1 -> 3 blocks/CU.
 2. The launcher forced min_partitions >= 32 for every shape — a
@@ -221,13 +222,13 @@ What moved the needle:
    inversely batch-scaled cap: batch moves -9% -> parity, 12K -4% -> +3%,
    44K +5% -> +8%.
 
-Still ahead: software double-buffer for the block-table K/V gather
-(cp.async is `!GGML_USE_HIP`-gated, so plain double-buffering; DeepSeek review
-`/tmp/opencode/ds_review.md` §10 specifies nbatch 32 x 2 buffers = 18,432 B,
-occupancy stays 3). Minor cleanups from that review: kernel-scope
-stride_tile_K/V now unused; V-staging dim0 covered by the new parameter.
+Next candidate was a software double-buffer for the block-table K/V gather
+(cp.async is `!GGML_USE_HIP`-gated, so plain double-buffering; an earlier
+review specified nbatch 32 x 2 buffers = 18,432 B, occupancy stays 3). It was
+tried and reverted - see the next section - and that review's minor cleanups
+are folded into the final tree.
 
-### Double-buffer pipeline: attempted, measured, reverted (c0950b55)
+### Double-buffer pipeline: attempted, measured, reverted
 
 Split the gather into register-load + smem-store and rotated two 64x36
 buffers (nbatch_K2/V2 64->32, 18,432 B, occupancy stays 3) so chunk c+1's
@@ -297,7 +298,7 @@ element - hoist per-row resolution and vectorize (16 B rows are contiguous);
 (b) the partials+combine global round trip for n_partitions>1; (c) partition
 granularity / tail effects (PAGED_ATTN_BLOCKS_PER_PARTITION=64).
 
-### Gather vectorization: the 2x, delivered (d65d6b4c)
+### Gather vectorization: the 2x, delivered
 
 Root cause of the paged path's deficit: the gather resolved the block table
 and did its loads per (row, half2) element (~8-15 instructions, 4-byte F16 /
@@ -337,9 +338,9 @@ Qwen3.8-27B-UD-IQ4_XS, q8_0 KV, `DFLASH27B_PAGED_WMMA` 0 vs 1, route verified
 from each run's `server-command.txt`.
 
 Two knobs were added to the two concurrency runners (backward compatible,
-defaults unchanged): `KV_TYPE` (canonical default q4_0; q8_0 required for the
-WMMA route, which only supports F16/Q8_0) and `PAGED_WMMA`, which forwards
-DFLASH27B_PAGED_WMMA past the runners' ambient-tuning guard.
+defaults unchanged): `KV_TYPE` (canonical default q4_0; the WMMA route
+supports F16/Q8_0/Q4_0, q8_0 matches the blog command) and `PAGED_WMMA`,
+which forwards DFLASH27B_PAGED_WMMA past the runners' ambient-tuning guard.
 
 **he-raw (short HumanEval-style prompts, 256 output tokens, C=1/2/5, 1 rep)**
 — parity within noise: goodput 29.33/41.04/92.88 -> 29.14/40.87/92.56 tok/s
@@ -363,9 +364,9 @@ attention-numerics differences under timing-dependent batch composition.
 Known harness behaviour (the blog documents responses differing between runs)
 and not a kernel determinism issue - the differential is bit-exact per run.
 
-Caveats: no Q8_0 DFlash2 draft on the bench host, so the AR variant was used
-(the blog's headline numbers are with DFlash2 speculation and are not
-comparable); single-repeat for he-raw.
+Caveat: single-repeat for he-raw. (This run predates the DFlash2 draft below;
+the blog's headline numbers use DFlash2 speculation and are not comparable to
+the AR variant used here.)
 
 ### DFlash2 drafter + extended long-context A/B (blog harness)
 
@@ -395,9 +396,9 @@ Ragged long-context ladder, q8_0 KV, luce-k8 (medians where repeated):
 The advantage grows with context exactly as the isolated op does. Bench
 constraint found: the ragged runner sizes the worst-case prefill graph as
 SLOTS x max_ctx, so 16 slots x 32K OOMs (20 GB graph); xl needs SLOTS<=4 and
-xxl SLOTS<=2 to stay at the ~131K-row bound the 2.6-5.2K runs used.
+xxl SLOTS<=2 to stay within the ~131K-row bound those runs used.
 
-### Q4_0 KV support (fa0fa0bb + 39d32819)
+### Q4_0 KV support
 
 Third KV type alongside F16/Q8_0, so the canonical runner's q4_0 default (and
 the DS4 production KV type) routes without overrides. The gather's per-thread

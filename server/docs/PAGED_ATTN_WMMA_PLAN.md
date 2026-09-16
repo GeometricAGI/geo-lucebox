@@ -1,5 +1,12 @@
 # Paged attention WMMA plan (head-256, RDNA4)
 
+> **SUPERSEDED - kept for provenance only.** This is the pre-work plan; its
+> baseline numbers and predictions were later refuted by measurement (the 44K
+> ">12 min" pathology no longer exists; the V_DOT2 paged kernel is ~1.7x
+> slower than the contiguous one, not tile-equal; Q4_0 is now supported, not
+> left on V_DOT2). See PAGED_ATTN_WMMA_HANDOFF.md, "Where the plan's 2x went",
+> for the post-hoc reconstruction and the delivered results.
+
 Follow-up to PR #736 (tensor-core fattn). Target: the continuous-batching
 path (`--paged-attention`), which routes full-attention layers through
 `ggml_paged_attn_ext` (paged-attn.cu) and never reaches the fattn dispatch

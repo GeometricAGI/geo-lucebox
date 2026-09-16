@@ -1,8 +1,8 @@
 // Paged-attention kernel throughput bench (head-256, gfx1201).
 //
 // Times ggml_paged_attn_ext at a chunked-prefill shape (nq query rows in one
-// block-table slot over a growing paged pool) with q8_0 K/V, the Qwen3.8-27B
-// serving config. DFLASH27B_PAGED_WMMA=0/1 selects the V_DOT2 decode kernel
+// block-table slot over a growing paged pool) with the K/V type from argv[2]
+// (f16/q8_0/q4_0, default q8_0). DFLASH27B_PAGED_WMMA=0/1 selects the V_DOT2 decode kernel
 // or the stage-1 WMMA kernel; run the binary once per value to A/B. The
 // launcher reads the env once at static init, hence one route per process.
 // Throughput only; correctness is covered by test_paged_attn_wmma.cpp.

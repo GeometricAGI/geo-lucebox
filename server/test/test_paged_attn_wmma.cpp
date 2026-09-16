@@ -4,8 +4,8 @@
 // DFLASH27B_PAGED_WMMA=1 (route pinned by the launch counter) or through
 // the V_DOT2 reference kernel when =0 (counter must stay 0), dumping the
 // outputs to paged_attn_out.bin for the compare_paged_attn.py comparator
-// (max-abs-diff tolerance 2e-3 f16 / 3e-3 q8_0 / 6e-3 q4_0). The CPU backend ABORTS on
-// GGML_OP_PAGED_ATTN, so the two GPU routes are compared against each
+// (max-abs-diff tolerance 2e-3 f16 / 3e-3 q8_0 / 6e-3 q4_0). The CPU backend
+// ABORTS on GGML_OP_PAGED_ATTN, so the two GPU routes are compared against each
 // other.
 #include "ggml.h"
 #define GGML_COMMON_DECL_CPP

@@ -457,7 +457,10 @@ bool run_case(ggml_backend_t backend,
         // The WMMA route accumulates the VKQ output in f16 (design: mirrors
         // the contiguous fattn-mma kernel), so long-context rows carry ~1e-3
         // absolute noise against the f32 reference; the decode route
-        // accumulates in f32 (~1e-5). Applies only when the route is enabled.
+        // accumulates in f32 (~1e-5). Applies only when the route is enabled:
+        // with DFLASH27B_PAGED_WMMA=1 this test is an A/B against the f32
+        // reference, so it no longer pins the decode path (test_paged_attn_wmma
+        // does that, counter-checked).
         const char * wmma_env = getenv("DFLASH27B_PAGED_WMMA");
         const float tol = (wmma_env && atoi(wmma_env) != 0) ? 2.0e-3f : MAX_ABS_ERROR;
         ok = ok && max_abs_error < tol;
