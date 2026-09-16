@@ -430,8 +430,19 @@ artifact; every other column for that level tracks).
 ### Tolerance margins (review note)
 
 compare_paged_attn.py reports a single global max over all concatenated
-cases, so the per-type margins are not independent witnesses: measured
-headroom is f16 3.2-6.8x, q8_0 1.48-1.54x, q4_0 1.40-1.75x. A future codegen
-change could flip one q8_0/q4_0 outlier and fail the whole run. If that
-happens, split the comparator per case (the test's case table is fixed)
-rather than widening --tol further.
+cases, so the per-type margins are not independent witnesses. After the
+long-context coverage fix (dense rows now sit at the end of the committed
+prefix), the measured per-case maxima are:
+
+| case | max abs | tol | headroom |
+|---|---:|---:|---:|
+| 512-f16 / 8192-f16 / mixed-f16 / sparse-f16 | 4.88e-4 | 2e-3 | 4.1x |
+| 512-q8 / 8192-q8 | 2.77e-4 | 3e-3 | 10.8x |
+| 512-q4 / 8192-q4 | 4.43e-4 | 6e-3 | 13.5x |
+| mixed-q4 | **4.28e-3** | 6e-3 | **1.40x** |
+
+The binding case is mixed-q4; short-extent rows carry the *larger* error
+(peaked softmax over few tokens), which is why the old dense-64-token cases
+set the q8_0 margin. A future codegen change could flip the mixed-q4 outlier
+and fail the whole run. If that happens, split the comparator per case (the
+test's case table is fixed) rather than widening --tol further.
