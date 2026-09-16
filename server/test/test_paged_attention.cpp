@@ -454,7 +454,13 @@ bool run_case(ggml_backend_t backend,
             max_abs_error =
                 std::max(max_abs_error, std::fabs(actual[i] - expected[i]));
         }
-        ok = ok && max_abs_error < MAX_ABS_ERROR;
+        // The WMMA route accumulates the VKQ output in f16 (design: mirrors
+        // the contiguous fattn-mma kernel), so long-context rows carry ~1e-3
+        // absolute noise against the f32 reference; the decode route
+        // accumulates in f32 (~1e-5). Applies only when the route is enabled.
+        const char * wmma_env = getenv("DFLASH27B_PAGED_WMMA");
+        const float tol = (wmma_env && atoi(wmma_env) != 0) ? 2.0e-3f : MAX_ABS_ERROR;
+        ok = ok && max_abs_error < tol;
     }
 
     std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s tree=%s max_abs=%.6g %s\n",
