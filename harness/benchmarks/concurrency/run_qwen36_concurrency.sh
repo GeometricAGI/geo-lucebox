@@ -26,6 +26,12 @@ MAX_TOKENS="${MAX_TOKENS:-64}"
 WARMUP_TOKENS="${WARMUP_TOKENS:-8}"
 PREFILL_FIRST_BURST_STEPS="${PREFILL_FIRST_BURST_STEPS:-0}"
 IDLE_PREFILL_TOKENS="${IDLE_PREFILL_TOKENS:-4096}"
+# KV quantisation for the paged pool (q4_0 canonical default; q8_0
+# matches the WMMA route's supported types and the blog command).
+KV_TYPE="${KV_TYPE:-q4_0}"
+# Optional pass-through for the paged-attention kernel route
+# (DFLASH27B_PAGED_WMMA). Empty preserves the default kernel.
+PAGED_WMMA="${PAGED_WMMA:-}"
 
 usage() {
   cat <<'EOF'
@@ -181,11 +187,12 @@ pathlib.Path(p).write_text(json.dumps(obj,indent=2,sort_keys=True)+"\n")' \
 run_case() {
   local repeat="$1" workload="$2" clients="$3" variant="$4"
   local max_ctx timeout capacity max_prefills binary model_id
-  if [[ "$workload" == long ]]; then
-    max_ctx=8192; timeout=1800
-  else
-    max_ctx=4096; timeout=1200
-  fi
+  case "$workload" in
+    xl)  max_ctx=32768; timeout=3600 ;;
+    xxl) max_ctx=65536; timeout=5400 ;;
+    long) max_ctx=8192; timeout=1800 ;;
+    *)   max_ctx=4096; timeout=1200 ;;
+  esac
   capacity=$((SLOTS * max_ctx))
   local case_dir="$OUT/$workload/c$clients/r$repeat/$variant"
   mkdir -p "$case_dir"
@@ -225,22 +232,25 @@ run_case() {
     command=("$binary" -m "$MODEL" -ngl all -lv 4 --reasoning off --reasoning-format none
       --parallel "$SLOTS" -c "$capacity"
       -b 2048 -ub 512 --cont-batching --no-context-shift --no-mmap -fa on
-      -ctk q4_0 -ctv q4_0 --no-cache-prompt --host 127.0.0.1 --port "$PORT" --alias "$model_id")
+      -ctk "$KV_TYPE" -ctv "$KV_TYPE" --no-cache-prompt --host 127.0.0.1 --port "$PORT" --alias "$model_id")
   else
     command=("$binary" "$MODEL" --target-device hip:0 --paged-attention
       --max-concurrency "$SLOTS" --kv-pool-tokens "$capacity" --max-ctx "$max_ctx"
-      --cache-type-k q4_0 --cache-type-v q4_0 --fa-window 0
+      --cache-type-k "$KV_TYPE" --cache-type-v "$KV_TYPE" --fa-window 0
       --prefix-cache-slots 0 --prefill-cache-slots 0 --admission-coalesce-ms 5
       --host 127.0.0.1 --port "$PORT" --model-name "$model_id")
   fi
   if [[ "$variant" == llama ]]; then
     launch_command=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" "${command[@]}")
   else
+    local -a route_env2=()
+    [[ -n "$PAGED_WMMA" ]] && route_env2=(DFLASH27B_PAGED_WMMA="$PAGED_WMMA")
     launch_command=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1
       DFLASH_MIN_TOKENS="$WARMUP_TOKENS"
       DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
       DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
-      DFLASH_MAX_CONCURRENT_PREFILLS="$max_prefills" "${command[@]}")
+      DFLASH_MAX_CONCURRENT_PREFILLS="$max_prefills"
+      "${route_env2[@]}" "${command[@]}")
   fi
   printf '%q ' "${launch_command[@]}" > "$case_dir/server-command.txt"; printf '\n' >> "$case_dir/server-command.txt"
   local offset="${prompt_offsets[$clients]}"
