@@ -2,6 +2,8 @@
 """Comparator for test_paged_attn_wmma.cpp two-mode dumps.
 
 Usage: compare_paged_attn.py ref.bin cand.bin [--tol 6e-3]
+       (the test writes ref=paged_attn_out_vdot2.bin,
+        cand=paged_attn_out_wmma.bin, one file per route)
 Exits non-zero when the global max exceeds --tol, so CI can gate on it.
 
 The dump layout is case order from the test source; the test prints the

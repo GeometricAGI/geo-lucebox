@@ -3,8 +3,10 @@
 // Runs ggml_paged_attn_ext through the stage-1 WMMA kernel when
 // DFLASH27B_PAGED_WMMA=1 (route pinned by the launch counter) or through
 // the V_DOT2 reference kernel when =0 (counter must stay 0), dumping the
-// outputs to paged_attn_out.bin for the compare_paged_attn.py comparator
-// (max-abs-diff tolerance 2e-3 f16 / 3e-3 q8_0 / 6e-3 q4_0). The CPU backend
+// outputs to paged_attn_out_wmma.bin / paged_attn_out_vdot2.bin (one file per
+// route, so the two CTest entries never truncate each other when run in
+// parallel) for the compare_paged_attn.py comparator (max-abs-diff tolerance
+// 2e-3 f16 / 3e-3 q8_0 / 6e-3 q4_0). The CPU backend
 // ABORTS on GGML_OP_PAGED_ATTN, so the two GPU routes are compared against each
 // other.
 #include "ggml.h"
@@ -42,7 +44,8 @@ struct Case {
     int kv_len;      // committed prefix length (per slot, may differ)
     ggml_type kv_type; // F16 / Q8_0 / Q4_0 paged pool
     bool mixed;      // ragged multi-slot + decode-row shape
-    int qpos_stride = 1; // 1 = dense causal (extent r+1); >1 spans partitions
+    int qpos_stride = 1; // 1 = dense prefill chunk at end of prefix
+                         // (extent kv_len-n_rows+r+1); >1 spans partitions
 };
 
 bool run_case(ggml_backend_t gpu, const Case & c, FILE * out) {
@@ -195,7 +198,12 @@ int main() {
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
     if (!gpu) return 1;
 
-    FILE * out = std::fopen("paged_attn_out.bin", "wb");
+    // One dump per route: the V_DOT2 and WMMA CTest entries share a working
+    // directory, so a common filename would race under `ctest -j`.
+    const bool wmma_route = getenv("DFLASH27B_PAGED_WMMA") != nullptr
+                            && atoi(getenv("DFLASH27B_PAGED_WMMA")) != 0;
+    FILE * out = std::fopen(wmma_route ? "paged_attn_out_wmma.bin"
+                                       : "paged_attn_out_vdot2.bin", "wb");
     if (!out) return 1;
 
     const Case cases[] = {
