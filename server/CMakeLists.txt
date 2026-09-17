@@ -1092,6 +1092,30 @@ if(DFLASH27B_TESTS)
         dflash_add_ggml_gpu_executable(bench_fattn_mma256 test/bench_fattn_mma256.cpp)
         target_compile_definitions(bench_fattn_mma256 PRIVATE GGML_USE_HIP)
 
+        # Two-mode differential test for the stage-1 WMMA paged-attention
+        # kernel (RDNA4): runs the op through the WMMA route and the V_DOT2
+        # decode route, then tests/compare_paged_attn.py compares the dumps.
+        add_executable(test_paged_attn_wmma test/test_paged_attn_wmma.cpp)
+        set_source_files_properties(test/test_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_paged_attn_wmma PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_compile_definitions(test_paged_attn_wmma PRIVATE GGML_USE_HIP)
+        target_include_directories(test_paged_attn_wmma PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_paged_attn_wmma PRIVATE ggml ggml-base ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
+        list(APPEND _raw_unit_test_targets test_paged_attn_wmma)
+
+        # Benchmark, not a test: isolates the paged-attention op at
+        # chunked-prefill shapes and A/B's the V_DOT2 / WMMA routes.
+        add_executable(bench_paged_attn_wmma test/bench_paged_attn_wmma.cpp)
+        set_source_files_properties(test/bench_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(bench_paged_attn_wmma PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_compile_definitions(bench_paged_attn_wmma PRIVATE GGML_USE_HIP)
+        target_include_directories(bench_paged_attn_wmma PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(bench_paged_attn_wmma PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
+
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
         # claim the fusion rests on.
@@ -2211,6 +2235,16 @@ if(DFLASH27B_TESTS)
                 endif()
             endif()
         endforeach()
+        # test_paged_attn_wmma runs one route per process (the env selects it
+        # and the launch counter pins it), so the auto-registered case above
+        # only ever exercises V_DOT2. Register the WMMA pass as a second case;
+        # the test fails on a route mismatch, so CI now gates both routes.
+        if(TARGET test_paged_attn_wmma)
+            add_test(NAME paged_attn_wmma_route COMMAND test_paged_attn_wmma)
+            set_tests_properties(paged_attn_wmma_route PROPERTIES
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "DFLASH27B_PAGED_WMMA=1")
+        endif()
         unset(_unit_ctest_name)
         unset(_cppunit_target_index)
     endif()
