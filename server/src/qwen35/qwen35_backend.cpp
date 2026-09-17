@@ -1782,6 +1782,10 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const int kvf_chunk = kvflash_pager_.chunk_tokens();
         prefill_ubatch = std::max(prefill_ubatch, kvf_chunk);
         prefill_ubatch = (prefill_ubatch / kvf_chunk) * kvf_chunk;
+        // Never let one ubatch span more than the whole pool: allocating the
+        // later chunks would evict the earlier chunks of the same ubatch before
+        // their KV is computed.
+        prefill_ubatch = std::min(prefill_ubatch, kvflash_tokens_);
         kvflash_pager_.reset();
         if (kvflash_qk_policy_) {
             kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
