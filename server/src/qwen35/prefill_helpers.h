@@ -17,6 +17,20 @@ inline int qwen35_prefill_ubatch(int fallback) {
     return value ? std::max(1, std::atoi(value)) : fallback;
 }
 
+// Pooled kvflash prefill ubatch. The pager only needs chunk-aligned batches, so
+// round the configured ubatch down to a chunk multiple (never below one chunk)
+// and never exceed the pool: a ubatch larger than the pool would allocate its
+// later chunks by evicting its own earlier, not-yet-computed chunks.
+inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_tokens) {
+    if (chunk_tokens <= 0) return prefill_ubatch;
+    int ub = std::max(prefill_ubatch, chunk_tokens);
+    ub = (ub / chunk_tokens) * chunk_tokens;
+    if (pool_tokens > 0 && ub > pool_tokens) {
+        ub = std::max(chunk_tokens, (pool_tokens / chunk_tokens) * chunk_tokens);
+    }
+    return ub;
+}
+
 // GGML M-RoPE consumes positions axis-major:
 //   [all temporal][all height][all width][all extra].
 // position_stride is the complete token width of the destination tensor;

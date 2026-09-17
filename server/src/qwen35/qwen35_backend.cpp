@@ -1775,17 +1775,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         return -1;
     }
     if (kvf_paged) {
-        // The pager only needs chunk-aligned ubatches, not one-chunk ubatches.
-        // Forcing prefill to the chunk size (~64 tokens) makes pooled prefill
-        // ~2x slower; round the configured ubatch down to a chunk multiple,
-        // never below one chunk.
+        // Chunk-aligned but not one-chunk ubatches; see kvflash_pooled_ubatch.
         const int kvf_chunk = kvflash_pager_.chunk_tokens();
-        prefill_ubatch = std::max(prefill_ubatch, kvf_chunk);
-        prefill_ubatch = (prefill_ubatch / kvf_chunk) * kvf_chunk;
-        // Never let one ubatch span more than the whole pool: allocating the
-        // later chunks would evict the earlier chunks of the same ubatch before
-        // their KV is computed.
-        prefill_ubatch = std::min(prefill_ubatch, kvflash_tokens_);
+        prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_);
         kvflash_pager_.reset();
         if (kvflash_qk_policy_) {
             kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
