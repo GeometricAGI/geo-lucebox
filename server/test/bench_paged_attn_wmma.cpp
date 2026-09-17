@@ -141,10 +141,17 @@ bool run_shape(ggml_backend_t gpu, int nq, int kv_len, int iters, ggml_type kv_t
 
 int main(int argc, char ** argv) {
 #if defined(GGML_USE_HIP)
-    hipDeviceProp_t props{};
-    if (hipGetDeviceProperties(&props, 0) != hipSuccess) {
+    // Distinguish "no device" (skip) from a device that exists but cannot be
+    // queried (real failure), so CI does not report a runtime error as a skip.
+    int n_devices = 0;
+    if (hipGetDeviceCount(&n_devices) != hipSuccess || n_devices == 0) {
         std::printf("[bench-paged-wmma] SKIP: no HIP device\n");
         return 77;
+    }
+    hipDeviceProp_t props{};
+    if (hipGetDeviceProperties(&props, 0) != hipSuccess) {
+        std::printf("[bench-paged-wmma] FAIL: hipGetDeviceProperties failed\n");
+        return 1;
     }
     if (std::strncmp(props.gcnArchName, "gfx12", 5) != 0) {
         std::printf("[bench-paged-wmma] SKIP: requires gfx12 (RDNA4), got %s\n", props.gcnArchName);
