@@ -1775,15 +1775,21 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         return -1;
     }
     if (kvf_paged) {
-        prefill_ubatch = kvflash_pager_.chunk_tokens();
+        // The pager only needs chunk-aligned ubatches, not one-chunk ubatches.
+        // Forcing prefill to the chunk size (~64 tokens) makes pooled prefill
+        // ~2x slower; round the configured ubatch down to a chunk multiple,
+        // never below one chunk.
+        const int kvf_chunk = kvflash_pager_.chunk_tokens();
+        prefill_ubatch = std::max(prefill_ubatch, kvf_chunk);
+        prefill_ubatch = (prefill_ubatch / kvf_chunk) * kvf_chunk;
         kvflash_pager_.reset();
         if (kvflash_qk_policy_) {
             kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
             kvflash_qk_pooled_upto_ = 0;
         }
         std::printf("[kvflash] pooled prefill: %d tokens through a %d-token pool "
-                    "(%d-token chunks, evicting)\n",
-                    prompt_len, kvflash_tokens_, prefill_ubatch);
+                    "(%d-token chunks, ubatch=%d, evicting)\n",
+                    prompt_len, kvflash_tokens_, kvf_chunk, prefill_ubatch);
         std::fflush(stdout);
     }
 
