@@ -649,6 +649,11 @@ static __global__ void ds4_indexer_score_wmma_m32_kernel(
                 }
             }
         }
+        // The next head_base iteration rewrites weight_sh and c_sh: drain the
+        // reads above before any warp reaches them. The small kernel's
+        // equivalent barrier is at :474; without it the staged M32 route races
+        // and nondeterministically changes score bits.
+        __syncthreads();
     }
 
     int slot = 0;
