@@ -21,4 +21,8 @@ TEST_CASE(KvflashUbatchFixture, clamped_to_pool) {
     CHECK(kvflash_pooled_ubatch(1024, 64, 512) == 512);
     CHECK(kvflash_pooled_ubatch(512, 64, 256) == 256);
     CHECK(kvflash_pooled_ubatch(4096, 64, 512) == 512);
+    // Pool smaller than one chunk: the one-chunk floor wins over the pool clamp.
+    // The pager's pool is always a positive chunk multiple, so this only pins
+    // the documented precedence.
+    CHECK(kvflash_pooled_ubatch(1024, 64, 32) == 64);
 }
