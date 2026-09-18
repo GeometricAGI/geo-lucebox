@@ -4126,6 +4126,15 @@ void HttpServer::configure_generation_io(
         }
         ++output.completion_tokens;
 
+        if (output.completion_tokens == 1) {
+            // Prefill is over: the first generated token marks the decode phase.
+            // The count goes with it, so the transition a client sees is not
+            // "decode with nothing generated" — the counter otherwise only
+            // moves on multiples of ten.
+            status_.set_decode();
+            status_.update_completion_tokens(output.completion_tokens);
+            broadcast_status();
+        }
         if (output.completion_tokens % 10 == 0) {
             status_.update_completion_tokens(output.completion_tokens);
             broadcast_status();
@@ -4384,9 +4393,9 @@ void HttpServer::process_job(ServerJob * job) {
         backend_.unpark(ParkTarget::DraftModel);   // reload decode draft (~3.3 GB)
     }
 
-    // Transition status to decode phase.
-    status_.set_decode();
-    broadcast_status();
+    // The status stays in PREFILL until the first generated token (set in the
+    // token callback): generate() below prefills first, so flipping here makes
+    // a long prompt report decode for the whole time it is still prefilling.
 
     GenerateResult result;
     if (using_restore) {
