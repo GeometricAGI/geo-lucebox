@@ -1857,6 +1857,40 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_invoke_in_string
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_string_parameter_before_sibling_parameter) {
+    // When a string="true" parameter is unclosed before another parameter,
+    // lookahead termination on tag boundaries must cleanly partition them
+    // rather than consuming the sibling parameter into the first argument.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">list directory files</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"].get<std::string>().find("ls -la") != std::string::npos);
+        TEST_ASSERT(args["command"].get<std::string>().find("<｜DSML｜parameter") == std::string::npos);
+        TEST_ASSERT(args["description"] == "list directory files");
+    }
+}
+
 
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
