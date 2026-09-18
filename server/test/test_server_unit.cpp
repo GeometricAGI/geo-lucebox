@@ -1695,6 +1695,47 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_deepseek_harness_exact_p
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_final_invoke_before_block_end) {
+    // Regression test for real payload (chatcmpl_000000000000000a) where the model omits </｜DSML｜invoke>
+    // before the closing </｜DSML｜tool_calls>.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"edit\">\n"
+        "<｜DSML｜parameter name=\"file_path\" string=\"true\">/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"new_string\" string=\"true\">### B. Paged Attention WMMA (head-256, RDNA4) — `DFLASH27B_PAGED_WMMA` (default off, BURN-IN)\n"
+        "- Env `DFLASH27B_PAGED_WMMA=1` routes paged full-attention layers (head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Default (unset/0) keeps the V_DOT2 decode kernel.\n"
+        "- Differential: single-prompt TTFT −21% @12K, −42% @44K; batched 8K-pool prefill slightly ahead. Kernel-level 20.6–22.4 TFLOP/s vs 6.4–6.8 (3.1–3.3×); end-to-end bounded by attention's prefill share (~8% @44K, ~4% @12K).\n"
+        "- Two-mode CTest: `test_paged_attn_wmma` (V_DOT2, env=0) / `paged_attn_wmma_route` (env=1), diff via `server/test/compare_paged_attn.py --tol 6e-3`. Need `--reconfig` after the upstream pull for `CMakeLists.txt` to register targets.\n"
+        "- Source of truth: `server/docs/PAGED_ATTN_WMMA_HANDOFF.md`.</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"old_string\" string=\"true\">### B. Prefill Mode: `--ds4-prefill sparse` (DO NOT use `exact` for multi-turn)</｜DSML｜parameter>\n"
+        "</｜DSML｜tool_calls>";
+
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"file_path", {{"type", "string"}}},
+                     {"new_string", {{"type", "string"}}},
+                     {"old_string", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["file_path"] == "/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md");
+        TEST_ASSERT(args["new_string"].get<std::string>().find("DFLASH27B_PAGED_WMMA") != std::string::npos);
+        TEST_ASSERT(args["old_string"].get<std::string>().find("Prefill Mode") != std::string::npos);
+    }
+}
+
+
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
