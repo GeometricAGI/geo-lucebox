@@ -722,7 +722,7 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     // 3. Extract parameter key-value pairs:
     // a. Attribute style: <(param|parameter) name="key" string="true|false">value</...> or <parameter=key>value</parameter>
     static const std::regex re_attr_param(
-        R"(<(?:｜DSML｜)?(?:param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)</(?:｜DSML｜)?(?:param|parameter)\s*>)"
+        R"(<(?:｜DSML｜)?(?:param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?![\s\S])))"
         R"(|<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?![\s\S]))|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     auto pbegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_attr_param);
     auto pend = std::sregex_iterator();
@@ -1525,7 +1525,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             R"(([\s\S]*?))"
             R"((?:</(?:｜DSML｜)?invoke\s*>(?=\s*(?:<(?:｜DSML｜)?invoke[\s/>]|</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>|\{|(?![\s\S])))|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S])))");
         static const std::regex re_param(
-            R"(<(?:｜DSML｜)?(param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)</(?:｜DSML｜)?\1\s*>)"
+            R"(<(?:｜DSML｜)?(param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)(?:</(?:｜DSML｜)?\1\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?![\s\S])))"
             R"(|<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?\5\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?![\s\S])))");
 
         auto fbegin = std::sregex_iterator(text.begin(), text.end(), re_block);
