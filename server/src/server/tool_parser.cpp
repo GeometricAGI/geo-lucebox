@@ -722,7 +722,7 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     // 3. Extract parameter key-value pairs:
     // a. Attribute style: <(param|parameter) name="key" string="true|false">value</...> or <parameter=key>value</parameter>
     static const std::regex re_attr_param(
-        R"(<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?(true|false)["']?)?\s*>([\s\S]*?)</(?:｜DSML｜)?(?:param|parameter)>|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+        R"(<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)>|(?=<(?:｜DSML｜)?(?:param|parameter))|(?=</(?:｜DSML｜)?invoke)|(?![\s\S]))|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     auto pbegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_attr_param);
     auto pend = std::sregex_iterator();
     if (pbegin != pend) {
@@ -744,13 +744,15 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
                 std::string v = (*it)[3].str();
                 if (is_str == "true") {
                     args[k] = v;
-                } else {
+                } else if (is_str == "false") {
                     json j = json::parse(v, nullptr, false);
                     if (!j.is_discarded()) {
                         args[k] = std::move(j);
                     } else {
                         args[k] = convert_param_value(trim_ws(v), k, props);
                     }
+                } else {
+                    args[k] = convert_param_value(trim_ws(v), k, props);
                 }
             } else {
                 std::string v = trim_ws((*it)[1].matched ? (*it)[3].str() : (*it)[5].str());
@@ -1509,8 +1511,15 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     // Pattern 4d: <function_calls> or <tool_calls> containing <invoke> blocks or JSON lines
     {
         static const std::regex re_block(R"(<(?:｜DSML｜)?(?:function_calls|tool_calls)>([\s\S]*?)</(?:｜DSML｜)?(?:function_calls|tool_calls)>)");
-        static const std::regex re_invoke(R"(<(?:｜DSML｜)?invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</(?:｜DSML｜)?invoke>)");
-        static const std::regex re_param(R"(<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?(true|false)["']?)?\s*>([\s\S]*?)</(?:｜DSML｜)?\1>)");
+        static const std::regex re_invoke(
+            R"(<(?:｜DSML｜)?invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>)"
+            R"(([\s\S]*?))"
+            R"((?:</(?:｜DSML｜)?invoke>|(?=<(?:｜DSML｜)?invoke)|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)>)|(?![\s\S])))");
+        static const std::regex re_param(
+            R"(<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)"
+            R"((?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>)"
+            R"(([\s\S]*?))"
+            R"((?:</(?:｜DSML｜)?\1>|(?=<(?:｜DSML｜)?(?:param|parameter))|(?=</(?:｜DSML｜)?invoke)|(?![\s\S])))");
 
         auto fbegin = std::sregex_iterator(text.begin(), text.end(), re_block);
         auto fend = std::sregex_iterator();
@@ -1566,13 +1575,15 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                             std::string v = (*pit)[4].str();
                             if (is_str == "true") {
                                 args[k] = v;
-                            } else {
+                            } else if (is_str == "false") {
                                 json j = json::parse(v, nullptr, false);
                                 if (!j.is_discarded()) {
                                     args[k] = std::move(j);
                                 } else {
                                     args[k] = convert_param_value(trim_ws(v), k, find_tool_properties(tools, fn_name));
                                 }
+                            } else {
+                                args[k] = convert_param_value(trim_ws(v), k, find_tool_properties(tools, fn_name));
                             }
                         } else {
                             std::string v = trim_ws((*pit)[4].str());

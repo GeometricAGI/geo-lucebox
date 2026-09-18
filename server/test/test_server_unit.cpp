@@ -1602,6 +1602,99 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semanti
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_invoke) {
+    // When a model omits </｜DSML｜invoke> between consecutive calls,
+    // lookahead termination should cleanly partition the invocations.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"] == "pwd");
+
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["command"] == "ls -la");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_deepseek_harness_exact_payload) {
+    // Regression test for the real DeepSeek Harness multi-tool call:
+    // Call 1: bash (unclosed invoke)
+    // Call 2: bash (closed invoke)
+    // Call 3: web_search with string="invalid"
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">find /home/dpavlin/aimax -name \"*.tar.gz\" -o -name \"*.tgz\" 2>/dev/null | head -20; ls -la /home/dpavlin/aimax 2>/dev/null | head -30</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">List aimax dir for package artifacts</｜DSML｜parameter>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la /home/dpavlin/.npm/_npx/1e7f6d9597241db0/ 2>/dev/null; cat /home/dpavlin/.npm/_npx/1e7f6d9597241db0/package.json 2>/dev/null | head -50</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">Check harness checkout package.json for version</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"web_search\">\n"
+        "<｜DSML｜parameter name=\"queries\" string=\"invalid\">\n"
+        "</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"}, {"function", {
+             {"name", "web_search"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"queries", {{"type", "array"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    auto result = parse_tool_calls(text, tools);
+    // At minimum, both bash calls must be completely recovered
+    TEST_ASSERT(result.tool_calls.size() >= 2);
+    if (result.tool_calls.size() >= 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"].get<std::string>().find("find /home/dpavlin/aimax") != std::string::npos);
+        TEST_ASSERT(args0["description"] == "List aimax dir for package artifacts");
+
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["command"].get<std::string>().find("cat /home/dpavlin/.npm") != std::string::npos);
+        TEST_ASSERT(args1["description"] == "Check harness checkout package.json for version");
+    }
+}
+
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
