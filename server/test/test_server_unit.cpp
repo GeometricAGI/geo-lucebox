@@ -1680,9 +1680,8 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_deepseek_harness_exact_p
     });
 
     auto result = parse_tool_calls(text, tools);
-    // At minimum, both bash calls must be completely recovered
-    TEST_ASSERT(result.tool_calls.size() >= 2);
-    if (result.tool_calls.size() >= 2) {
+    TEST_ASSERT(result.tool_calls.size() == 3);
+    if (result.tool_calls.size() == 3) {
         TEST_ASSERT(result.tool_calls[0].name == "bash");
         auto args0 = json::parse(result.tool_calls[0].arguments);
         TEST_ASSERT(args0["command"].get<std::string>().find("find /home/dpavlin/aimax") != std::string::npos);
@@ -1692,6 +1691,10 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_deepseek_harness_exact_p
         auto args1 = json::parse(result.tool_calls[1].arguments);
         TEST_ASSERT(args1["command"].get<std::string>().find("cat /home/dpavlin/.npm") != std::string::npos);
         TEST_ASSERT(args1["description"] == "Check harness checkout package.json for version");
+
+        TEST_ASSERT(result.tool_calls[2].name == "web_search");
+        auto args2 = json::parse(result.tool_calls[2].arguments);
+        TEST_ASSERT(args2.contains("queries"));
     }
 }
 
@@ -1792,6 +1795,65 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_tag_like_parameter_conte
         TEST_ASSERT(result.tool_calls[0].name == "bash");
         auto args = json::parse(result.tool_calls[0].arguments);
         TEST_ASSERT(args["command"] == "echo \"<invoke-not-a-tag>\"; cat <parameterized>");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_prose_invoke_tag_does_not_mask_json_call) {
+    // A prose or non-call <invoke> tag (without name/tool attribute) must not cause
+    // invoke_spans to span until EOF and mask subsequent bare JSON tool calls.
+    const std::string text =
+        "You can invoke the command as follows:\n"
+        "Please look at <invoke> syntax.\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -l\"}}";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -l");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_invoke_in_string_parameter) {
+    // Parameter values with string="true" containing literal </invoke> or </parameter>
+    // inside their payload (e.g. grep commands, git diffs) must not be truncated prematurely.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">grep -n \"</invoke>\" server/src/server/tool_parser.cpp</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">Search for invoke close tags</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "grep -n \"</invoke>\" server/src/server/tool_parser.cpp");
+        TEST_ASSERT(args["description"] == "Search for invoke close tags");
     }
 }
 
