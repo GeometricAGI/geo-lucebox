@@ -22,6 +22,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH27B_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
 | `DFLASH27B_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
+| `DFLASH27B_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `DFLASH_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `DFLASH_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `DFLASH_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
@@ -99,7 +100,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH27B_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `DFLASH27B_LM_HEAD_FIX` - http_server.cpp
 - `DFLASH27B_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
-- `DFLASH27B_PREFILL_UBATCH` - layer_split_daemon.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
+- `DFLASH27B_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `DFLASH_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `DFLASH_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
 - `DFLASH_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
