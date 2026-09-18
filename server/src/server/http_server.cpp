@@ -4128,7 +4128,11 @@ void HttpServer::configure_generation_io(
 
         if (output.completion_tokens == 1) {
             // Prefill is over: the first generated token marks the decode phase.
+            // The count goes with it, so the transition a client sees is not
+            // "decode with nothing generated" — the counter otherwise only
+            // moves on multiples of ten.
             status_.set_decode();
+            status_.update_completion_tokens(output.completion_tokens);
             broadcast_status();
         }
         if (output.completion_tokens % 10 == 0) {
