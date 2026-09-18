@@ -722,7 +722,8 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     // 3. Extract parameter key-value pairs:
     // a. Attribute style: <(param|parameter) name="key" string="true|false">value</...> or <parameter=key>value</parameter>
     static const std::regex re_attr_param(
-        R"(<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?=</(?:｜DSML｜)?invoke[\s/>])|(?![\s\S]))|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+        R"(<(?:｜DSML｜)?(?:param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)</(?:｜DSML｜)?(?:param|parameter)\s*>)"
+        R"(|<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?![\s\S]))|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     auto pbegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_attr_param);
     auto pend = std::sregex_iterator();
     if (pbegin != pend) {
@@ -734,29 +735,37 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
                 valid = false;
                 break;
             }
-            std::string k = (*it)[1].matched ? (*it)[1].str() : (*it)[4].str();
+            std::string k;
+            std::string v;
+            std::string is_str;
+            if ((*it)[1].matched || (*it)[2].matched) {
+                k = (*it)[1].matched ? (*it)[1].str() : (*it)[2].str();
+                v = (*it)[3].str();
+                is_str = "true";
+            } else if ((*it)[4].matched) {
+                k = (*it)[4].str();
+                if ((*it)[5].matched) is_str = (*it)[5].str();
+                v = (*it)[6].str();
+            } else {
+                k = (*it)[7].str();
+                v = trim_ws((*it)[8].str());
+            }
             if (args.contains(k)) {
                 valid = false;
                 break;
             }
-            if ((*it)[1].matched && (*it)[2].matched) {
-                std::string is_str = (*it)[2].str();
-                std::string v = (*it)[3].str();
-                if (is_str == "true") {
-                    args[k] = v;
-                } else if (is_str == "false") {
-                    json j = json::parse(v, nullptr, false);
-                    if (!j.is_discarded()) {
-                        args[k] = std::move(j);
-                    } else {
-                        args[k] = convert_param_value(trim_ws(v), k, props);
-                    }
+            if (is_str == "true") {
+                args[k] = v;
+            } else if (is_str == "false") {
+                json j = json::parse(v, nullptr, false);
+                if (!j.is_discarded()) {
+                    args[k] = std::move(j);
                 } else {
                     args[k] = convert_param_value(trim_ws(v), k, props);
                 }
             } else {
-                std::string v = trim_ws((*it)[1].matched ? (*it)[3].str() : (*it)[5].str());
-                args[k] = convert_param_value(v, k, props);
+                std::string val = is_str.empty() ? trim_ws(v) : v;
+                args[k] = convert_param_value(val, k, props);
             }
             cursor = pos + it->length();
         }
@@ -1121,7 +1130,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     // including malformed or disallowed ones, so no later JSON sweep can
     // reinterpret their bodies as independent calls.
     static const std::regex re_invoke_span(
-        R"(<(?:｜DSML｜)?invoke(?:\s[^>]*)?>[\s\S]*?(?:</(?:｜DSML｜)?invoke\s*>|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S])))");
+        R"(<(?:｜DSML｜)?invoke\s+(?:name|tool)\s*=\s*["']?[A-Za-z_][\w.\-]*["']?[^>]*>[\s\S]*?(?:</(?:｜DSML｜)?invoke\s*>|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S]))|<(?:｜DSML｜)?invoke(?:\s[^>]*)?>[\s\S]*?</(?:｜DSML｜)?invoke\s*>)");
     std::vector<Span> invoke_spans;
     auto invoke_begin = std::sregex_iterator(
         text.begin(), text.end(), re_invoke_span);
@@ -1514,12 +1523,10 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         static const std::regex re_invoke(
             R"(<(?:｜DSML｜)?invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>)"
             R"(([\s\S]*?))"
-            R"((?:</(?:｜DSML｜)?invoke\s*>|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S])))");
+            R"((?:</(?:｜DSML｜)?invoke\s*>(?=\s*(?:<(?:｜DSML｜)?invoke[\s/>]|</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>|\{|(?![\s\S])))|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S])))");
         static const std::regex re_param(
-            R"(<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)"
-            R"((?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>)"
-            R"(([\s\S]*?))"
-            R"((?:</(?:｜DSML｜)?\1\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?=</(?:｜DSML｜)?invoke[\s/>])|(?![\s\S])))");
+            R"(<(?:｜DSML｜)?(param|parameter)\s+(?:name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s+string\s*=\s*["']?true["']?|string\s*=\s*["']?true["']?\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)\s*>([\s\S]*?)</(?:｜DSML｜)?\1\s*>)"
+            R"(|<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?\5\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?![\s\S])))");
 
         auto fbegin = std::sregex_iterator(text.begin(), text.end(), re_block);
         auto fend = std::sregex_iterator();
@@ -1572,26 +1579,31 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                     for (auto pit = pbegin; pit != pend; ++pit) {
                         size_t ppos = pit->position();
                         if (!trim_ws(body.substr(cursor, ppos - cursor)).empty()) { valid_body = false; break; }
-                        std::string k = (*pit)[2].str();
+                        std::string k;
+                        std::string v;
+                        std::string is_str;
+                        if ((*pit)[1].matched) {
+                            k = (*pit)[2].matched ? (*pit)[2].str() : (*pit)[3].str();
+                            v = (*pit)[4].str();
+                            is_str = "true";
+                        } else {
+                            k = (*pit)[6].str();
+                            v = (*pit)[8].str();
+                            if ((*pit)[7].matched) is_str = (*pit)[7].str();
+                        }
                         if (args.contains(k)) { valid_body = false; break; }
-                        if ((*pit)[3].matched) {
-                            std::string is_str = (*pit)[3].str();
-                            std::string v = (*pit)[4].str();
-                            if (is_str == "true") {
-                                args[k] = v;
-                            } else if (is_str == "false") {
-                                json j = json::parse(v, nullptr, false);
-                                if (!j.is_discarded()) {
-                                    args[k] = std::move(j);
-                                } else {
-                                    args[k] = convert_param_value(trim_ws(v), k, find_tool_properties(tools, fn_name));
-                                }
+                        if (is_str == "true") {
+                            args[k] = v;
+                        } else if (is_str == "false") {
+                            json j = json::parse(v, nullptr, false);
+                            if (!j.is_discarded()) {
+                                args[k] = std::move(j);
                             } else {
                                 args[k] = convert_param_value(trim_ws(v), k, find_tool_properties(tools, fn_name));
                             }
                         } else {
-                            std::string v = trim_ws((*pit)[4].str());
-                            args[k] = convert_param_value(v, k, find_tool_properties(tools, fn_name));
+                            std::string val = is_str.empty() ? trim_ws(v) : v;
+                            args[k] = convert_param_value(val, k, find_tool_properties(tools, fn_name));
                         }
                         found_param = true;
                         cursor = ppos + pit->length();
