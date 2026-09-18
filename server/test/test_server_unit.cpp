@@ -1735,6 +1735,66 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_final_invoke_be
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_invoke_with_nested_json) {
+    // When an unclosed invoke contains a parameter whose value is a JSON tool-call object,
+    // subsequent sweeps must not parse that JSON value as a duplicate tool call.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">cat config.json</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"metadata\" string=\"false\">{\"name\": \"bash\", \"arguments\": {\"command\": \"nested\"}}</｜DSML｜parameter>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"metadata", {{"type", "object"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "cat config.json");
+        TEST_ASSERT(args["metadata"]["name"] == "bash");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_tag_like_parameter_content) {
+    // Parameter values containing substrings like <invoke-not-a-tag> or <parameterized>
+    // must not trigger premature lookahead termination.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">echo \"<invoke-not-a-tag>\"; cat <parameterized></｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo \"<invoke-not-a-tag>\"; cat <parameterized>");
+    }
+}
+
 
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {

@@ -722,7 +722,7 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     // 3. Extract parameter key-value pairs:
     // a. Attribute style: <(param|parameter) name="key" string="true|false">value</...> or <parameter=key>value</parameter>
     static const std::regex re_attr_param(
-        R"(<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)>|(?=<(?:｜DSML｜)?(?:param|parameter))|(?=</(?:｜DSML｜)?invoke)|(?![\s\S]))|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+        R"(<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>([\s\S]*?)(?:</(?:｜DSML｜)?(?:param|parameter)\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?=</(?:｜DSML｜)?invoke[\s/>])|(?![\s\S]))|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     auto pbegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_attr_param);
     auto pend = std::sregex_iterator();
     if (pbegin != pend) {
@@ -1121,7 +1121,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     // including malformed or disallowed ones, so no later JSON sweep can
     // reinterpret their bodies as independent calls.
     static const std::regex re_invoke_span(
-        R"(<invoke(?:\s[^>]*)?>[\s\S]*?</invoke\s*>)");
+        R"(<(?:｜DSML｜)?invoke(?:\s[^>]*)?>[\s\S]*?(?:</(?:｜DSML｜)?invoke\s*>|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S])))");
     std::vector<Span> invoke_spans;
     auto invoke_begin = std::sregex_iterator(
         text.begin(), text.end(), re_invoke_span);
@@ -1514,12 +1514,12 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         static const std::regex re_invoke(
             R"(<(?:｜DSML｜)?invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>)"
             R"(([\s\S]*?))"
-            R"((?:</(?:｜DSML｜)?invoke>|(?=<(?:｜DSML｜)?invoke)|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)>)|(?![\s\S])))");
+            R"((?:</(?:｜DSML｜)?invoke\s*>|(?=<(?:｜DSML｜)?invoke[\s/>])|(?=</(?:｜DSML｜)?(?:function_calls|tool_calls)\s*>)|(?![\s\S])))");
         static const std::regex re_param(
             R"(<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)"
             R"((?:\s+string\s*=\s*["']?([^\s"'>]+)["']?)?\s*>)"
             R"(([\s\S]*?))"
-            R"((?:</(?:｜DSML｜)?\1>|(?=<(?:｜DSML｜)?(?:param|parameter))|(?=</(?:｜DSML｜)?invoke)|(?![\s\S])))");
+            R"((?:</(?:｜DSML｜)?\1\s*>|(?=<(?:｜DSML｜)?(?:param|parameter)[\s/>])|(?=</(?:｜DSML｜)?invoke[\s/>])|(?![\s\S])))");
 
         auto fbegin = std::sregex_iterator(text.begin(), text.end(), re_block);
         auto fend = std::sregex_iterator();
@@ -1537,6 +1537,10 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             auto begin = std::sregex_iterator(block_content.begin(), block_content.end(), re_invoke);
             auto end = std::sregex_iterator();
             for (auto it = begin; it != end; ++it) {
+                size_t istart = inner_start + it->position();
+                size_t iend = istart + it->length();
+                invoke_spans.push_back({istart, iend});
+
                 std::string fn_name = (*it)[1].str();
                 if (!tool_allowed(tools, fn_name)) continue;
                 std::string body = trim_ws((*it)[2].str());
@@ -1597,8 +1601,6 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                     if (!trim_ws(body.substr(cursor)).empty()) continue;
                     if (raw_args.empty()) raw_args = args.dump();
                 }
-                size_t istart = inner_start + it->position();
-                size_t iend = istart + it->length();
                 block_calls.push_back({fn_name, std::move(args), raw_args, istart, iend});
             }
 
@@ -1614,6 +1616,15 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                         inside_invoke = true;
                         cursor = span.end - inner_start;
                         break;
+                    }
+                }
+                if (!inside_invoke) {
+                    for (const auto & bc : block_calls) {
+                        if (abs_s >= bc.start && abs_s < bc.end) {
+                            inside_invoke = true;
+                            cursor = bc.end - inner_start;
+                            break;
+                        }
                     }
                 }
                 if (inside_invoke) continue;
