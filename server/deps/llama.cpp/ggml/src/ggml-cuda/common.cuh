@@ -1136,6 +1136,42 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
 };
 
+// GQH (Geo-Quant Hierarchical) rungs 108/109/110/111. The 256-weight superblock
+// runs along the row (input) axis, so qk is 256 -- GQH_SUPERBLOCK, pinned by a
+// static_assert in gqh.cuh, because common.cuh is included everywhere and must
+// not pull in gqh-tables.h grid arrays. MMQ ITER_K of
+// 256 gives exactly one superblock per tile iteration -- the same relation the
+// K-quants have. qr/qi describe a 2-bit-per-code interleave that GQH does not
+// use (its planes are bit-sliced), so they are the K-quant values purely to keep
+// the generic templates that reference them well-formed; no GQH path reads them.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_GQH3> {
+    static constexpr int qk = 256;
+    static constexpr int qr = QR3_K;
+    static constexpr int qi = QI3_K;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_GQH2_H> {
+    static constexpr int qk = 256;
+    static constexpr int qr = QR2_K;
+    static constexpr int qi = QI2_K;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_GQH2_C> {
+    static constexpr int qk = 256;
+    static constexpr int qr = QR2_K;
+    static constexpr int qi = QI2_K;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_GQH4> {
+    static constexpr int qk = 256;
+    static constexpr int qr = QR4_K;
+    static constexpr int qi = QI4_K;
+};
+
 //////////////////////
 
 struct ggml_cuda_device_info {
