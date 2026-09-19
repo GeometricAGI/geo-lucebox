@@ -437,6 +437,7 @@ add_library(dflash_common STATIC
     src/gemma4/gemma4_dflash_target.cpp
     src/gemma4/gemma4_layer_split_adapter.cpp
     # DeepSeek V4 Flash target arch
+    src/common/gqh_headers.cpp
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_roctx.cpp
@@ -462,6 +463,7 @@ add_library(dflash_common STATIC
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp
+    src/common/dflash2_head.cpp
     src/common/target_shard_ipc.cpp
     src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
@@ -1163,6 +1165,87 @@ if(DFLASH27B_TESTS)
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
     endif()
+    # GQH (108/109/110/111) decode bit-exactness against the geo-quant reference vectors.
+    # Deliberately PLAIN C++ targets: these use only the public ggml API, and marking a
+    # .cpp as LANGUAGE HIP is what leaves the rocmfp test targets below linking without
+    # libstdc++ (undefined operator new / __gxx_personality_v0).
+    set(GQH_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/tests")
+    if(EXISTS "${GQH_TEST_DIR}/test-gqh-cpu-decode.cpp")
+        foreach(GQH_SRC test-gqh-cpu-decode test-gqh-backend)
+            add_executable(${GQH_SRC} "${GQH_TEST_DIR}/${GQH_SRC}.cpp")
+            target_link_libraries(${GQH_SRC} PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+            target_include_directories(${GQH_SRC} PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include")
+        endforeach()
+        foreach(GQH_CASE "gqh3;1;256" "gqh3;4;512" "gqh3;64;1024"
+                         "gqh2_h;1;256" "gqh2_h;4;512" "gqh2_h;64;1024"
+                         "gqh2_c;1;256" "gqh2_c;4;512" "gqh2_c;64;1024"
+                         "gqh4;1;256" "gqh4;4;512" "gqh4;64;1024")
+            list(GET GQH_CASE 0 GQH_RUNG)
+            list(GET GQH_CASE 1 GQH_ROWS)
+            list(GET GQH_CASE 2 GQH_COLS)
+            set(GQH_STEM "${GQH_TEST_DIR}/gqh-vectors/${GQH_RUNG}_${GQH_ROWS}x${GQH_COLS}")
+            add_test(NAME test-gqh-cpu-decode-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                     COMMAND test-gqh-cpu-decode ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                             "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32")
+            # nvec=8 exercises the DFlash2 default verify width on the fused path.
+            # GQH dispatch is no longer gated on luce_mmvq_max_ncols (default 3);
+            # a narrower probe would miss the N=8 exact-width arm.
+            add_test(NAME test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                     COMMAND test-gqh-backend ${GQH_RUNG} ${GQH_ROWS} ${GQH_COLS}
+                             "${GQH_STEM}.wire.bin" "${GQH_STEM}.decode.f32" 8)
+            # Serving defaults GGML_GQH_I8DOT=1 (not bit-exact vs the f32 vectors).
+            set_tests_properties(test-gqh-backend-${GQH_RUNG}-${GQH_ROWS}x${GQH_COLS}
+                PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
+        endforeach()
+    endif()
+
+    # The GQH header-KV parser (common/gqh_headers.cpp), model-free. This is the only
+    # qtype-specific gate on the loader side, and it was previously reachable only
+    # through a real multi-GB model load. Plain C++ for the same reason as above.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gqh_headers.cpp")
+        add_executable(test_gqh_headers
+            test/test_gqh_headers.cpp
+            src/common/gqh_headers.cpp)
+        target_link_libraries(test_gqh_headers PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        target_include_directories(test_gqh_headers PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include")
+        add_test(NAME test_gqh_headers COMMAND test_gqh_headers)
+    endif()
+
+    # Shipped GQH3 5120x17408 gate/up pair + SWIGLU graph (Qwen3.8-GQH-Q3KXL FFN).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gqh_pair_glu.cpp"
+            AND EXISTS "${GQH_TEST_DIR}/gqh-vectors/gqh3_64x1024.wire.bin")
+        add_executable(test_gqh_pair_glu test/test_gqh_pair_glu.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_gqh_pair_glu.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_gqh_pair_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_gqh_pair_glu PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_gqh_pair_glu.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_gqh_pair_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_gqh_pair_glu PRIVATE GGML_USE_CUDA)
+        endif()
+        target_include_directories(test_gqh_pair_glu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/test
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_gqh_pair_glu PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_gqh_pair_glu PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_gqh_pair_glu PRIVATE hip::host)
+        endif()
+        add_test(NAME test_gqh_pair_glu
+                 COMMAND test_gqh_pair_glu
+                         "${GQH_TEST_DIR}/gqh-vectors/gqh3_64x1024.wire.bin")
+        set_tests_properties(test_gqh_pair_glu PROPERTIES ENVIRONMENT "GGML_GQH_I8DOT=0")
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,

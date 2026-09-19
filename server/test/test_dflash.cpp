@@ -21,6 +21,7 @@
 #include "dflash27b.h"
 #include <limits>
 #include "internal.h"
+#include "common/gqh_headers.h"
 #include "delta_net_specla.h"
 #include "specla_commit_cuda.h"
 #include "specla_mode.h"
@@ -1299,6 +1300,14 @@ int main(int argc, char ** argv) {
     // verify mode we'll use. DDTree needs room for 1 + ddtree_budget tree nodes.
     // Profile mode intentionally keeps the intermediate cache tiny (no capture)
     // so we can go up to n_tokens=128 without OOM.
+    // GQH I8/glu-fuse is exact-width ncols == block_size; tree verify is
+    // 1+n_nodes columns, so cap budget before sizing the cache.
+    if (ddtree_mode) {
+        const int native_block = dw.block_size > 0
+            ? dw.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+        ddtree_budget = dflash::common::gqh_cap_spec_ddtree_budget(
+            w.ctx, ddtree_budget, native_block);
+    }
     const int max_verify_tokens = (profile_scaling || time_breakdown)
         ? DFLASH27B_DRAFT_BLOCK_SIZE
         : (ddtree_mode

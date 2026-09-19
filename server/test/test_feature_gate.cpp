@@ -115,6 +115,21 @@ void test_feature_gate_mixed_draft_placement_requires_ipc() {
         args, "qwen35", PlacementBackend::Cuda).empty());
 }
 
+void test_feature_gate_draft_block_size_requires_local_draft() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    args.draft_block_size = 12;
+    CHECK(!gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
+
+    args.draft_path = "/nonexistent/draft.gguf";
+    CHECK(gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
+
+    args.device.backend = PlacementBackend::Cuda;
+    args.draft_device.backend = PlacementBackend::Hip;
+    args.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
+    CHECK(!gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
+}
+
 void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
@@ -532,6 +547,7 @@ void test_feature_warnings_silent_when_supported() {
     args.draft_path = "/nonexistent/draft.gguf";
     args.ddtree_mode = true;
     args.fa_window = 512;
+    args.draft_block_size = 12;
     args.draft_swa_window = 2048;
     // qwen35 forwards every one of these.
     CHECK(warn_result(args, "qwen35").empty());
@@ -568,6 +584,15 @@ void test_feature_warnings_report_inert_decode_tunables() {
     vw.verify_width = 8;
     CHECK(!warns_about(warn_result(vw, "laguna"), "--verify-width"));
     CHECK(warns_about(warn_result(vw, "qwen35"), "--verify-width"));
+
+    BackendArgs db;
+    db.model_path = "/nonexistent/model.gguf";
+    db.draft_path = "/nonexistent/draft.gguf";
+    db.draft_block_size = 12;
+    CHECK(!warns_about(warn_result(db, "qwen35"), "--draft-block-size"));
+    CHECK(warns_about(warn_result(db, "qwen35moe"), "--draft-block-size"));
+    CHECK(parse_placement_device_list("cuda:0,cuda:1", db.device));
+    CHECK(warns_about(warn_result(db, "qwen35"), "--draft-block-size"));
 
     BackendArgs fa;
     fa.model_path = "/nonexistent/model.gguf";
@@ -627,6 +652,7 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_decode_draft("qwen36", false));
     CHECK(!arch_supports_ddtree("qwen36", false));
     CHECK(!arch_supports_verify_width("qwen36", false));
+    CHECK(!arch_supports_draft_block_size("qwen36", false));
     CHECK(!arch_supports_fa_window("qwen36", false));
     CHECK(!arch_supports_draft_swa("qwen36", false));
     CHECK(!arch_supports_paged_attention("qwen36", false));
@@ -635,6 +661,10 @@ void test_model_capability_tables() {
     CHECK(arch_supports_paged_attention("qwen35", false));
     CHECK(!arch_supports_paged_attention("qwen35", true));
     CHECK(!arch_supports_paged_attention("qwen35moe", false));
+
+    CHECK(arch_supports_draft_block_size("qwen35", false));
+    CHECK(!arch_supports_draft_block_size("qwen35", true));
+    CHECK(!arch_supports_draft_block_size("qwen35moe", false));
 }
 
 };
@@ -646,6 +676,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_requires_compiled_target_backend();
     test_feature_gate_ipc_options_require_ipc_binary();
     test_feature_gate_mixed_draft_placement_requires_ipc();
+    test_feature_gate_draft_block_size_requires_local_draft();
     test_feature_gate_pflash_requires_drafter_and_supported_arch();
     test_feature_gate_validates_target_split_topology();
     test_feature_gate_tensor_parallel_requirements();

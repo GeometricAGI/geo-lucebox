@@ -495,7 +495,9 @@ bool build_target_step(
         ggml_set_input(sg.logits_row_indices);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net prefill graph (CS = 32) reaches ~17k
+    // nodes at a 512-token ubatch.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
     // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
