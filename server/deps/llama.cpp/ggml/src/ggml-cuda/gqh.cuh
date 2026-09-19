@@ -57,6 +57,17 @@ bool ggml_cuda_gqh_mul_mat_vec(
         int in, int out, int ncols, int64_t x_col_stride, int64_t y_col_stride,
         cudaStream_t stream);
 
+// Two same-shaped GQH4 weight tensors sharing one activation, in ONE dispatch --
+// the ffn gate/up pair. Halves that pair's per-dispatch fixed cost and turns its
+// 8.5 occupancy rounds into 17.0. Returns false unless both tensors are registered
+// GQH4 of identical shape and the shape takes the ROWS == 1 arm, so the caller
+// keeps its unfused path. The two halves may carry different level tables.
+// See the definition for the model.
+bool ggml_cuda_gqh_mul_mat_vec_pair(
+        const void * vx_a, float * y_a, const void * vx_b, float * y_b,
+        const float * x, int in, int out, int ncols,
+        int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream);
+
 // Registry-aware converters for ggml_get_to_fp16_cuda / ggml_get_to_fp32_cuda.
 // The per-tensor header comes from the shared ggml-base registry (ggml_gqh_lookup),
 // the same one the CPU decoders use -- the loader registers once for both.

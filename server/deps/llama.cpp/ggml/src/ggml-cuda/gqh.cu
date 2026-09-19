@@ -2,6 +2,7 @@
 #include "../gqh.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // Device-side constants, single-sourced with the host tables through the *_INIT
@@ -211,6 +212,109 @@ void ggml_cuda_gqh2c_decode(const void * wire, float * dst,
 // N times slower than it should be -- measured as 8 slots buying only 1.35x over
 // single-stream. Every column is accumulated against one load instead.
 #define GQH_MAX_COLS       8
+// Output rows one warp owns on the batch-1 path. The kernel is memory-level-parallelism
+// bound, not issue bound (measured: a 14% instruction cut bought 2.5%, an 8-instruction
+// increase that kept two more requests in flight bought 4.4%), so the axis that pays is
+// outstanding DRAM bytes per wave. Four rows give the wave four independent wire streams
+// instead of one, and quarter the activation traffic per row -- a warp pulls 1024 B of x
+// per 137 B of weights, and the prefetched xnext is now shared by all four rows.
+//
+// Swept on the R9700 against a same-session ROWS == 1 control (rocprofv3, ±0.3%):
+// GQH4 total per N=1 forward 26.408 / 25.151 / 23.707 ms at ROWS 1 / 2 / 4. Costs VGPRs
+// 33 -> 46 -> 70, all still 16 waves/SIMD with no spills, so 4 is the last step before
+// the occupancy cliff. NOT uniformly better per shape: the out == 17408 (gate/up)
+// dispatches, the only ones already near DRAM peak at ROWS == 1, lose 9%. Which shapes
+// take this value and which fall back to one row per warp is decided by
+// gqh_rows1_selected(), which carries the per-shape sweep table.
+#define GQH_MATVEC_ROWS    4
+
+// Occupancy rounds' worth of waves that a ROWS == 1 launch has to supply before
+// ROWS == GQH_MATVEC_ROWS stops paying. This is a MEASURED TABLE, not a law -- read
+// gqh_rows1_selected() below before touching it.
+//
+// 5, not 8. The threshold is `rounds * 2048` output rows, so 5 admits out == 10240 and
+// out == 12288 to the deep ROWS == 1 arm and keeps out == 6144 (and the nsb == 68
+// down-proj at out == 5120) on ROWS == 4. Measured per bucket with rocprofv3 on ONE
+// binary, A/B'd through GGML_GQH_ROWS1_ROUNDS so both arms come from the same build,
+// us per dispatch, two runs each (bucket figures repeat to ~0.5%):
+//
+//   out     nsb   waves@R4 rounds   ROWS==4    ROWS==1/DEPTH==3   arm
+//    5120    68     1280    0.63     78.0 78.2        --          ROWS==4
+//    6144    20     1536    0.75     41.9 42.1     49.1           ROWS==4
+//   10240    20     2560    1.25     61.9 61.9     53.2 53.5      ROWS==1  <- moved
+//   12288    20     3072    1.50     69.1 69.3     60.0 60.0      ROWS==1  <- moved
+//   17408    20     4352    2.13    (102)         85.1 85.2       ROWS==1
+//
+// The mechanism is occupancy-round quantisation, and it only reads correctly when you
+// compare `ceil(waves/2048) / (waves/2048)` between the two arms rather than trusting
+// either arm's raw rate: out == 10240 and out == 12288 sit at 1.25 and 1.50 rounds on
+// ROWS == 4, i.e. they pay for 2 rounds and use 1.25/1.50, while ROWS == 1 puts them at
+// exactly 5 and 6 whole rounds with zero waste. out == 6144 is the case that keeps this
+// a table and not a formula: ROWS == 1 gives it 3 whole rounds and it still LOSES by
+// 13%, because ROWS == 4 amortises the 1024 B activation read over four rows and that
+// is worth more than its 33% round waste.
+//
+// This supersedes iteration 8's sweep, which read R = 6/5/3/2 as "all worse" off
+// `hot_ms`. R == 5 is worth 0.52 ms of a 37 ms forward -- 1.4%, under that signal's
+// 1.6% noise floor. Only the per-bucket kernel trace can see it; do not re-sweep this
+// constant with hot_ms.
+#define GQH_ROWS1_ROUNDS   5
+
+// Superblocks the batch-1 ROWS == 1 arm keeps in flight per wave. ROWS and DEPTH buy
+// the SAME thing -- outstanding DRAM bytes per wave -- on two different axes, and the
+// ROWS == 1 arm exists precisely for the shapes where the ROWS axis is closed: ROWS
+// divides the wave count, and out == 17408 at ROWS == 4 falls from 8.5 occupancy
+// rounds to 2.125, which quantises up to 3 and throws away 29% of the machine
+// (measured: 11.93 -> 12.99 ms). DEPTH costs registers instead and leaves the wave
+// count alone.
+//
+// Little's law says that is exactly what this arm needs, and the same model reads the
+// whole sweep table below correctly, which is why it is worth trusting. This arm
+// sustains 508 GB/s with 128 SIMDs x 16 waves x 137 B = 280 KB in flight, i.e. an
+// effective ~551 ns of DRAM latency; the same 551 ns needs ~358 KB to reach the
+// R9700's ~640 GB/s peak, and two superblocks per wave give 560 KB. The rest of the
+// table: the down-proj bucket at ROWS == 4 holds 701 KB in flight and measures 613
+// GB/s (96% of peak), and gate/up at ROWS == 4 holds 1.1 MB and still loses -- to
+// round quantisation, not to bandwidth (74.5 us saturated x 3/2.125 rounds = 105 us,
+// measured 102).
+//
+// Swept on the R9700 against the DEPTH == 1 control, rocprofv3, ms of <111,1,1> per
+// N=1 forward (this arm's only bucket: out == 17408, in == 5120, 127 dispatches).
+// Rows 1-2 are iteration 7's sweep; 3 and 4 were re-measured same-session in
+// iteration 8 against a 10.897 control and reproduced iteration 7 to 0.03%:
+//
+//   DEPTH      ms   vs ctl   GB/s   VGPRs   occupancy
+//     1    11.866      --     510      32      16      <- the one-superblock pipeline
+//     2    10.896   1.089x    556      50      16
+//     3    10.731   1.106x    565      76      16      <- landed
+//     4       --       --      --      97      12      <- occupancy cliff, by ONE VGPR
+//
+// 3, and it is the last step this axis has. 4 is refuted outright and not by a little:
+// 97 VGPRs is one over the 96 that 16 waves/SIMD allows, and crossing that cliff does
+// not merely cost occupancy, it halves the blocks-per-MP that gqh_rows1_selected()
+// multiplies its threshold by, which silently drags two more GQH4 buckets onto this arm
+// with no signal in hot_ms or the sha gate (read that function's warning). At 76 VGPRs
+// this leaves 20 of headroom, so ANY future change to this arm has to re-read
+// .amdhsa_next_free_vgpr -- there is no longer room to be casual about it.
+//
+// Do not try to buy DEPTH == 4 by moving the activation prefetch after the fold to free
+// the xcur copy. Measured in iteration 8: that schedule DOES fit (81 VGPRs, 16
+// waves/SIMD at DEPTH == 4) but the reordering costs 3.2% on its own, and DEPTH 4 on
+// top of it only got back to 10.751 -- worse than plain DEPTH == 3. Nor by decoupling
+// the wire prefetch distance from the trip length (a WSTAGES knob, wire queue
+// 2*DEPTH deep at +4 VGPRs): 11.356 / 11.301 / 11.694 at 2 / 3 / 4 stages against
+// 10.889 at 1, i.e. worse everywhere.
+//
+// Diminishing returns, and they are nearly exhausted: at 565 GB/s this arm is at 88% of
+// the R9700's ~640 peak, and 613 GB/s is the best any GQH4 bucket has ever reached on
+// this device, so there is at most ~8% left in it from ANY amount of extra depth.
+#define GQH_MATVEC_DEPTH   3
+
+// Instruction classes gqh_sched_fence() still lets the scheduler move across:
+// VALU | SALU | DS read | DS write | transcendental. Only VMEM is pinned, because
+// VMEM is the prefetch -- the LDS gathers and the activation loads stay free to
+// float up into the shadow of the E4M3 table read.
+#define GQH_SCHED_MASK     0x0486
 
 // Down-shift shuffle confined to a 32-lane logical group. The explicit width is
 // what keeps the reduction self-contained on wave64 (GFX8/9), and is a no-op on
@@ -225,44 +329,245 @@ static __device__ __forceinline__ float gqh_warp_shfl_down(float v, int off) {
 #endif
 }
 
-// gqh3/gqh2_h only. Both grids are symmetric about zero, so the level is a SIGN plus one of four
-// magnitudes. Selecting from registers beats indexing the table: the SASS showed
-// the table version dominated by divergent constant-bank loads (8 distinct grid
-// entries per warp serialise into 8 replays), 78 LDC against 23 FP ops.
-// gqh3:   grid = [-m3,-m2,-m1,-m0, m0,m1,m2,m3]
-// gqh2_h: grid = [-1, -a, +a, +1], so m.x = a and the outer level is 1.
-// gqh4's 16 levels would need a 7-deep select tree, so it takes the LDS grid below
-// instead -- 8 magnitudes do not fit this trick cheaply.
-template <bool IS_GQH3>
-static __device__ __forceinline__ float gqh_level(int code, const float4 & m) {
-    if (IS_GQH3) {
-        const int hi  = (code >> 2) & 1;
-        const int k   = code & 3;
-        const int idx = hi ? k : (3 - k);
-        const float e0  = (idx & 1) ? m.y : m.x;
-        const float e1  = (idx & 1) ? m.w : m.z;
-        const float mag = (idx & 2) ? e1 : e0;
-        return hi ? mag : -mag;
+// One superblock's wire bytes, as the matvec pipeline carries them from the
+// iteration that loads them into the one that decodes them.
+struct gqh_wire {
+    uint32_t codes;   // this lane's 8 packed codes
+    uint8_t  d;       // superblock E4M3 scale byte (warp-uniform)
+    uint8_t  rb;      // the byte holding this lane's sub-block uint4 ratio
+    uint8_t  hi1;     // gqh3 high-1-bit code plane byte; 0 for the other rungs
+};
+
+// This lane's byte offsets within a superblock. Loop-invariant, and uint32_t rather
+// than int on purpose: every wire read is addressed as `row base + 32-bit offset`,
+// never as a 64-bit pointer add. A global load only takes its SADDR form (SGPR base
+// pair + one 32-bit VGPR offset, no VALU at all) when the zero-extension of the
+// offset is selected in the same basic block as the load. Fold the lane term into a
+// 64-bit pointer instead and LICM hoists it into a 64-bit VGPR pair in the preheader,
+// after which every load in the loop pays a v_add_co_u32/v_add_co_ci_u32 pair plus
+// the s_wait_alu depctr_va_vcc hazard behind it. Pure addressing: which bytes are
+// read, and in what order, is unchanged.
+struct gqh_wire_offsets {
+    uint32_t rb;      // 1 + (sub >> 1)              -- this lane's sub-block ratio byte
+    uint32_t codes;   // 9 + lane * (4 or 2)         -- this lane's packed codes
+    uint32_t hi1;     // 73 + lane                   -- gqh3 high-1-bit plane byte
+};
+
+// Every global read of one superblock, in one place, so the matvec can issue a
+// whole superblock's worth of wire loads a full iteration ahead of the decode
+// that consumes them. `rowbase` is the wave-uniform start of this row and `sb_off`
+// the 32-bit byte offset of superblock `sb` inside it; keeping the two apart is what
+// leaves the SADDR pattern intact.
+template <ggml_type RUNG>
+static __device__ __forceinline__ gqh_wire gqh_wire_load(
+        const uint8_t * __restrict__ rowbase, uint32_t sb_off,
+        const gqh_wire_offsets & off) {
+    constexpr bool IS_GQH3 = RUNG == GGML_TYPE_GQH3;
+    constexpr bool IS_GQH4 = RUNG == GGML_TYPE_GQH4;
+
+    gqh_wire wire;
+    wire.d  = rowbase[sb_off];
+    wire.rb = rowbase[sb_off + off.rb];
+    // memcpy, not a cast: 9 + lane*k is odd and superblocks are an odd stride
+    // apart, so these are unaligned. memcpy lets the compiler pick byte loads
+    // instead of emitting an access that faults on AMD.
+    if (IS_GQH4) {
+        memcpy(&wire.codes, rowbase + (sb_off + off.codes), sizeof(uint32_t));
+    } else {
+        uint16_t lo2;
+        memcpy(&lo2, rowbase + (sb_off + off.codes), sizeof(lo2));
+        wire.codes = lo2;
     }
-    const int hi = (code >> 1) & 1;
-    const float mag = ((code & 1) != hi) ? m.x : 1.0f;
-    return hi ? mag : -mag;
+    wire.hi1 = IS_GQH3 ? rowbase[sb_off + off.hi1] : 0;
+    return wire;
+}
+
+// The eight activations this lane folds against one superblock, as two 128-bit loads.
+// Addressed as `column base + 32-bit BYTE offset` for the SADDR reason in
+// gqh_wire_offsets -- indexing the float* instead makes the address zext(off)*4, the
+// selector will not hoist the scale out of the zero-extension, and the pair of 64-bit
+// VALU adds comes back. in <= 17408, so sb*1024 + j0*4 cannot overflow 32 bits, and
+// alignment is unchanged: j0 is a multiple of 8 floats, so every offset is 32-byte
+// aligned and the 128-bit loads stay legal.
+static __device__ __forceinline__ void gqh_load_x(
+        const float * __restrict__ xc, int sb, int j0, float (&xs)[GQH_PER_LANE]) {
+    const uint8_t * __restrict__ xb = (const uint8_t *) xc;
+    const uint32_t xo = (uint32_t) (sb * GQH_SUPERBLOCK + j0) * sizeof(float);
+    const float4 x0 = *(const float4 *) (xb + xo);
+    const float4 x1 = *(const float4 *) (xb + xo + sizeof(float4));
+    xs[0] = x0.x; xs[1] = x0.y; xs[2] = x0.z; xs[3] = x0.w;
+    xs[4] = x1.x; xs[5] = x1.y; xs[6] = x1.z; xs[7] = x1.w;
+}
+
+// Scheduling fence for the software pipeline. With the ncols == 1 body collapsed to
+// a single basic block, nothing structural stops LLVM sinking the prefetch across the
+// back-edge onto its own use -- and it does, which un-does the pipeline entirely.
+// Measured: the specialization alone handed back all of iteration 1's 1.10x (scored
+// 1.0125). GQH_SCHED_MASK names the classes still allowed to cross it, so the
+// prefetch stays issued a full superblock ahead of the decode that consumes it. Costs no
+// instructions, and is a no-op on NVIDIA and on the multi-column instantiation, whose
+// eight predicated blocks already pin the prefetch.
+static __device__ __forceinline__ void gqh_sched_fence() {
+#if defined(__HIP_PLATFORM_AMD__)
+    __builtin_amdgcn_sched_barrier(GQH_SCHED_MASK);
+#endif
+}
+
+// Asserts to the compiler that `v` is the same in every lane of the wave. `row` is
+// wave-uniform by construction -- one warp owns one output row -- but LLVM's
+// divergence analysis cannot see through threadIdx.x / GQH_WARP and marks the row,
+// and therefore every pointer derived from it, divergent. That costs a 64-bit VALU
+// address chain per global load (v_add_co_u32 + v_add_co_ci_u32, each with an
+// s_wait_alu depctr_va_vcc hazard behind it) where a scalar base plus a 32-bit lane
+// offset would do. readfirstlane is exact here, not an approximation: the value
+// already is uniform, so lane 0's copy is every lane's copy.
+static __device__ __forceinline__ int gqh_uniform(int v) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __builtin_amdgcn_readfirstlane(v);
+#else
+    return v;
+#endif
+}
+
+// The superblock's E4M3 scale, times the per-tensor scale.
+//
+// `d` is the superblock's E4M3 byte -- one address for the whole wave -- but it is
+// adjacent to the per-lane ratio byte `rb` in gqh_wire, LLVM merges the two into one
+// 16-bit value, and rb's divergence infects d. Re-asserting uniformity is what turns
+// the table read into an `s_load_b32`: the lookup leaves the vector memory pipe for the
+// scalar one, so it is tracked by kmcnt instead of loadcnt and can no longer force a
+// full `s_wait_loadcnt 0x0` that drains the prefetch behind it. It also deletes the
+// 64-bit VALU address chain the divergent form needed.
+template <int NCOLS_MAX>
+static __device__ __forceinline__ float gqh_d_real(uint8_t d_raw, float tensor_scale) {
+    const int d = NCOLS_MAX == 1 ? gqh_uniform(d_raw) : d_raw;
+    return gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
+}
+
+// One superblock's contribution to one output row, for every column.
+//
+// This is a SECOND copy of the fold that gqh_matvec_kernel's generic loop spells out
+// inline, and the duplication is deliberate. The deep-pipeline arm needs the fold in
+// two places (its main trip and its leftover-superblock tail), and calling this from
+// the generic loop as well was tried and rejected: it changed the codegen of all six
+// DEPTH == 1 instantiations (e.g. <108,1,4> 657 -> 646 instructions, register
+// allocation shuffled throughout), and four of those six are on paths NOTHING in the
+// scoring rig executes -- so the drift would have been unmeasurable in either
+// direction. Keeping the generic loop textually untouched is what makes its ISA
+// diff-to-identical, which is the only instrument those paths have. If you change the
+// term order here, change it in gqh_matvec_kernel too.
+//
+// same order as the reference: d_real = e4m3(d) * tensor_scale, then
+// s_b = d_real * (ratio/15), then the levels. Do not reassociate.
+template <ggml_type RUNG, int NCOLS_MAX>
+static __device__ __forceinline__ void gqh_fold_superblock(
+        float d_real, uint32_t codes, uint8_t rb, uint8_t hi1, int sub,
+        const float * __restrict__ s_grid, const float * __restrict__ s_ratio,
+        const float (&xcur)[GQH_PER_LANE], const float * __restrict__ x, int sb, int j0,
+        int ncols, int64_t x_col_stride, float (&acc)[NCOLS_MAX]) {
+    constexpr bool IS_GQH3 = RUNG == GGML_TYPE_GQH3;
+    constexpr bool IS_GQH4 = RUNG == GGML_TYPE_GQH4;
+
+    const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
+
+    // Decode this lane's 8 weights ONCE, then reuse them for every column.
+    float w[GQH_PER_LANE];
+#pragma unroll
+    for (int t = 0; t < GQH_PER_LANE; ++t) {
+        // gqh4: little-endian, byte t>>1, low nibble for even t -> bit 4*t
+        // either way. gqh3: the low-2-bit plane carries bits [1:0] of the code
+        // and the high plane bit 2. gqh2_h: the 2-bit code is the whole index.
+        const int code = IS_GQH4
+            ? ((codes >> (4 * t)) & 0x0f)
+            : (((codes >> (2 * t)) & 0x03) |
+               (IS_GQH3 ? (((hi1 >> t) & 1) << 2) : 0));
+        w[t] = s_grid[code] * s_b;
+    }
+
+    // Fully unrolled so acc[]/xs[] stay in registers; the per-column term order is
+    // unchanged, so each output is bit-identical to the one-superblock-per-trip loop.
+#pragma unroll
+    for (int c = 0; c < NCOLS_MAX; ++c) {
+        if (NCOLS_MAX > 1 && c >= ncols) {
+            continue;
+        }
+        float xs[GQH_PER_LANE];
+        if (NCOLS_MAX == 1) {
+#pragma unroll
+            for (int t = 0; t < GQH_PER_LANE; ++t) {
+                xs[t] = xcur[t];
+            }
+        } else {
+            gqh_load_x(x + (int64_t) c * x_col_stride, sb, j0, xs);
+        }
+#pragma unroll
+        for (int t = 0; t < GQH_PER_LANE; ++t) {
+            acc[c] += w[t] * xs[t];
+        }
+    }
 }
 
 // RUNG selects the wire layout and the level decode at compile time. gqh2_c has its
 // own kernel below (different block geometry), so RUNG is one of GQH3/GQH2_H/GQH4.
-// `mag` is read only by gqh3/gqh2_h and `grid` only by gqh4; the unused argument
-// costs argument space and nothing else, which keeps the gqh3 codegen untouched.
-template <ggml_type RUNG>
+// `grid` carries the rung's whole signed level table by value; the kernel reads its
+// first 16 / 8 / 4 entries and ignores the rest.
+//
+// NCOLS_MAX is the compile-time column bound. With the runtime `ncols` alone, the
+// eight `c >= ncols` guards are opaque to the compiler and it emits eight predicated
+// basic blocks -- so a batch-1 decode still walks ~20 dead scalar compare/branch
+// instructions per superblock, and, worse, the machine scheduler cannot move loads
+// across those block boundaries. Instantiating NCOLS_MAX == 1 makes the guard
+// compile-time false and collapses the superblock body to a single basic block; the
+// generic NCOLS_MAX == GQH_MAX_COLS instantiation keeps the runtime guard and is
+// byte-for-byte the kernel this replaces. Only the codegen changes: the values and
+// the order they fold into acc[] are untouched, so every output stays bit-identical.
+//
+// ROWS is how many output rows one warp owns. Each row keeps its own rowbase, its own
+// wire stream and its own acc, folded in the same term order as the one-row kernel, so
+// every output is still bit-identical; only `x` is shared between them. ROWS > 1 is the
+// batch-1 path -- the generic multi-column instantiation stays at ROWS == 1 so its
+// codegen does not move.
+template <ggml_type RUNG, int NCOLS_MAX, int ROWS, bool PAIRED>
 static __global__ void gqh_matvec_kernel(
         const uint8_t * __restrict__ data, const float * __restrict__ x,
-        float * __restrict__ y, int in, int out, int ncols, float tensor_scale, float4 mag,
-        gqh_grid16 grid, int64_t x_col_stride, int64_t y_col_stride) {
+        float * __restrict__ y, int in, int out, int ncols, float tensor_scale,
+        gqh_grid16 grid, int64_t x_col_stride, int64_t y_col_stride,
+        const uint8_t * __restrict__ data_b, float * __restrict__ y_b,
+        float tensor_scale_b, gqh_grid16 grid_b) {
+    // PAIRED folds two same-shaped weight tensors that share `x` into ONE dispatch,
+    // selected by blockIdx.y. See ggml_cuda_gqh_mul_mat_vec_pair(). The four extra
+    // kernargs are appended, so every pre-existing kernarg keeps its offset, and the
+    // if constexpr below vanishes for PAIRED == false -- the seven unpaired
+    // instantiations keep a byte-identical opcode stream (verified by ISA diff).
+    //
+    // A block still folds exactly the terms it folded before, in the same order, for
+    // the same output row of whichever tensor it belongs to. Bit-identical by
+    // construction: the only thing that changes is which dispatch carries the block.
+    const uint8_t * __restrict__ w_base = data;
+    float * __restrict__ y_base = y;
+    float t_scale = tensor_scale;
+    // Each half carries its OWN level table: 26% of this model's gate/up pairs are
+    // quantized against different GQH4 grids (measured: 53 of 200), and requiring a
+    // shared table would silently leave those pairs unfused.
+    const float * g_levels = grid.v;
+    if constexpr (PAIRED) {
+        if (blockIdx.y != 0) {
+            w_base   = data_b;
+            y_base   = y_b;
+            t_scale  = tensor_scale_b;
+            g_levels = grid_b.v;
+        }
+    }
     constexpr bool IS_GQH3 = RUNG == GGML_TYPE_GQH3;
     constexpr bool IS_GQH4 = RUNG == GGML_TYPE_GQH4;
     const int sb_bytes = IS_GQH3 ? GQH3_SB_BYTES : (IS_GQH4 ? GQH4_SB_BYTES : GQH2H_SB_BYTES);
     const int warps_per_block = blockDim.x / GQH_WARP;
-    const int row  = blockIdx.x * warps_per_block + (threadIdx.x / GQH_WARP);
+    // Batch-1 only: hand LLVM the uniformity it cannot prove, so `rowbase` and the
+    // activation base become SGPR pairs and every global load in the loop takes the
+    // SADDR form (scalar base + 32-bit lane offset). The generic instantiation keeps
+    // the divergent form so its codegen stays byte-for-byte what it was.
+    const int row_raw = (blockIdx.x * warps_per_block + (threadIdx.x / GQH_WARP)) * ROWS;
+    const int row  = NCOLS_MAX == 1 ? gqh_uniform(row_raw) : row_raw;
     const int lane = threadIdx.x % GQH_WARP;
 
     // ratio/15 in LDS, not constant memory: the index is the lane's sub-block, so
@@ -271,93 +576,329 @@ static __global__ void gqh_matvec_kernel(
     // Hoisted above the early return -- __syncthreads needs the whole block, and
     // `row >= out` retires whole warps in the tail block.
     __shared__ float s_ratio[16];
-    // gqh4's 16 grid levels ride in LDS for the same reason: `code` is divergent, and
-    // 16 consecutive floats land in 16 distinct banks, one address each -> no conflict.
-    __shared__ float s_grid[IS_GQH4 ? 16 : 1];
+    // The signed level grid rides in LDS for EVERY rung, for the same reason: `code` is
+    // divergent, and RUNG_LEVELS consecutive floats land in that many distinct banks with
+    // one address each, so the gather broadcasts conflict-free.
+    //
+    // gqh3/gqh2_h used to decode from a register select tree instead, on the strength of
+    // an NVIDIA SASS reading where the table lived in CONSTANT memory and 8 distinct
+    // addresses per warp serialised into 8 constant-bank replays. LDS does not replay --
+    // that is the whole reason gqh4's 16 levels are staged here -- and the tree was far
+    // from free: ~5 v_cndmask per weight put gqh3 at 126 VALU per row-superblock against
+    // gqh4's 40, which made the 248320-row output head VALU-ISSUE BOUND (626 M VALU
+    // instructions in 1.65 ms = 128/clk x 2.9 GHz, i.e. saturated) at only 309 GB/s.
+    // Do not reinstate the tree without re-measuring that dispatch.
+    //
+    // Bit-exact, not rounding-equivalent: GQH3_GRID / GQH2H_GRID are antisymmetric to the
+    // bit (G[i] == -G[N-1-i], sign bit only), so table[code] is the same float32 the tree
+    // selected out of the positive half.
+    constexpr int RUNG_LEVELS = IS_GQH4 ? 16 : (IS_GQH3 ? 8 : 4);
+    __shared__ float s_grid[RUNG_LEVELS];
     if (threadIdx.x < 16) {
         s_ratio[threadIdx.x] = gqh_bits(GQH_RATIO_Q_D[threadIdx.x][0]);
-        if (IS_GQH4) {
-            s_grid[threadIdx.x] = grid.v[threadIdx.x];
+        if (threadIdx.x < RUNG_LEVELS) {
+            s_grid[threadIdx.x] = g_levels[threadIdx.x];
         }
     }
     __syncthreads();
     if (row >= out) return;
 
     const int nsb = in / GQH_SUPERBLOCK;
-    const uint8_t * __restrict__ rowbase = data + (int64_t) row * nsb * sb_bytes;
+    // Clamped, not branched: a tail warp whose second row runs past `out` re-reads the
+    // last real row (an L2 hit) and simply does not store it. Branching would split the
+    // superblock body across basic blocks, and the machine scheduler only clusters loads
+    // within one block -- which is the whole basis of the software pipeline below.
+    const uint8_t * __restrict__ rowbase[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        const int rr = r == 0 ? row : (row + r < out ? row + r : out - 1);
+        rowbase[r] = w_base + (int64_t) rr * nsb * sb_bytes;
+    }
 
     const int j0  = lane * GQH_PER_LANE;   // this lane's first weight in the superblock
     const int sub = j0 >> 4;               // two lanes share a 16-weight sub-block
+    const gqh_wire_offsets woff = {
+        (uint32_t) (1 + (sub >> 1)),
+        (uint32_t) (9 + lane * (IS_GQH4 ? 4 : 2)),
+        (uint32_t) (73 + lane),
+    };
 
-    float acc[GQH_MAX_COLS] = { 0.0f };
-    for (int sb = 0; sb < nsb; ++sb) {
-        const uint8_t * __restrict__ b = rowbase + (int64_t) sb * sb_bytes;
+    float acc[ROWS][NCOLS_MAX] = {};
 
-        // same order as the reference: d_real = e4m3(d) * tensor_scale, then
-        // s_b = d_real * (ratio/15). b[0] is warp-uniform so its table read broadcasts.
-        const uint8_t d = b[0];
-        const float d_real = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * tensor_scale;
-        const uint8_t rb = b[1 + (sub >> 1)];
-        const float s_b = d_real * s_ratio[(sub & 1) ? (rb >> 4) : (rb & 0x0f)];
-
-        // memcpy, not a cast: 9 + lane*k is odd and superblocks are an odd stride
-        // apart, so these are unaligned. memcpy lets the compiler pick byte loads
-        // instead of emitting an access that faults on AMD.
-        uint32_t codes;
-        if (IS_GQH4) {
-            memcpy(&codes, b + 9 + lane * 4, sizeof(uint32_t));   // 8 codes x 4 bits
-        } else {
-            uint16_t lo2;
-            memcpy(&lo2, b + 9 + lane * 2, sizeof(lo2));          // 8 codes x 2 bits
-            codes = lo2;
-        }
-        const uint8_t hi1 = IS_GQH3 ? b[73 + lane] : 0;
-
-        // Decode this lane's 8 weights ONCE, then reuse them for every column.
-        float w[GQH_PER_LANE];
+    // Two arms, and the split is the whole reason this kernel has a ROWS parameter at
+    // all. Both buy the same thing -- outstanding DRAM bytes per wave -- but ROWS pays
+    // for it by dividing the wave count, so on a shape with no wave supply to spare it
+    // is a losing trade (see gqh_rows1_selected). The batch-1 one-row-per-warp arm is
+    // exactly that case, so it goes deeper in the superblock dimension instead, where
+    // the price is registers. Everything else keeps the one-superblock-deep pipeline.
+    if constexpr (NCOLS_MAX == 1 && ROWS == 1) {
+        // Software pipeline, GQH_MATVEC_DEPTH superblocks deep. One superblock deep, a
+        // wave holds one wire request in flight and the loop is not unrolled, so there
+        // is nothing else of this wave's to overlap the DRAM read with; the ISA shows
+        // the request issued and then consumed ~70 instructions later in the SAME trip,
+        // i.e. 0.7 superblocks of cover, with one activation load left outstanding
+        // across the back-edge. Issuing DEPTH superblocks ahead makes it ~1.7. Purely a
+        // load schedule: the values and the order they fold into acc are untouched, so
+        // every output stays bit-identical.
+        constexpr int DEPTH = GQH_MATVEC_DEPTH;
+        gqh_wire wire[DEPTH];
+        // The activations ride the same pipeline stage as the wire. loadcnt retires in
+        // issue order, so as long as ANY load in the body is consumed in the trip that
+        // issues it, the partial wait that consumes it also drains the prefetches
+        // sitting behind it -- measured on ISA, loading x for the current superblock
+        // left the wire prefetch 6 instructions of cover. With x prefetched too, every
+        // load in the body belongs to a later superblock. Costs GQH_PER_LANE VGPRs per
+        // stage, twice over: a stage's activations stay live while the next trip's load
+        // into the same slot is already in flight.
+        float xpipe[DEPTH][GQH_PER_LANE];
 #pragma unroll
-        for (int t = 0; t < GQH_PER_LANE; ++t) {
-            if (IS_GQH4) {
-                // little-endian: byte t>>1, low nibble for even t -> bit 4*t either way
-                w[t] = s_grid[(codes >> (4 * t)) & 0x0f] * s_b;
-            } else {
-                const int lo = (codes >> (2 * t)) & 0x03;
-                const int code = IS_GQH3 ? (lo | (((hi1 >> t) & 1) << 2)) : lo;
-                w[t] = gqh_level<IS_GQH3>(code, mag) * s_b;
+        for (int p = 0; p < DEPTH; ++p) {
+            // Clamped so a tensor with fewer superblocks than DEPTH still fills the
+            // pipeline (it re-reads superblock nsb-1); p == 0 is spelled out separately
+            // so the first stage keeps a literal zero offset.
+            const int sbp = p == 0 ? 0 : (p < nsb ? p : nsb - 1);
+            wire[p] = gqh_wire_load<RUNG>(
+                rowbase[0], (uint32_t) sbp * (uint32_t) sb_bytes, woff);
+            gqh_load_x(x, sbp, j0, xpipe[p]);
+        }
+        // The pipeline advances DEPTH stages per trip, so the main loop covers a
+        // multiple of DEPTH and at most DEPTH-1 superblocks are left for the tail.
+        const int nsb_main = nsb - nsb % DEPTH;
+        for (int sb = 0; sb < nsb_main; sb += DEPTH) {
+            // Read every stage out of the loop-carried registers before the prefetch
+            // below overwrites them.
+            float    d_real[DEPTH];
+            uint32_t codes[DEPTH];
+            uint8_t  rb[DEPTH];
+            uint8_t  hi1[DEPTH];
+            float    xcur[DEPTH][GQH_PER_LANE];
+#pragma unroll
+            for (int p = 0; p < DEPTH; ++p) {
+                d_real[p] = gqh_d_real<NCOLS_MAX>(wire[p].d, t_scale);
+                codes[p]  = wire[p].codes;
+                rb[p]     = wire[p].rb;
+                hi1[p]    = wire[p].hi1;
+#pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    xcur[p][t] = xpipe[p][t];
+                }
+            }
+
+            // Every stage's loads are issued here, in one group, so the wave holds
+            // DEPTH independent DRAM requests in flight instead of one.
+            //
+            // ONE clamped base superblock, then a compile-time per-stage stride off it.
+            // Clamping each stage separately instead reads to LLVM as DEPTH unrelated
+            // addresses, and it strength-reduces the later ones into 64-bit pointer
+            // induction variables -- which loses the SADDR form iteration 3's whole
+            // addressing scheme exists to keep (measured on ISA: a v_add_co_u32 /
+            // v_add_co_ci_u32 pair came back, and one stage's two b128 activation loads
+            // split into b64 + flat b128 + b64). With a common base every offset is
+            // `base + constant`, so it folds into the load's immediate.
+            //
+            // Clamped, not branched: the last trip re-reads superblocks it already
+            // holds (a cache hit) instead of splitting the body in two, which would put
+            // the prefetch and the decode in different basic blocks -- the machine
+            // scheduler only clusters loads within one block, which is the whole basis
+            // of this. nsb >= DEPTH whenever this loop runs, so the clamp cannot go
+            // negative.
+            const int sbn0 = sb + DEPTH <= nsb - DEPTH ? sb + DEPTH : nsb - DEPTH;
+#pragma unroll
+            for (int p = 0; p < DEPTH; ++p) {
+                wire[p] = gqh_wire_load<RUNG>(
+                    rowbase[0], (uint32_t) (sbn0 + p) * (uint32_t) sb_bytes, woff);
+                gqh_load_x(x, sbn0 + p, j0, xpipe[p]);
+            }
+            gqh_sched_fence();
+
+            // Stage p before stage p+1, so acc still sums its superblocks in ascending
+            // sb -- bit-identical to the one-superblock-per-trip loop.
+#pragma unroll
+            for (int p = 0; p < DEPTH; ++p) {
+                gqh_fold_superblock<RUNG, NCOLS_MAX>(
+                    d_real[p], codes[p], rb[p], hi1[p], sub, s_grid, s_ratio,
+                    xcur[p], x, sb + p, j0, ncols, x_col_stride, acc[0]);
             }
         }
 
-        // Fully unrolled so acc[]/xs[] stay in registers; the per-column term order
-        // is unchanged, so each output is bit-identical to the one-column-per-block
-        // version this replaces.
+        // Leftover superblocks, when nsb is not a multiple of DEPTH. These load their
+        // own wire and activations rather than reading them out of the pipeline
+        // registers: the clamped prefetch base above means stage p does NOT reliably
+        // hold superblock nsb_main + p on the final trip, and an unpipelined load here
+        // costs nothing -- this runs at most DEPTH-1 times per dispatch, outside the hot
+        // loop's basic block.
+        //
+        // THIS IS ON THE HOT PATH, and it stopped being dead the moment DEPTH became 3.
+        // Every weight tensor in the model has `in` 5120 or 17408, i.e. nsb 20 or 68,
+        // and 20 % 3 == 68 % 3 == 2 -- so at DEPTH == 2 this ran NEVER and at DEPTH == 3
+        // it runs TWICE PER DISPATCH, 2 of every 20 superblocks, on the arm that is 47%
+        // of all matvec time. Its cost is already inside the 10.731 ms in the sweep
+        // table above.
+        //
+        // Grouping the two tail loads ahead of both folds (so one DRAM latency is
+        // exposed per dispatch instead of two) was tried in iteration 8 and LOST:
+        // 10.804 vs 10.731, because keeping wt[]/xt[] live perturbs the main loop's
+        // allocation. Leave the load/fold chain alone.
+        //
+        // Correctness here is covered by forcing gqh_rows1_selected() to true in a
+        // throwaway build and running all 12 test-gqh-backend cases at --nvec=1, which
+        // compares BITWISE against the geo-quant f32 reference; nsb 1 / 2 / 4 in those
+        // vectors give a skipped main loop, a two-stage tail, and a main trip plus a
+        // tail respectively.
 #pragma unroll
-        for (int c = 0; c < GQH_MAX_COLS; ++c) {
-            if (c >= ncols) {
-                continue;
+        for (int p = 0; p < DEPTH - 1; ++p) {
+            const int sbt = nsb_main + p;
+            if (sbt < nsb) {
+                const gqh_wire wt = gqh_wire_load<RUNG>(
+                    rowbase[0], (uint32_t) sbt * (uint32_t) sb_bytes, woff);
+                float xt[GQH_PER_LANE];
+                gqh_load_x(x, sbt, j0, xt);
+                gqh_fold_superblock<RUNG, NCOLS_MAX>(
+                    gqh_d_real<NCOLS_MAX>(wt.d, t_scale), wt.codes, wt.rb, wt.hi1,
+                    sub, s_grid, s_ratio, xt, x, sbt, j0, ncols, x_col_stride, acc[0]);
             }
-            const float * __restrict__ xcc = x + (int64_t) c * x_col_stride
-                                               + sb * GQH_SUPERBLOCK + j0;
-            const float4 x0 = *(const float4 *) (xcc);
-            const float4 x1 = *(const float4 *) (xcc + 4);
-            const float xs[GQH_PER_LANE] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
-#pragma unroll
-            for (int t = 0; t < GQH_PER_LANE; ++t) {
-                acc[c] += w[t] * xs[t];
+        }
+    } else {
+        // Software pipeline, one superblock deep. Without it a wave holds exactly one
+        // superblock in flight and every iteration pays the whole serial chain
+        // b[0] -> E4M3 table -> s_ratio -> s_grid -> FMA; the loop is not unrolled, so
+        // there is nothing else of this wave's to overlap the DRAM read with. Issuing
+        // sb+1's wire bytes here, ahead of the decode they feed, hides that read
+        // behind this superblock's table lookup, LDS gathers and FMAs. Purely a load
+        // schedule: the values and the order they fold into acc[] are untouched, so
+        // every output stays bit-identical.
+        gqh_wire wire[ROWS];
+    #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            wire[r] = gqh_wire_load<RUNG>(rowbase[r], 0, woff);
+        }
+        // Batch-1 carries the activations through the same pipeline stage as the wire.
+        // loadcnt retires in issue order, so as long as ANY load in the body is consumed
+        // in the iteration that issues it, the partial wait that consumes it also drains
+        // the prefetch sitting behind it -- measured on ISA, that left the wire prefetch
+        // 6 instructions of cover. With the activations prefetched too, every load in the
+        // body belongs to sb+1 and the only wait is at the top of the next trip, so both
+        // requests stay outstanding across the whole FMA block and the back-edge. Costs 8
+        // VGPRs of the ~70 this kernel has spare at 16 waves/SIMD.
+        float xnext[GQH_PER_LANE];
+        if (NCOLS_MAX == 1) {
+            gqh_load_x(x, 0, j0, xnext);
+        }
+        for (int sb = 0; sb < nsb; ++sb) {
+            // same order as the reference: d_real = e4m3(d) * tensor_scale, then
+            // s_b = d_real * (ratio/15). Do not reassociate.
+            //
+            // `d` is the superblock's E4M3 byte -- one address for the whole wave -- but it
+            // is adjacent to the per-lane ratio byte `rb` in gqh_wire, LLVM merges the two
+            // into one 16-bit value, and rb's divergence infects d. Re-asserting uniformity
+            // is what turns the table read into an `s_load_b32`: the lookup leaves the
+            // vector memory pipe for the scalar one, so it is tracked by kmcnt instead of
+            // loadcnt and can no longer force a full `s_wait_loadcnt 0x0` that drains the
+            // prefetch behind it. It also deletes the 64-bit VALU address chain the
+            // divergent form needed.
+            float    d_real[ROWS];
+            uint32_t codes[ROWS];
+            uint8_t  rb[ROWS];
+            uint8_t  hi1[ROWS];
+    #pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const uint8_t d_raw = wire[r].d;
+                const int d = NCOLS_MAX == 1 ? gqh_uniform(d_raw) : d_raw;
+                d_real[r] = gqh_bits(GQH_E4M3_D[d >> 3][d & 7]) * t_scale;
+
+                codes[r] = wire[r].codes;
+                rb[r]    = wire[r].rb;
+                hi1[r]   = wire[r].hi1;
+            }
+
+            float xcur[GQH_PER_LANE];
+            if (NCOLS_MAX == 1) {
+    #pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    xcur[t] = xnext[t];
+                }
+            }
+
+            // Clamped, not branched: the last iteration re-reads its own superblock (a
+            // cache hit) instead of splitting the body in two, which would put the
+            // prefetch and the decode in different basic blocks -- the machine
+            // scheduler only clusters loads within one block.
+            const int sbn = sb + 1 < nsb ? sb + 1 : sb;
+            const uint32_t sbn_off = (uint32_t) sbn * (uint32_t) sb_bytes;
+            // Every row's wire load is issued here, in one group, so the wave holds ROWS
+            // independent DRAM requests in flight instead of one. That is the whole point
+            // of ROWS > 1: bytes-in-flight per wave is the axis this kernel is bound on.
+    #pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                wire[r] = gqh_wire_load<RUNG>(rowbase[r], sbn_off, woff);
+            }
+            if (NCOLS_MAX == 1) {
+                gqh_load_x(x, sbn, j0, xnext);
+                gqh_sched_fence();
+            }
+
+    #pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const float s_b = d_real[r] * s_ratio[(sub & 1) ? (rb[r] >> 4) : (rb[r] & 0x0f)];
+
+                // Decode this lane's 8 weights ONCE, then reuse them for every column.
+                float w[GQH_PER_LANE];
+    #pragma unroll
+                for (int t = 0; t < GQH_PER_LANE; ++t) {
+                    // gqh4: little-endian, byte t>>1, low nibble for even t -> bit 4*t
+                    // either way. gqh3: the low-2-bit plane carries bits [1:0] of the code
+                    // and the high plane bit 2. gqh2_h: the 2-bit code is the whole index.
+                    const int code = IS_GQH4
+                        ? ((codes[r] >> (4 * t)) & 0x0f)
+                        : (((codes[r] >> (2 * t)) & 0x03) |
+                           (IS_GQH3 ? (((hi1[r] >> t) & 1) << 2) : 0));
+                    w[t] = s_grid[code] * s_b;
+                }
+
+                // Fully unrolled so acc[]/xs[] stay in registers; the per-column term order
+                // is unchanged, so each output is bit-identical to the one-column-per-block
+                // version this replaces. Rows are independent sums, so folding row r+1 after
+                // row r changes nothing about either row's term order.
+    #pragma unroll
+                for (int c = 0; c < NCOLS_MAX; ++c) {
+                    if (NCOLS_MAX > 1 && c >= ncols) {
+                        continue;
+                    }
+                    float xs[GQH_PER_LANE];
+                    if (NCOLS_MAX == 1) {
+    #pragma unroll
+                        for (int t = 0; t < GQH_PER_LANE; ++t) {
+                            xs[t] = xcur[t];
+                        }
+                    } else {
+                        gqh_load_x(x + (int64_t) c * x_col_stride, sb, j0, xs);
+                    }
+    #pragma unroll
+                    for (int t = 0; t < GQH_PER_LANE; ++t) {
+                        acc[r][c] += w[t] * xs[t];
+                    }
+                }
             }
         }
     }
 
 #pragma unroll
-    for (int c = 0; c < GQH_MAX_COLS; ++c) {
-        if (c >= ncols) {
-            continue;
-        }
+    for (int r = 0; r < ROWS; ++r) {
+        // The only place the row clamp is paid for: a tail warp recomputed row out-1
+        // in slot r > 0 and must not write it back.
+        const bool store = r == 0 || row + r < out;
 #pragma unroll
-        for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
-            acc[c] += gqh_warp_shfl_down(acc[c], off);
-        }
-        if (lane == 0) {
-            y[(int64_t) c * y_col_stride + row] = acc[c];
+        for (int c = 0; c < NCOLS_MAX; ++c) {
+            if (NCOLS_MAX > 1 && c >= ncols) {
+                continue;
+            }
+#pragma unroll
+            for (int off = GQH_WARP / 2; off > 0; off >>= 1) {
+                acc[r][c] += gqh_warp_shfl_down(acc[r][c], off);
+            }
+            if (lane == 0 && store) {
+                y_base[(int64_t) c * y_col_stride + row + r] = acc[r][c];
+            }
         }
     }
 }
@@ -413,6 +954,151 @@ static __global__ void gqh2c_matvec_kernel(
     }
 }
 
+// Rows-per-warp selector for the batch-1 path, and the one place the ROWS trade-off
+// is decided. ROWS == GQH_MATVEC_ROWS gives a wave ROWS independent wire streams,
+// which is what a LATENCY-STARVED wave wants; it is not free, because it also divides
+// the wave count by ROWS. Whether that trade pays is a property of the SHAPE, and the
+// swept GQH4 buckets on the R9700 (rocprofv3, GQH4 ms per N=1 forward, +-0.3%) say so
+// plainly -- ROWS == 4 lands the whole in == 5120 family on a ~470-490 GB/s plateau
+// regardless of shape, while ROWS == 1 tracks wave supply from 252 up to 514 GB/s:
+//
+//   out    in     n   ROWS=1  ROWS=4  r1->r4   GB/s r1->r4   rounds at ROWS=1
+//   17408  5120  127  11.790  12.988  0.908x   514 -> 467    8.5   <- ROWS=1 wins
+//   12288  5120   12   1.081   0.826  1.308x   374 -> 489    6.0
+//   10240  5120   48   3.813   2.864  1.331x   354 -> 471    5.0
+//    6144  5120   45   3.010   1.878  1.602x   252 -> 403    3.0
+//    5120 17408   66   6.690   5.134  1.303x   471 -> 613    2.5
+//
+// The selector as it stands, A/B'd from ONE binary against its own rounds == 0 control
+// (the only fair comparison at this effect size), GQH4 ms per N=1 forward:
+//
+//   out      control (all ROWS=4)   selector    delta
+//   17408             12.960          11.934    1.086x   <- the only bucket switched
+//    5120              5.132           5.138    ~1.00x
+//   10240              2.868           2.881    ~1.00x
+//    6144              1.879           1.881    ~1.00x
+//   12288              0.827           0.831    ~1.00x
+//   total             23.666          22.665    1.044x
+//
+// So exactly one bucket loses, and it is the only one that was ALREADY near DRAM peak
+// at ROWS == 1 -- there was no starvation left to fix, only wave count to give up.
+// `out` (i.e. the wave supply, since ROWS == 1 is one warp per row) is the only
+// variable that separates it: out == 12288 has the same `in`, the same nsb == 20, and
+// gains 31%.
+//
+// **This is a fit on five shapes of one model, and it is deliberately biased.** The
+// threshold below now sits between 6144 and 10240 rows (it was between 12288 and 17408
+// while the ROWS == 1 arm was one superblock deep); nothing measured here pins it
+// inside that interval, and neither hot_ms nor the greedy-sha gate can falsify it.
+// It is therefore written as the NARROW EXCEPTION: a shape has to clear
+// GQH_ROWS1_ROUNDS full occupancy rounds before it takes the ROWS == 1 arm, so any
+// shape this table does not cover lands on the ROWS == 4 plateau instead of on the arm
+// that can regress 13%. Scoped to GQH4 for the same reason -- the sweep was
+// GQH4-only, and GQH3/GQH2_H measured flat across ROWS (2.47 -> 2.44 ms) so they have
+// nothing to gain from being included and a shape-dependent regression to lose.
+//
+// **The table above is iteration 5's, taken when the ROWS == 1 arm was DEPTH == 1 and
+// ran at 510 GB/s. Iterations 7-8 took that arm to 565 GB/s, which moved the crossover
+// two buckets down -- see GQH_ROWS1_ROUNDS, re-measured per bucket in iteration 9.**
+// The rows above are still the right shape of evidence; their verdicts for out == 10240
+// and out == 12288 are stale.
+//
+// GGML_GQH_ROWS1_ROUNDS overrides the threshold; 0 disables the ROWS == 1 arm outright,
+// which is how a single binary can be A/B'd against its own selector-off control (the
+// kernel trace's cross-session spread is ~1.4%, so same-build is the only fair
+// comparison for a 5% effect).
+static int gqh_rows1_rounds() {
+    static const int rounds = []() {
+        const char * e = getenv("GGML_GQH_ROWS1_ROUNDS");
+        return e ? atoi(e) : GQH_ROWS1_ROUNDS;
+    }();
+    return rounds;
+}
+
+// Waves the device holds resident for the ROWS == 1 batch-1 kernel, asked of the
+// runtime rather than assumed. Both halves of this matter:
+//   - `nsm` is whatever unit the backend counts multiprocessors in. On RDNA, HIP
+//     reports WGPs (2 CUs), so this box says nsm == 32 for a 64-CU R9700 -- a
+//     hand-rolled "waves per CU" constant is silently off by 2x, which is exactly
+//     how the first cut of this selector put the threshold at 8192 rows instead of
+//     16384 and cost 1.2 ms. (That regression was iteration 5's, when the ROWS == 1
+//     arm was DEPTH == 1; at DEPTH == 3 out == 10240 and out == 12288 are FASTER on
+//     that arm and the threshold is deliberately 10240 now. The lesson survives the
+//     inversion: a hand-rolled `nsm` still moves the threshold by 2x, and the shapes
+//     it would drag over -- out == 5120 and out == 6144 -- lose 13% there.)
+//   - blocks-per-MP comes from the occupancy API, so it tracks the kernel's real
+//     register pressure instead of a hard-coded 16 waves/SIMD.
+// Product on the R9700: 32 MPs x 16 blocks x 4 warps = 2048 waves, the physically
+// correct figure. Cached per device -- this is on the per-dispatch path, and the
+// forward's real launch-gap budget is only ~4.4 ms (1891 dispatches; the ~13 ms an
+// earlier note claimed was rocprofv3's own per-dispatch cost, see the handoff).
+static int gqh_rows1_resident_waves() {
+    const int id = ggml_cuda_get_device();
+    static int cached[GGML_CUDA_MAX_DEVICES] = {};
+    if (cached[id] == 0) {
+        const int threads = GQH_WARP * GQH_MATVEC_WARPS;
+        int blocks_per_mp = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_mp, gqh_matvec_kernel<GGML_TYPE_GQH4, 1, 1, false>,
+            threads, 0);
+        const int nsm = ggml_cuda_info().devices[id].nsm;
+        cached[id] = blocks_per_mp * nsm * GQH_MATVEC_WARPS;
+    }
+    return cached[id];
+}
+
+static bool gqh_rows1_selected(int out) {
+    const int rounds = gqh_rows1_rounds();
+    if (rounds <= 0) {
+        return false;
+    }
+    const int resident = gqh_rows1_resident_waves();
+    if (resident <= 0) {
+        return false;   // occupancy query failed: take the safe arm
+    }
+    // One warp per row at ROWS == 1, so the wave count IS `out`.
+    return (int64_t) out >= (int64_t) rounds * resident;
+}
+
+// Binds the runtime `ncols` to the kernel's compile-time NCOLS_MAX. Decode is
+// ncols == 1 and is where all the time goes, so it gets its own instantiation with
+// the column guards folded away and gqh_rows1_selected()'s choice of rows per warp;
+// everything wider keeps the generic one-row-per-warp instantiation unchanged. The
+// grid follows: a block covers warps * ROWS output rows.
+template <ggml_type RUNG>
+static void gqh_matvec_launch(
+        const dim3 & threads, cudaStream_t stream,
+        const uint8_t * data, const float * x, float * y, int in, int out, int ncols,
+        float tensor_scale, gqh_grid16 grid,
+        int64_t x_col_stride, int64_t y_col_stride) {
+    if (ncols == 1) {
+        // if constexpr, not a plain if: the selector is GQH4-only, and this keeps
+        // <GQH3, 1, 1> / <GQH2_H, 1, 1> from being instantiated at all rather than
+        // emitted and never dispatched.
+        if constexpr (RUNG == GGML_TYPE_GQH4) {
+            if (gqh_rows1_selected(out)) {
+                const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 1, 1);
+                gqh_matvec_kernel<RUNG, 1, 1, false><<<blocks, threads, 0, stream>>>(
+                    data, x, y, in, out, ncols, tensor_scale, grid,
+                    x_col_stride, y_col_stride, data, y, tensor_scale, grid);
+                return;
+            }
+        }
+        const int rows_per_block = GQH_MATVEC_WARPS * GQH_MATVEC_ROWS;
+        const dim3 blocks((out + rows_per_block - 1) / rows_per_block, 1, 1);
+        gqh_matvec_kernel<RUNG, 1, GQH_MATVEC_ROWS, false>
+            <<<blocks, threads, 0, stream>>>(
+                data, x, y, in, out, ncols, tensor_scale, grid,
+                x_col_stride, y_col_stride, data, y, tensor_scale, grid);
+    } else {
+        const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 1, 1);
+        gqh_matvec_kernel<RUNG, GQH_MAX_COLS, 1, false>
+            <<<blocks, threads, 0, stream>>>(
+                data, x, y, in, out, ncols, tensor_scale, grid,
+                x_col_stride, y_col_stride, data, y, tensor_scale, grid);
+    }
+}
+
 bool ggml_cuda_gqh_mul_mat_vec(
         ggml_type type, const void * vx, const float * x, float * y,
         int in, int out, int ncols, int64_t x_col_stride, int64_t y_col_stride,
@@ -423,6 +1109,14 @@ bool ggml_cuda_gqh_mul_mat_vec(
     }
     if (in % GQH_SUPERBLOCK != 0 || ncols <= 0 || ncols > GQH_MAX_COLS) {
         return false;   // wider batches keep the dequant->GEMM path
+    }
+    // The kernel addresses both the wire and the activations as a uniform base plus a
+    // 32-bit byte offset (that is what lets the loads take their SADDR form). The
+    // largest such offset is in*sizeof(float) for the activations and (in/256)*137 for
+    // the wire, so a row of 2^24 elements leaves better than 2 orders of magnitude of
+    // headroom over any real matvec. Bail rather than wrap.
+    if (in > (1 << 24)) {
+        return false;
     }
     // The kernel reads activations as float4. in is a multiple of 256 and lanes are
     // 8 floats apart, so every offset is 32-byte aligned -- but only if the base is
@@ -447,38 +1141,97 @@ bool ggml_cuda_gqh_mul_mat_vec(
         return false;   // unregistered -> caller keeps the dequant fallback
     }
 
-    // Positive half of the grid: gqh3 keeps all four magnitudes, gqh2_h needs only
-    // the inner level a (its outer level is exactly 1). gqh4 has 8 magnitudes, too
-    // many for the register select, so it ships all 16 signed levels for LDS instead.
-    float4 mag{};
+    // The whole signed level grid, out of the same per-rung tables the dequant kernels
+    // read, so the two decoders cannot drift. The kernel stages the first 16 / 8 / 4
+    // entries into LDS and gathers by code; one gqh_grid16 covers every rung.
     gqh_grid16 grid{};
     if (type == GGML_TYPE_GQH3) {
-        memcpy(&mag.x, &GQH3_GRID[code][4], 4 * sizeof(float));
+        memcpy(grid.v, GQH3_GRID[code], 8 * sizeof(float));
     } else if (type == GGML_TYPE_GQH4) {
-        memcpy(grid.v, GQH4_GRID[code], sizeof(grid.v));
+        memcpy(grid.v, GQH4_GRID[code], 16 * sizeof(float));
     } else {
-        memcpy(&mag.x, &GQH2H_GRID[code][2], sizeof(float));
+        memcpy(grid.v, GQH2H_GRID[code], 4 * sizeof(float));
     }
 
-    const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 1, 1);
     const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
     switch (type) {
         case GGML_TYPE_GQH3:
-            gqh_matvec_kernel<GGML_TYPE_GQH3><<<blocks, threads, 0, stream>>>(
-                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, grid,
-                x_col_stride, y_col_stride);
+            gqh_matvec_launch<GGML_TYPE_GQH3>(
+                threads, stream, (const uint8_t *) vx, x, y, in, out, ncols,
+                scale, grid, x_col_stride, y_col_stride);
             break;
         case GGML_TYPE_GQH4:
-            gqh_matvec_kernel<GGML_TYPE_GQH4><<<blocks, threads, 0, stream>>>(
-                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, grid,
-                x_col_stride, y_col_stride);
+            gqh_matvec_launch<GGML_TYPE_GQH4>(
+                threads, stream, (const uint8_t *) vx, x, y, in, out, ncols,
+                scale, grid, x_col_stride, y_col_stride);
             break;
         default:
-            gqh_matvec_kernel<GGML_TYPE_GQH2_H><<<blocks, threads, 0, stream>>>(
-                (const uint8_t *) vx, x, y, in, out, ncols, scale, mag, grid,
-                x_col_stride, y_col_stride);
+            gqh_matvec_launch<GGML_TYPE_GQH2_H>(
+                threads, stream, (const uint8_t *) vx, x, y, in, out, ncols,
+                scale, grid, x_col_stride, y_col_stride);
             break;
     }
+    return true;
+}
+
+// Two same-shaped GQH4 weight tensors that share `x`, in ONE dispatch.
+//
+// WHY THIS EXISTS. Iteration 10 fitted every GQH4 bucket to
+// `T = C + q * bytes / 630 GB/s`, where q is occupancy-round quantisation
+// (ceil(waves/resident) / (waves/resident)) and C is a per-DISPATCH fixed cost of
+// 4-6 us. 630 GB/s is 98% of the R9700's 640 GB/s datasheet peak, so the steady-state
+// loop is finished -- every remaining microsecond is C or q, and both are properties of
+// the DISPATCH, not of the loop body. This is the one change that attacks both at once,
+// on the biggest bucket in the model:
+//
+//   ffn gate and ffn up are 126 of the 298 GQH4 dispatches per N=1 forward (10.64 ms,
+//   47% of all matvec time). Both are out == 17408, in == 5120, and they read the SAME
+//   activation. 17408 rows at one row per warp is 8.5 occupancy rounds against 2048
+//   resident waves -- a fractional round, the only fractional one on the ROWS == 1 arm
+//   (out == 10240 and 12288 are exactly 5.0 and 6.0). Folding the pair into one
+//   dispatch of 2 x 4352 blocks makes it 34816 waves = 17.0 rounds EXACTLY, and pays C
+//   once for the layer instead of twice.
+//
+// Do NOT try to buy the same thing by cutting occupancy so the wave count divides
+// evenly (16 KB of LDS caps residency at 1024 waves and makes 17408 a whole 17 rounds):
+// measured, the whole-round control buckets out == 10240 / 12288 lose 10% of their
+// bandwidth to the halved residency, which swamps the 5.9% the quantisation is worth.
+//
+// Returns false unless BOTH tensors are registered GQH4 of identical shape and the
+// shape takes the ROWS == 1 arm. Narrow on purpose -- the caller keeps its unfused
+// path, and no other shape family in this model forms a pair. The two halves may carry
+// DIFFERENT level tables; 26% of this model's pairs do.
+bool ggml_cuda_gqh_mul_mat_vec_pair(
+        const void * vx_a, float * y_a, const void * vx_b, float * y_b,
+        const float * x, int in, int out, int ncols,
+        int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream) {
+    if (ncols != 1 || in % GQH_SUPERBLOCK != 0 || in > (1 << 24)) {
+        return false;
+    }
+    if (((uintptr_t) x) % sizeof(float4) != 0) {
+        return false;
+    }
+    // The paired kernel is the ROWS == 1 arm only; that is where out == 17408 goes and
+    // the arm's own selector has to agree, or the pair would silently take a different
+    // code path from the two dispatches it replaces.
+    if (!gqh_rows1_selected(out)) {
+        return false;
+    }
+    float scale_a, scale_b;
+    int   code_a,  code_b;
+    if (!ggml_gqh_lookup(vx_a, &scale_a, &code_a) ||
+        !ggml_gqh_lookup(vx_b, &scale_b, &code_b)) {
+        return false;
+    }
+    gqh_grid16 grid_a{}, grid_b{};
+    memcpy(grid_a.v, GQH4_GRID[code_a], 16 * sizeof(float));
+    memcpy(grid_b.v, GQH4_GRID[code_b], 16 * sizeof(float));
+
+    const dim3 threads(GQH_WARP * GQH_MATVEC_WARPS, 1, 1);
+    const dim3 blocks((out + GQH_MATVEC_WARPS - 1) / GQH_MATVEC_WARPS, 2, 1);
+    gqh_matvec_kernel<GGML_TYPE_GQH4, 1, 1, true><<<blocks, threads, 0, stream>>>(
+        (const uint8_t *) vx_a, x, y_a, in, out, ncols, scale_a, grid_a,
+        x_col_stride, y_col_stride, (const uint8_t *) vx_b, y_b, scale_b, grid_b);
     return true;
 }
 
