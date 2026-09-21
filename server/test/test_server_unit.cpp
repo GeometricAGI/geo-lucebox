@@ -1891,6 +1891,94 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_string_paramete
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_param_tag_in_string_value) {
+    // Literal "<param>" / "<parameter ...>" text inside a verbatim value is
+    // payload, not a sibling parameter. Only a parameter tag that opens a new
+    // line terminates an unclosed value.
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"}, {"function", {
+             {"name", "write_file"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}},
+                     {"content", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    {
+        const std::string text =
+            "<｜DSML｜tool_calls>\n"
+            "<｜DSML｜invoke name=\"bash\">\n"
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo '<param>'</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>";
+        auto result = parse_tool_calls(text, tools);
+        TEST_ASSERT(result.tool_calls.size() == 1);
+        if (!result.tool_calls.empty()) {
+            TEST_ASSERT(result.tool_calls[0].name == "bash");
+            auto args = json::parse(result.tool_calls[0].arguments);
+            TEST_ASSERT(args["command"] == "echo '<param>'");
+        }
+    }
+
+    {
+        const std::string text =
+            "<｜DSML｜tool_calls>\n"
+            "<｜DSML｜invoke name=\"write_file\">\n"
+            "<｜DSML｜parameter name=\"path\" string=\"true\">doc.xml</｜DSML｜parameter>\n"
+            "<｜DSML｜parameter name=\"content\" string=\"true\">use <parameter name=\"x\"> here</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>";
+        auto result = parse_tool_calls(text, tools);
+        TEST_ASSERT(result.tool_calls.size() == 1);
+        if (!result.tool_calls.empty()) {
+            TEST_ASSERT(result.tool_calls[0].name == "write_file");
+            auto args = json::parse(result.tool_calls[0].arguments);
+            TEST_ASSERT(args["path"] == "doc.xml");
+            TEST_ASSERT(args["content"] == "use <parameter name=\"x\"> here");
+            TEST_ASSERT(!args.contains("x"));
+        }
+    }
+
+    {
+        // XML content whose lines open with <param ...> elements: extra
+        // attributes or a self-closing tag are not a sibling tool parameter.
+        const std::string content =
+            "<launch>\n"
+            "  <param name=\"rate\" value=\"10\"/>\n"
+            "  <parameter name=\"mode\" type=\"string\">fast\n"
+            "</launch>";
+        const std::string text =
+            "<｜DSML｜tool_calls>\n"
+            "<｜DSML｜invoke name=\"write_file\">\n"
+            "<｜DSML｜parameter name=\"path\" string=\"true\">robot.launch</｜DSML｜parameter>\n"
+            "<｜DSML｜parameter name=\"content\" string=\"true\">" + content + "</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>";
+        auto result = parse_tool_calls(text, tools);
+        TEST_ASSERT(result.tool_calls.size() == 1);
+        if (!result.tool_calls.empty()) {
+            auto args = json::parse(result.tool_calls[0].arguments);
+            TEST_ASSERT(args["path"] == "robot.launch");
+            TEST_ASSERT(args["content"] == content);
+            TEST_ASSERT(!args.contains("rate"));
+            TEST_ASSERT(!args.contains("mode"));
+        }
+    }
+}
+
 
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
