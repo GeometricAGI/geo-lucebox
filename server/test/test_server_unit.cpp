@@ -1970,6 +1970,7 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_param_tag_in_str
         auto result = parse_tool_calls(text, tools);
         TEST_ASSERT(result.tool_calls.size() == 1);
         if (!result.tool_calls.empty()) {
+            TEST_ASSERT(result.tool_calls[0].name == "write_file");
             auto args = json::parse(result.tool_calls[0].arguments);
             TEST_ASSERT(args["path"] == "robot.launch");
             TEST_ASSERT(args["content"] == content);
