@@ -5601,6 +5601,7 @@ static __global__ void mul_mat_q_moe_persistent(
         const int32_t * __restrict__ expert_bounds,
         const nv_bfloat16 * __restrict__ mix_codebooks,
         const uint8_t * __restrict__ mix_modes,
+        const gqh_mmq_params gqh,
         float * __restrict__ dst,
         const int2 * __restrict__ tasks,
         const int * __restrict__ task_count,
@@ -5663,7 +5664,7 @@ static __global__ void mul_mat_q_moe_persistent(
             x, offset_x, y + offset_y, ids_dst_shared,
             dst + offset_dst, nullptr, stride_row_x, ncols_y,
             stride_col_dst, tile_x_max_i, tile_y_max_j,
-            0, blocks_per_ne00.z, mix_codebooks, mix_modes,
+            0, blocks_per_ne00.z, mix_codebooks, mix_modes, gqh,
             fastdiv(zt, channel_ratio));
         __syncthreads();
     }
@@ -5916,7 +5917,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                 mul_mat_q_moe_persistent<type, mmq_x, false>
                     <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
                         args.x, args.y, args.ids_dst, args.expert_bounds,
-                        args.mix_codebooks, args.mix_modes, args.dst,
+                        args.mix_codebooks, args.mix_modes, args.gqh, args.dst,
                         tasks.get(), task_count.get(),
                         blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
                         args.ncols_y, args.nrows_dst, channel_ratio_fd,
@@ -5925,7 +5926,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                 mul_mat_q_moe_persistent<type, mmq_x, true>
                     <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
                         args.x, args.y, args.ids_dst, args.expert_bounds,
-                        args.mix_codebooks, args.mix_modes, args.dst,
+                        args.mix_codebooks, args.mix_modes, args.gqh, args.dst,
                         tasks.get(), task_count.get(),
                         blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
                         args.ncols_y, args.nrows_dst, channel_ratio_fd,
