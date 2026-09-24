@@ -34,6 +34,7 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v}, 
 TYPES_MMQ = [
     "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0",
     "GGML_TYPE_Q4_0_ROCMFP4_FAST", "GGML_TYPE_Q2_0_ROCMFP2", "GGML_TYPE_Q2_1_ROCMFP2_MIX", "GGML_TYPE_Q3_0_ROCMFPX", "GGML_TYPE_Q3_1_ROCMFP3_MIX",
+    "GGML_TYPE_GQH3", "GGML_TYPE_GQH4",
     "GGML_TYPE_Q2_K", "GGML_TYPE_Q3_K", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K",
     "GGML_TYPE_IQ2_XXS", "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_S", "GGML_TYPE_IQ3_XXS", "GGML_TYPE_IQ3_S",
     "GGML_TYPE_IQ1_S", "GGML_TYPE_IQ4_NL", "GGML_TYPE_IQ4_XS", "GGML_TYPE_MXFP4", "GGML_TYPE_NVFP4"
@@ -122,6 +123,11 @@ for type in TYPES_MMQ:
                 guard += "#define GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY 1\n"
         if type == "GGML_TYPE_Q4_K":
             guard = "#define LUCEBOX_RDNA_MMQ_Y 64\n"
+        # GQH3/GQH4 keep the upstream 128x128 shape on purpose. Its MMQ path exists
+        # for PREFILL, where the note above measures the small tile costing ~8%
+        # because the narrow x-tile re-streams the weights; the verify widths the
+        # small tile wins never reach MMQ, because ggml_cuda_gqh_mul_mat_vec owns
+        # N <= 16. There is also no big-tile twin for GQH3 to recover them.
         f.write(SOURCE_MMQ.format(type=type, guard=guard))
 
 BIG_TILE_TYPES = [

@@ -47,6 +47,7 @@
 #include "qwen35_image_prompt.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_inspect.h"
+#include "common/gqh_headers.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_mmap.h"
 #include "common/tensor_file_reader.h"
@@ -188,6 +189,14 @@ static bool should_load_target_tensor(const char * name,
         return true;
     }
     return false;
+}
+
+// GQH headers (scale + grid) are per-tensor in GGUF KV. A stacked alias is one
+// ggml tensor spanning two payloads, so the fused matvec would decode the second
+// weight with the first tensor's header. q8_0 / K-quant pairs are safe to stack.
+static bool is_gqh_weight_type(ggml_type t) {
+    return t == GGML_TYPE_GQH3 || t == GGML_TYPE_GQH2_H ||
+           t == GGML_TYPE_GQH2_C || t == GGML_TYPE_GQH4;
 }
 
 static bool validate_embedded_nextn_blocks(const gguf_context * gctx,
@@ -751,7 +760,9 @@ bool load_target_gguf_partial(const std::string & path,
                 }
             }
             if (first >= 0 && second >= 0 && !taken[(size_t)first] && !taken[(size_t)second] &&
-                ((size_t)first == i || (size_t)second == i)) {
+                ((size_t)first == i || (size_t)second == i) &&
+                !is_gqh_weight_type(allocs[(size_t)first].tensor->type) &&
+                !is_gqh_weight_type(allocs[(size_t)second].tensor->type)) {
                 taken[(size_t)first] = taken[(size_t)second] = true;
                 ordered.push_back(allocs[(size_t)first]);
                 ordered.push_back(allocs[(size_t)second]);
@@ -883,6 +894,7 @@ bool load_target_gguf_partial(const std::string & path,
             auto make_stack = [&](ggml_tensor * first, ggml_tensor * second,
                                   const char * name) -> ggml_tensor * {
                 if (!first || !second || !out.stack_ctx) return nullptr;
+                if (is_gqh_weight_type(first->type) || is_gqh_weight_type(second->type)) return nullptr;
                 if (first->type != second->type || first->ne[0] != second->ne[0]) return nullptr;
                 if (!ggml_is_contiguous(first) || !ggml_is_contiguous(second)) return nullptr;
                 const char * f = (const char *)first->data;
@@ -1137,10 +1149,22 @@ bool load_target_gguf_partial(const std::string & path,
         tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
     set_last_error(summary);
 
+    // GQH per-tensor headers, after upload because the registry is keyed by the
+    // tensor's device pointer. No-op unless the artifact carries GQH tensors.
+    if (!dflash::common::register_gqh_headers(path, out.ctx)) {
+        set_last_error("GQH header registration failed for " + path);
+        free_target_weights(out);
+        return false;
+    }
+
     return true;
 }
 
 void free_target_weights(TargetWeights & w) {
+    // Drop GQH registry entries while the tensors are still valid, BEFORE ggml_free:
+    // the registry resolves by pointer range, so a stale entry would shadow a later
+    // load that reuses the address.
+    dflash::common::unregister_gqh_headers(w.ctx);
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     if (w.stack_ctx) { ggml_free(w.stack_ctx);    w.stack_ctx = nullptr; }

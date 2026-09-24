@@ -724,6 +724,29 @@ a step-time cliff with no commit gain and stay rejected. The block-8
 HumanEval runs (+3.1%), HumanEval+ pass@1 145/164 versus 143/164, with all ten
 short A/B replies and 133/164 full-suite replies byte-identical.
 
+**Qwen3.8-27B GQH (Geometric-AI staging).** The published
+[`Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF`](https://huggingface.co/Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF)
+target (~3.93 bpw, GQH qtypes 108/111) loads on this tree: GQH decode lives in
+ggml, embedded MTP `nextn` blocks are skipped via #610, and DSpark/DFlash2
+spec-decode is the qwen35 path from [Luce-Org/lucebox#625](https://github.com/Luce-Org/lucebox/pull/625).
+GQH projections are **not** stacked (`attn_gate`/`attn_qkv` each carry their
+own per-tensor header); q8_0 `ssm_beta`/`ssm_alpha` stacking is unchanged.
+Stock llama.cpp cannot load this GGUF.
+
+```bash
+hf download Geometric-AI/Qwen3.8-27B-GQH-Q3KXL-GGUF Qwen3.8-27B-GQH-Q3KXL.gguf \
+  --local-dir models/
+./build/dflash_server models/Qwen3.8-27B-GQH-Q3KXL.gguf \
+  --target-device hip:0 --fa-window 2048 --cache-type-k q8_0 --cache-type-v q8_0
+```
+
+A DFlash2/DSpark drafter is optional; without `--draft` the server runs AR on
+the GQH target. Converted Qwen3.8 drafters: `z-lab/Qwen3.8-27B-DFlash2` and
+`RadixArk/Qwen3.8-27B-DSpark` via `scripts/convert_dflash_to_gguf.py`.
+On GQH, `--specla --ddtree-budget 8` is capped to budget 7 so tree verify stays
+on the ncols=8 I8 kernel (`1+n_nodes`); uncapped budget 8 is ncols=9 and misses
+that kernel.
+
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 

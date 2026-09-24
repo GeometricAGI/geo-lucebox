@@ -26,8 +26,10 @@
 #include "common.cuh"
 #include "convert.cuh"
 
+#ifndef GGML_USE_HIP
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#endif
 #include <cstring>
 
 static ggml_cuda_sparse_attn_fn_t s_sparse_kernel = nullptr;
@@ -39,7 +41,7 @@ void ggml_cuda_flash_attn_sparse_set_kernel(ggml_cuda_sparse_attn_fn_t fn) {
 // Convert F32 -> BF16 with (S,H) transpose.
 // src: ggml [B,H,S,D] row-major.  dst: pFlash [B,S,H,D] row-major.
 __global__ void k_f32_to_bf16_transpose_sh(
-    const float * __restrict__ src, __nv_bfloat16 * __restrict__ dst,
+    const float * __restrict__ src, nv_bfloat16 * __restrict__ dst,
     int B, int S, int H, int D)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -50,13 +52,13 @@ __global__ void k_f32_to_bf16_transpose_sh(
     int s = (idx / (D * H)) % S;
     int b = idx / (D * H * S);
     int src_idx = ((b * H + h) * S + s) * D + d;
-    dst[idx] = __float2bfloat16(src[src_idx]);
+    dst[idx] = nv_bfloat16(src[src_idx]);
 }
 
 // Convert F16 -> BF16 with (S,H) transpose.
 // src: ggml [B,H,S,D] row-major.  dst: pFlash [B,S,H,D] row-major.
 __global__ void k_f16_to_bf16_transpose_sh(
-    const half * __restrict__ src, __nv_bfloat16 * __restrict__ dst,
+    const half * __restrict__ src, nv_bfloat16 * __restrict__ dst,
     int B, int S, int H, int D)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -67,18 +69,18 @@ __global__ void k_f16_to_bf16_transpose_sh(
     int s = (idx / (D * H)) % S;
     int b = idx / (D * H * S);
     int src_idx = ((b * H + h) * S + s) * D + d;
-    dst[idx] = __float2bfloat16(__half2float(src[src_idx]));
+    dst[idx] = nv_bfloat16(__half2float(src[src_idx]));
 }
 
 // Flat BF16 -> F32 conversion (no transpose).
 // pFlash output [B,S,H,D] row-major matches ggml dst ne={D,H,S,B} column-major —
 // no transpose needed; a flat element-wise copy is correct.
 __global__ void k_bf16_to_f32_flat(
-    const __nv_bfloat16 * __restrict__ src, float * __restrict__ dst, int n)
+    const nv_bfloat16 * __restrict__ src, float * __restrict__ dst, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    dst[idx] = __bfloat162float(src[idx]);
+    dst[idx] = float(src[idx]);
 }
 
 void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -152,15 +154,15 @@ void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // V: F16 ggml [B,Hk,S,D] -> BF16 pFlash [B,S,Hk,D] (S<->H transpose; dequant if needed)
     // O: pFlash [B,S,H,D] BF16 -> F32 into dst->data    (flat copy, no transpose)
 
-    __nv_bfloat16 *Q_pf;
-    __nv_bfloat16 *K_pf;
-    __nv_bfloat16 *V_pf;
-    __nv_bfloat16 *O_pf;
+    nv_bfloat16 *Q_pf;
+    nv_bfloat16 *K_pf;
+    nv_bfloat16 *V_pf;
+    nv_bfloat16 *O_pf;
 
-    CUDA_CHECK(cudaMallocAsync(&Q_pf, Q_n * sizeof(__nv_bfloat16), stream));
-    CUDA_CHECK(cudaMallocAsync(&K_pf, K_n * sizeof(__nv_bfloat16), stream));
-    CUDA_CHECK(cudaMallocAsync(&V_pf, K_n * sizeof(__nv_bfloat16), stream));
-    CUDA_CHECK(cudaMallocAsync(&O_pf, O_n * sizeof(__nv_bfloat16), stream));
+    CUDA_CHECK(cudaMallocAsync(&Q_pf, Q_n * sizeof(nv_bfloat16), stream));
+    CUDA_CHECK(cudaMallocAsync(&K_pf, K_n * sizeof(nv_bfloat16), stream));
+    CUDA_CHECK(cudaMallocAsync(&V_pf, K_n * sizeof(nv_bfloat16), stream));
+    CUDA_CHECK(cudaMallocAsync(&O_pf, O_n * sizeof(nv_bfloat16), stream));
 
     // Q: F32 ggml [B,H,S,D] -> BF16 pFlash [B,S,H,D]  (S<->H transpose)
     k_f32_to_bf16_transpose_sh<<<(Q_n + block - 1) / block, block, 0, stream>>>(

@@ -442,7 +442,11 @@ extern "C" {
         GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3 (P4); codebook in GGUF KV
         GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2 (gate/up); codebook in sidecar
         GGML_TYPE_Q2_0_ROCMFP2      = 107,
-        GGML_TYPE_COUNT   = 108,
+        GGML_TYPE_GQH3    = 108, // GQH 3.28125 bpw; 256-weight superblock, 105 B; 5 B per-tensor header in GGUF KV
+        GGML_TYPE_GQH2_H  = 109, // GQH 2.28125 bpw; 256-weight superblock,  73 B; 5 B per-tensor header in GGUF KV
+        GGML_TYPE_GQH2_C  = 110, // GQH 2.0625  bpw; 256-weight superblock,  66 B; no header (fp16 d in-block)
+        GGML_TYPE_GQH4    = 111, // GQH 4.28125 bpw; 256-weight superblock, 137 B; 5 B per-tensor header in GGUF KV
+        GGML_TYPE_COUNT   = 112,
     };
 
     // precision
@@ -3528,6 +3532,38 @@ extern "C" {
         ggml_to_float_t          to_float;
         ggml_from_float_t        from_float_ref;
     };
+
+    // GQH (108/109) per-tensor header: float32 tensor_scale + uint8 grid code. A
+    // fixed-size ggml block cannot hold the 5-byte prefix the wire puts in front of
+    // the superblock stream, so the loader reads it from GGUF KV and attaches it to
+    // the tensor's data pointer here. Decoding an unregistered GQH tensor aborts.
+    GGML_API void ggml_gqh_register(const void * base, size_t nbytes, float tensor_scale, int grid_code);
+    GGML_API void ggml_gqh_unregister(const void * base);
+
+    // The int8 weight-LUT denominator for a rung's level grid, and the level error
+    // it leaves. Every GQH grid's amax is exactly 1.0, so baking the codebook to
+    // int8 with a denominator of 127 wastes resolution on grids whose levels sit
+    // badly against the k/127 lattice; ggml_gqh_q8_denom returns the N in 1..127
+    // that minimises the uniform-prior rms ABSOLUTE level error instead, and the
+    // int8 arms fold the compensating 127/N into their per-tensor weight scale at
+    // zero runtime cost. See the derivation in gqh.cpp. maxe is the largest
+    // |q/N - level| over the grid, which is what bounds a single-term dot's error;
+    // rms is the objective's own value. All three return 0 for a type or grid code
+    // that has no level grid.
+    GGML_API int   ggml_gqh_q8_denom(enum ggml_type type, int grid_code);
+    GGML_API float ggml_gqh_q8_maxe (enum ggml_type type, int grid_code);
+    GGML_API float ggml_gqh_q8_rms  (enum ggml_type type, int grid_code);
+
+    // maxe at an ARBITRARY denominator rather than at the derived optimum, and the
+    // denominator ACTUALLY IN FORCE for a grid. The shipping default is the flat
+    // 127 -- per-grid optimal-s is opt-in through GGML_GQH_Q8N -- and
+    // ggml_gqh_q8_denom_eff is the single definition of that policy: the int8 arms
+    // and the test harness both read it, so a bound can be stated for the
+    // quantiser that ran instead of hardcoding a second copy of the default.
+    // ggml_gqh_q8_maxe(t, c) == ggml_gqh_q8_maxe_at(t, c, ggml_gqh_q8_denom(t, c)).
+    // maxe_at returns 0 for n outside 1..127 or a grid that does not exist.
+    GGML_API float ggml_gqh_q8_maxe_at   (enum ggml_type type, int grid_code, int n);
+    GGML_API int   ggml_gqh_q8_denom_eff (enum ggml_type type, int grid_code);
 
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);
 

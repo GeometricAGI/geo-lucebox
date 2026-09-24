@@ -13,6 +13,10 @@ Makefile
 .DS_Store
 /tmp/
 *.bin
+# ...except the GQH reference vectors. These are the test INPUTS: the bit-exact
+# gate reads <stem>.wire.bin, so *.bin silently kept every one of them out of the
+# repo and the GQH tests could not run from a clean clone at all.
+!deps/llama.cpp/tests/gqh-vectors/*.wire.bin
 *.log
 __pycache__/
 *.pyc

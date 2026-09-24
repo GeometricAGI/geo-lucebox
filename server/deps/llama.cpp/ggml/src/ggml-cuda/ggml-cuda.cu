@@ -38,6 +38,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-fused-combine.cuh"
 #include "ggml-cuda/rocmfp3_mix.cuh"
+#include "ggml-cuda/gqh.cuh"
 #include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2866,6 +2867,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     const int64_t ncols_dst = is_mul_mat_id ? dst->ne[2] : src1->ne[1];
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
+                             !ggml_cuda_qtype_has_no_mmvq(src0->type) &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
 #ifdef ROCMFP2_AFFINE
     // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
@@ -3032,6 +3034,96 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
     }
 
+    // GQH gate/up pair: two same-rung, same-shape GEMVs that share `x`, issued as
+    // one dispatch, then the existing SwiGLU. SuperSonic / lucebox_gqh measured this
+    // on GQH4 out==17408 (the only fractional occupancy-round bucket): folding the
+    // pair pays the per-dispatch cost once and turns 8.5 rounds into 17.0. Qwen3.8
+    // spells the FFN as {MUL_MAT, MUL_MAT, GLU} (ggml_swiglu_split), not the
+    // {MUL_MAT, UNARY, MUL_MAT, MUL} pattern that fusion originally matched, so the
+    // pair kernel was dead until this hook. GGML_GQH_FUSE_PAIR=0 is the same-binary
+    // control; GGML_GQH_FUSED=0 also declines so dequant A/B stays coherent.
+    if (direct_vector_layout && !ids &&
+            ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
+        static const bool gqh_fused_on = []() {
+            const char * e = getenv("GGML_GQH_FUSED");
+            return e ? atoi(e) != 0 : true;
+        }();
+        static const bool pair_on = []() {
+            const char * e = getenv("GGML_GQH_FUSE_PAIR");
+            return e ? atoi(e) != 0 : true;
+        }();
+        const ggml_tensor * w_gate = gate->src[0];
+        const ggml_tensor * w_up   = up->src[0];
+        const ggml_tensor * xt     = gate->src[1];
+        if (gqh_fused_on && pair_on && w_gate && w_up && xt &&
+                xt == up->src[1] && !gate->src[2] && !up->src[2] &&
+                w_gate->type == w_up->type &&
+                (w_gate->type == GGML_TYPE_GQH3 ||
+                 w_gate->type == GGML_TYPE_GQH4 ||
+                 w_gate->type == GGML_TYPE_GQH2_H) &&
+                ggml_are_same_shape(w_gate, w_up) &&
+                ggml_are_same_stride(w_gate, w_up) &&
+                ggml_are_same_shape(gate, up) &&
+                ggml_are_same_stride(gate, up) &&
+                xt->type == GGML_TYPE_F32 &&
+                gate->type == GGML_TYPE_F32 &&
+                up->type == GGML_TYPE_F32 &&
+                glu->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(xt) &&
+                ggml_is_contiguous(gate) &&
+                ggml_is_contiguous(up) &&
+                xt->ne[1] >= 1 && xt->ne[1] <= 16 &&
+                xt->ne[2] == 1 && xt->ne[3] == 1 &&
+                gate->data != up->data &&
+                w_gate->buffer && w_up->buffer &&
+                !ggml_backend_buft_is_cuda_split(w_gate->buffer->buft) &&
+                !ggml_backend_buft_is_cuda_split(w_up->buffer->buft) &&
+                ggml_cuda_gqh_mul_mat_vec_pair(
+                    w_gate->type,
+                    w_gate->data, (float *) gate->data,
+                    w_up->data,   (float *) up->data,
+                    (const float *) xt->data,
+                    (int) w_gate->ne[0], (int) w_gate->ne[1],
+                    (int) xt->ne[1],
+                    (int64_t) (xt->nb[1] / sizeof(float)),
+                    (int64_t) (gate->nb[1] / sizeof(float)),
+                    ctx.stream())) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: gqh pair-fused gate/up %s %dx%d ncols=%d\n", __func__,
+                              ggml_type_name(w_gate->type),
+                              (int) w_gate->ne[0], (int) w_gate->ne[1],
+                              (int) xt->ne[1]);
+            }
+            // ...and the SwiGLU itself folds into the pre-pass the DOWN projection would
+            // have launched separately: same tensor, two 68-block dispatches over 0.56 MB,
+            // one of which only re-reads what the other just wrote. Bit-identical output
+            // (see ggml_cuda_gqh_glu_quant), so this is a dispatch merge and not a numeric
+            // change; GGML_GQH_FUSE_GLU=0 keeps the unfused pair for the same-binary A/B.
+            // `swapped` needs no handling here: src1 is a separate tensor, which is the
+            // branch of ggml_cuda_op_unary_gated that ignores it.
+            // Logged once, for the same reason the pair fusion is: a fusion that silently
+            // declines is indistinguishable from a fusion that bought nothing, and
+            // iteration 10 lost eight HE runs to exactly that class of mistake.
+            static bool glu_logged = false;
+            if (!ggml_cuda_gqh_glu_quant(
+                        (const float *) gate->data, (const float *) up->data,
+                        (float *) glu->data, (int) glu->ne[0], (int) xt->ne[1],
+                        (int64_t) (gate->nb[1] / sizeof(float)),
+                        (int64_t) (up->nb[1]   / sizeof(float)),
+                        (int64_t) (glu->nb[1]  / sizeof(float)),
+                        ctx.stream())) {
+                ggml_cuda_op_swiglu(ctx, glu);
+            } else if (!glu_logged) {
+                glu_logged = true;
+                GGML_LOG_INFO("%s: gqh glu-fused swiglu+prepass %dx%d\n", __func__,
+                              (int) glu->ne[0], (int) xt->ne[1]);
+            }
+            return true;
+        }
+    }
+
     if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.gate = gate->src[0];
@@ -3100,6 +3192,69 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     return false;
 }
 
+// ---- GQH ne11 census (diagnostic, env-gated) --------------------------------
+// The MMQ width gate (gqh_mmq_max_ne11 in mmq.cu) is justified by the KERNEL
+// crossover curve. That is only half a justification: it says where MMQ stops
+// paying, not whether the workload ever goes there. This answers the other half
+// by counting the ne11 a real run actually dispatches for GQH weights.
+//
+// "calls" is every GQH mul_mat. "past_matvec" is those that got past
+// ggml_cuda_gqh_mul_mat_vec -- the only ones the gate can possibly affect, since
+// the matvec owns 1..GQH_MAX_COLS and returns before the gate is ever read.
+// Set GGML_GQH_NE11_LOG=1; the table goes to stderr at process exit.
+#define GQH_NE11_CENSUS_MAX 8192
+static std::atomic<uint64_t> gqh_ne11_seen[GQH_NE11_CENSUS_MAX + 2];
+static std::atomic<uint64_t> gqh_ne11_wide[GQH_NE11_CENSUS_MAX + 2];
+
+static void gqh_ne11_census_dump() {
+    uint64_t tot = 0, totw = 0;
+    for (int i = 0; i < GQH_NE11_CENSUS_MAX + 2; ++i) {
+        tot  += gqh_ne11_seen[i].load(std::memory_order_relaxed);
+        totw += gqh_ne11_wide[i].load(std::memory_order_relaxed);
+    }
+    if (tot == 0) {
+        fprintf(stderr, "=== GQH ne11 census: no GQH mul_mat calls ===\n");
+        return;
+    }
+    fprintf(stderr, "=== GQH ne11 census: %llu GQH mul_mat calls, %llu past the matvec ===\n",
+            (unsigned long long) tot, (unsigned long long) totw);
+    fprintf(stderr, "CENSUS %8s %14s %14s\n", "ne11", "calls", "past_matvec");
+    for (int i = 0; i < GQH_NE11_CENSUS_MAX + 2; ++i) {
+        const uint64_t c = gqh_ne11_seen[i].load(std::memory_order_relaxed);
+        const uint64_t w = gqh_ne11_wide[i].load(std::memory_order_relaxed);
+        if (!c && !w) continue;
+        if (i == GQH_NE11_CENSUS_MAX + 1) {
+            fprintf(stderr, "CENSUS  >%7d %14llu %14llu\n", GQH_NE11_CENSUS_MAX,
+                    (unsigned long long) c, (unsigned long long) w);
+        } else {
+            fprintf(stderr, "CENSUS %8d %14llu %14llu\n", i,
+                    (unsigned long long) c, (unsigned long long) w);
+        }
+    }
+    fflush(stderr);
+}
+
+static bool gqh_ne11_census_on() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_GQH_NE11_LOG");
+        const bool v = e && atoi(e) != 0;
+        if (v) { atexit(gqh_ne11_census_dump); }
+        return v;
+    }();
+    return on;
+}
+
+static void gqh_ne11_census_note(int64_t ne11, std::atomic<uint64_t> * tab) {
+    const int idx = (ne11 >= 0 && ne11 <= GQH_NE11_CENSUS_MAX)
+                  ? (int) ne11 : GQH_NE11_CENSUS_MAX + 1;
+    tab[idx].fetch_add(1, std::memory_order_relaxed);
+}
+
+static bool gqh_census_type(enum ggml_type t) {
+    return t == GGML_TYPE_GQH3 || t == GGML_TYPE_GQH4
+        || t == GGML_TYPE_GQH2_H || t == GGML_TYPE_GQH2_C;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
     const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
@@ -3129,6 +3284,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
+        && !ggml_cuda_qtype_has_no_mmvq(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
@@ -3165,6 +3321,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const int cc            = ggml_cuda_info().devices[id].cc;
             const int warp_size     = ggml_cuda_info().devices[id].warp_size;
             use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(dst, cc, src1->ne[1], /*n_experts=*/0);
+        // GQH carries per-tensor state (scale + grid code) out of band, so MMQ
+        // eligibility is a property of the TENSOR, not just the type:
+        // should_use_mmq's signature cannot see an unregistered tensor or a grid
+        // outside int8's range. Declining here keeps the dequant fallback.
+        use_mul_mat_q           = use_mul_mat_q             && (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0));
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -3173,6 +3334,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
         const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
         use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(dst, cc, src1->ne[1], /*n_experts=*/0);
+        // GQH carries per-tensor state (scale + grid code) out of band, so MMQ
+        // eligibility is a property of the TENSOR, not just the type:
+        // should_use_mmq's signature cannot see an unregistered tensor or a grid
+        // outside int8's range. Declining here keeps the dequant fallback.
+        use_mul_mat_q           = use_mul_mat_q             && (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0));
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -3203,6 +3369,39 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const char * e = getenv("LUCE_MIX_FUSED");
         return e ? atoi(e) != 0 : true;
     }();
+
+    // GQH fused decode matvec, same shape of hook and same reason: the generic chain
+    // would dequantize the whole weight matrix to f16 per token. Returns false for an
+    // unregistered tensor, keeping the fallback. GGML_GQH_FUSED=0 forces the fallback.
+    //
+    // NOT gated on luce_mmvq_max_ncols. That cap is the MMVQ/MMQ crossover for types
+    // that have a vec_dot (default 3). GQH has no MMVQ and no MMQ: N > 3 used to fall
+    // through to dequant->GEMM, which is pathological (N=4 was 6x a fused N=5). The
+    // kernel itself declines anything past GQH_MAX_COLS (16), so DFlash2 verify
+    // (block 8, --draft-block-size 12) stays on the fused path.
+    static const bool gqh_fused_on = []() {
+        const char * e = getenv("GGML_GQH_FUSED");
+        return e ? atoi(e) != 0 : true;
+    }();
+    if (gqh_ne11_census_on() && gqh_census_type(src0->type)) {
+        gqh_ne11_census_note(src1->ne[1], gqh_ne11_seen);
+    }
+    if (gqh_fused_on && !split
+            && (src0->type == GGML_TYPE_GQH3 || src0->type == GGML_TYPE_GQH2_H
+                || src0->type == GGML_TYPE_GQH2_C || src0->type == GGML_TYPE_GQH4)
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[2] == 1 && src1->ne[3] == 1
+            && ggml_cuda_gqh_mul_mat_vec(
+                   src0->type, src0->data, (const float *) src1->data, (float *) dst->data,
+                   (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
+                   (int64_t) (src1->nb[1] / sizeof(float)),
+                   (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
+        return;
+    }
+    if (gqh_ne11_census_on() && gqh_census_type(src0->type)) {
+        gqh_ne11_census_note(src1->ne[1], gqh_ne11_wide);
+    }
     if (mix_fused_on && is_rocmfp3_mix && !split
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
             && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
@@ -3385,7 +3584,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(dst, cc, ne12, /*n_experts=*/ne02)) {
+        if (ggml_cuda_should_use_mmq(dst, cc, ne12, /*n_experts=*/ne02) &&
+            (!ggml_cuda_gqh_mmq_type(src0->type) || ggml_cuda_gqh_mmq_eligible(src0))) {
             log_dispatch("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -4225,6 +4425,26 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #endif
         }
 
+        // GQH batch-1 matvec: measured incompatible with graph capture. The 2x2 on
+        // the qwen38-gqh-mimic artifact (2026-08-19): fused+graphs faulted 3x with
+        // "illegal instruction" at a long-sequence slot release (~227k tokens);
+        // fused+GGML_CUDA_DISABLE_GRAPHS clean over the same items (244k tokens, all
+        // completed); unfused+graphs clean (251k); a GQH-free artifact at identical
+        // geometry clean (269k). Neither fusion nor graphs alone reproduces it.
+        // Root mechanism still open, so exclude capture for GQH nodes entirely --
+        // measured cost of losing graphs on this model: ~1.7% tg64, vs 3.48x for
+        // losing the fused kernel.
+        if (node->op == GGML_OP_MUL_MAT &&
+            node->src[0] && (node->src[0]->type == GGML_TYPE_GQH3   ||
+                             node->src[0]->type == GGML_TYPE_GQH2_H ||
+                             node->src[0]->type == GGML_TYPE_GQH2_C ||
+                             node->src[0]->type == GGML_TYPE_GQH4)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GQH mul_mat node\n", __func__);
+#endif
+        }
+
         // A collective node calls into a library on this stream. Whether such
         // a collective may be captured and replayed is runtime- and
         // library-specific, so a graph containing one is executed eagerly.
@@ -4263,7 +4483,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 node->ne[2] <= mmvq_mmid_max;
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
                 ggml_cuda_should_use_mmq(node, cc,
-                                         node->src[1]->ne[2], node->src[0]->ne[2]);
+                                         node->src[1]->ne[2], node->src[0]->ne[2]) &&
+                (!ggml_cuda_gqh_mmq_type(node->src[0]->type) ||
+                 ggml_cuda_gqh_mmq_eligible(node->src[0]));
             // qtype-105 takes the stream-sync-free MoE path above (no host
             // synchronize), so it is safe to capture. Mirror that path's gate
             // exactly, incl. the registry check, so we never skip-disable while
