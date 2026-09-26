@@ -2131,14 +2131,19 @@ if(LUCE_TESTS)
         endif()
     endif()
     # Optional Strix Halo regression; reuse the tokenizer in luce_common.
-    if(LUCE_GPU_BACKEND STREQUAL "hip" AND
-       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_paged_prefill_model.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_paged_prefill_model.cpp")
         add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp)
         target_include_directories(test_ds4_paged_prefill_model PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-        target_compile_definitions(test_ds4_paged_prefill_model PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
+        if(LUCE_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ds4_paged_prefill_model PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
+            target_link_libraries(test_ds4_paged_prefill_model PRIVATE hip::host)
+        else()
+            target_compile_definitions(test_ds4_paged_prefill_model PRIVATE LUCE_BACKEND_CUDA=1 GGML_USE_CUDA)
+            target_link_libraries(test_ds4_paged_prefill_model PRIVATE CUDA::cudart)
+        endif()
         target_link_libraries(test_ds4_paged_prefill_model PRIVATE
-            luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base hip::host)
+            luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)

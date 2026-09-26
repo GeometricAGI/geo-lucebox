@@ -258,8 +258,9 @@ std::string check_feature_compatibility(
             return "--paged-attention cannot be combined with KVFlash";
         }
         if (arch_is_deepseek4_family(arch)) {
-            if (target_backend != PlacementBackend::Hip) {
-                return "DeepSeek4 paged attention requires a local HIP target";
+            if (target_backend != PlacementBackend::Hip &&
+                !(target_backend == PlacementBackend::Cuda && arch == "deepseek41")) {
+                return "DeepSeek4 paged attention requires HIP, or CUDA for DeepSeek4.1";
             }
             if (args.ds4_prefill_mode != PrefillAttentionMode::Exact) {
                 return "DeepSeek4 paged attention requires --ds4-prefill exact";

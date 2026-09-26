@@ -407,6 +407,9 @@ void test_feature_gate_paged_attention_requires_monolithic_backend() {
     ds4.paged_attention = true;
     CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
     CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Cuda).empty());
+    ds4.device.backend = PlacementBackend::Cuda;
+    ds4.max_concurrency = 2;
+    CHECK(gate_result(ds4, "deepseek41", PlacementBackend::Cuda).empty());
 
     // qwen35moe shares Qwen35Config, so its rejection is this gate's job —
     // the factory's field-presence cross-check cannot tell the two apart.

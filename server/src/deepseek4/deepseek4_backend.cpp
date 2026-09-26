@@ -1607,6 +1607,12 @@ bool DeepSeek4Backend::requires_monolithic_model() const {
 // implement its cache sharing or staggered pre-mix yet, so refuse them
 // instead of silently producing wrong tokens.
 bool DeepSeek4Backend::validate_model_features() const {
+    const auto target = cfg_.device.backend == PlacementBackend::Auto
+        ? compiled_placement_backend() : cfg_.device.backend;
+    if (cfg_.paged_attention && target == PlacementBackend::Cuda && w_.arch != "deepseek41") {
+        std::fprintf(stderr, "[deepseek4] CUDA paged serving is qualified only for deepseek41\n");
+        return false;
+    }
     if (!w_.hc_staggered_pre) return true;
     const char * unsupported = nullptr;
 #if !defined(LUCE_BACKEND_HIP) && !defined(GGML_USE_HIP)
@@ -2328,12 +2334,18 @@ bool DeepSeek4Backend::init() {
             cfg_.device.backend == PlacementBackend::Auto
                 ? compiled_placement_backend() : cfg_.device.backend;
         const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
-        if (target_backend != PlacementBackend::Hip) {
-            std::fprintf(stderr,
-                "[deepseek4] paged concurrency requires a local HIP target\n");
+        if (target_backend == PlacementBackend::Cuda) {
+            if (tp.requested) {
+                std::fprintf(stderr, "[deepseek4] CUDA paged serving requires one resident GPU\n");
+                return false;
+            }
+        } else if (target_backend != PlacementBackend::Hip) {
+            std::fprintf(stderr, "[deepseek4] paged concurrency requires CUDA or HIP\n");
             return false;
         }
-        if (!tp.requested) {
+        if (target_backend == PlacementBackend::Cuda) {
+            // Resident CUDA uses the same gathered per-slot graphs and KV ownership.
+        } else if (!tp.requested) {
             if (!is_gfx_device(cfg_.device.gpu, "gfx1151")) {
                 std::fprintf(stderr,
                     "[deepseek4] monolithic paged concurrency requires one "
@@ -2510,7 +2522,10 @@ bool DeepSeek4Backend::init() {
         std::fprintf(stderr,
             "[deepseek4-parallel] enabled %d slots mode=%s, %u x %d-token physical "
             "blocks; prefill is exact reference mode at %s\n",
-            cfg_.max_concurrency, moe_hybrid_ ? "r9700+strix" : "strix",
+            cfg_.max_concurrency, moe_hybrid_ ? "r9700+strix" :
+                ((cfg_.device.backend == PlacementBackend::Cuda ||
+                  (cfg_.device.backend == PlacementBackend::Auto && compiled_placement_backend() == PlacementBackend::Cuda))
+                    ? "cuda-resident" : "strix"),
             paged_cache_.plan.physical_blocks,
             DS4_PAGE_TOKENS,
             moe_hybrid_

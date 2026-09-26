@@ -6264,14 +6264,13 @@ struct DeepSeek4FusedDecodeCache {
     uint64_t counter = 0;
     std::array<DeepSeek4FusedDecodeGraph, 4> slots;
 
-    // Persistent F16 mirrors of the (quantized) HC fn projection weights so
-    // the fused graph matches the numerics of the reference HC paths, which
-    // always dequantize fn to F16 before the mix matvec.
+    // Persistent HC projection mirrors: native F32 stays F32; quantized and
+    // legacy F16 controllers retain the reference F16 decoding contract.
     ggml_context * fn_ctx = nullptr;
     ggml_backend_buffer_t fn_buf = nullptr;
-    std::vector<ggml_tensor *> fn_attn_f16;
-    std::vector<ggml_tensor *> fn_ffn_f16;
-    ggml_tensor * fn_out_f16 = nullptr;
+    std::vector<ggml_tensor *> fn_attn_weights;
+    std::vector<ggml_tensor *> fn_ffn_weights;
+    ggml_tensor * fn_out_weights = nullptr;
 
     void evict_graphs() {
         for (auto & slot : slots) {
@@ -6284,9 +6283,9 @@ struct DeepSeek4FusedDecodeCache {
         evict_graphs();
         if (fn_buf) { ggml_backend_buffer_free(fn_buf); fn_buf = nullptr; }
         if (fn_ctx) { ggml_free(fn_ctx); fn_ctx = nullptr; }
-        fn_attn_f16.clear();
-        fn_ffn_f16.clear();
-        fn_out_f16 = nullptr;
+        fn_attn_weights.clear();
+        fn_ffn_weights.clear();
+        fn_out_weights = nullptr;
         owner_ctx = nullptr;
         backend = nullptr;
         disabled = false;
@@ -6770,8 +6769,8 @@ static bool ds4_fused_ensure_fn_mirrors(
     // The staggered pre-mix has no output HC projection (the head collapses
     // with the last FFN's coefficients).
     const bool has_output_hc = !w.hc_staggered_pre;
-    if (fc.fn_ctx && fc.fn_buf && fc.fn_attn_f16.size() == (size_t) w.n_layer &&
-        (fc.fn_out_f16 || !has_output_hc)) {
+    if (fc.fn_ctx && fc.fn_buf && fc.fn_attn_weights.size() == (size_t) w.n_layer &&
+        (fc.fn_out_weights || !has_output_hc)) {
         return true;
     }
     const int64_t hc_dim = (int64_t) w.n_embd * w.n_hc;
@@ -6799,30 +6798,37 @@ static bool ds4_fused_ensure_fn_mirrors(
     params.no_alloc = true;
     fc.fn_ctx = ggml_init(params);
     if (!fc.fn_ctx) return false;
-    fc.fn_attn_f16.assign((size_t) w.n_layer, nullptr);
-    fc.fn_ffn_f16.assign((size_t) w.n_layer, nullptr);
+    fc.fn_attn_weights.assign((size_t) w.n_layer, nullptr);
+    fc.fn_ffn_weights.assign((size_t) w.n_layer, nullptr);
+    auto create_fn = [&](const HcWeightsCpu & weights, int64_t rows) {
+        return ggml_new_tensor_2d(fc.fn_ctx,
+            weights.fn_data_f32.empty() ? GGML_TYPE_F16 : GGML_TYPE_F32, hc_dim, rows);
+    };
     for (int il = 0; il < w.n_layer; ++il) {
-        fc.fn_attn_f16[(size_t) il] = ggml_new_tensor_2d(fc.fn_ctx, GGML_TYPE_F16, hc_dim, mix_dim);
-        fc.fn_ffn_f16[(size_t) il] = ggml_new_tensor_2d(fc.fn_ctx, GGML_TYPE_F16, hc_dim, mix_dim);
+        fc.fn_attn_weights[(size_t)il] = create_fn(hc_weights[(size_t)il].attn, mix_dim);
+        fc.fn_ffn_weights[(size_t)il] = create_fn(hc_weights[(size_t)il].ffn, mix_dim);
     }
-    fc.fn_out_f16 = has_output_hc
-        ? ggml_new_tensor_2d(fc.fn_ctx, GGML_TYPE_F16, hc_dim, w.n_hc) : nullptr;
+    fc.fn_out_weights = has_output_hc ? create_fn(hc_out_weights, w.n_hc) : nullptr;
     fc.fn_buf = ggml_backend_alloc_ctx_tensors(fc.fn_ctx, backend);
     if (!fc.fn_buf) {
         ggml_free(fc.fn_ctx);
         fc.fn_ctx = nullptr;
         return false;
     }
+    auto upload_fn = [](ggml_tensor * tensor, const HcWeightsCpu & weights) {
+        if (tensor->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(tensor, weights.fn_data_f32.data(), 0,
+                                    weights.fn_data_f32.size()*sizeof(float));
+        } else {
+            ggml_backend_tensor_set(tensor, weights.fn_data.data(), 0,
+                                    weights.fn_data.size()*sizeof(uint16_t));
+        }
+    };
     for (int il = 0; il < w.n_layer; ++il) {
-        const auto & a = hc_weights[(size_t) il].attn.fn_data;
-        const auto & f = hc_weights[(size_t) il].ffn.fn_data;
-        ggml_backend_tensor_set(fc.fn_attn_f16[(size_t) il], a.data(), 0, a.size() * sizeof(uint16_t));
-        ggml_backend_tensor_set(fc.fn_ffn_f16[(size_t) il], f.data(), 0, f.size() * sizeof(uint16_t));
+        upload_fn(fc.fn_attn_weights[(size_t)il], hc_weights[(size_t)il].attn);
+        upload_fn(fc.fn_ffn_weights[(size_t)il], hc_weights[(size_t)il].ffn);
     }
-    if (has_output_hc) {
-        const auto & o = hc_out_weights.fn_data;
-        ggml_backend_tensor_set(fc.fn_out_f16, o.data(), 0, o.size() * sizeof(uint16_t));
-    }
+    if (has_output_hc) upload_fn(fc.fn_out_weights, hc_out_weights);
     return true;
 }
 
@@ -7046,7 +7052,7 @@ static bool ds4_build_fused_decode_graph(
         ggml_tensor * hc_flat = ggml_reshape_1d(ctx, hc_cur, (int64_t) n_embd * n_hc);
         ggml_tensor * split_attn = nullptr;
         ggml_tensor * working = ds4_build_fused_hc_pre(ctx, w, hc_flat,
-                                                       fc.fn_attn_f16[(size_t) il], L.hc_attn_base,
+                                                       fc.fn_attn_weights[(size_t) il], L.hc_attn_base,
                                                        hlw.attn, &split_attn);
         if (!working) return false;
         ggml_tensor * attn_in = ggml_reshape_2d(ctx, working, n_embd, 1);
@@ -7120,7 +7126,7 @@ static bool ds4_build_fused_decode_graph(
         hc_flat = ggml_reshape_1d(ctx, hc_cur, (int64_t) n_embd * n_hc);
         ggml_tensor * split_ffn = nullptr;
         ggml_tensor * fworking = ds4_build_fused_hc_pre(ctx, w, hc_flat,
-                                                        fc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
+                                                        fc.fn_ffn_weights[(size_t) il], L.hc_ffn_base,
                                                         hlw.ffn, &split_ffn);
         if (!fworking) return false;
         ggml_tensor * ffn_in = ggml_reshape_2d(ctx, fworking, n_embd, 1);
@@ -7151,7 +7157,7 @@ static bool ds4_build_fused_decode_graph(
     // ── Output: HC merge → norm → lm_head ──────────────────────────
     ggml_tensor * hc_flat = ggml_reshape_1d(ctx, hc_cur, (int64_t) n_embd * n_hc);
     ggml_tensor * onorm = ggml_rms_norm(ctx, hc_flat, w.hc_eps);
-    ggml_tensor * omix = ggml_mul_mat(ctx, fc.fn_out_f16, onorm);
+    ggml_tensor * omix = ggml_mul_mat(ctx, fc.fn_out_weights, onorm);
     omix = ggml_reshape_1d(ctx, omix, ggml_nelements(omix));
     ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
     if (!obase || hc_out_weights.scale_data.empty()) return false;
@@ -8511,7 +8517,7 @@ static int ds4_try_layer_major_prefill(
         // HC pre -> batched attention.
         ggml_tensor * norm_hc = ggml_rms_norm(ctx, state_in, w.hc_eps);
         ggml_tensor * mix_attn = ggml_mul_mat(ctx,
-            fc.fn_attn_f16[(size_t) il], norm_hc);
+            fc.fn_attn_weights[(size_t) il], norm_hc);
         mix_attn = ggml_reshape_2d(ctx, mix_attn, mix_dim, n_tokens);
         ggml_tensor * attn_base = ds4_fused_hc_base_f32(ctx,
                                                         L.hc_attn_base);
@@ -8550,7 +8556,7 @@ static int ds4_try_layer_major_prefill(
         // HC pre -> batched MoE.
         norm_hc = ggml_rms_norm(ctx, hc_after_attn, w.hc_eps);
         ggml_tensor * mix_ffn = ggml_mul_mat(ctx,
-            fc.fn_ffn_f16[(size_t) il], norm_hc);
+            fc.fn_ffn_weights[(size_t) il], norm_hc);
         mix_ffn = ggml_reshape_2d(ctx, mix_ffn, mix_dim, n_tokens);
         ggml_tensor * ffn_base = ds4_fused_hc_base_f32(ctx, L.hc_ffn_base);
         ggml_tensor * pre_ffn = ggml_ds4_hc_pre(
@@ -8607,7 +8613,7 @@ static int ds4_try_layer_major_prefill(
                 (size_t) (n_tokens - 1) * hc_next->nb[1]);
             last_hc = ggml_reshape_1d(ctx, last_hc, hc_dim);
             ggml_tensor * out_hc_norm = ggml_rms_norm(ctx, last_hc, w.hc_eps);
-            ggml_tensor * out_mix = ggml_mul_mat(ctx, fc.fn_out_f16,
+            ggml_tensor * out_mix = ggml_mul_mat(ctx, fc.fn_out_weights,
                                                   out_hc_norm);
             out_mix = ggml_reshape_1d(ctx, out_mix, n_hc);
             ggml_tensor * out_base = ds4_fused_hc_base_f32(ctx,
@@ -10307,7 +10313,7 @@ bool deepseek4_step_layer_range(
             const auto hc_pre_attn_build_t0 = Ds4TimingClock::now();
             if (!build_prefill_hc_pre_graph(
                     prefill_hc_pre_graph, backend, w,
-                    fused_decode_graph_cache.fn_attn_f16[(size_t)il],
+                    fused_decode_graph_cache.fn_attn_weights[(size_t)il],
                     L.hc_attn_base, hc_lw.attn.scale_data.data(),
                     il, /*ffn=*/false, n_tokens, staggered_pre)) {
                 std::fprintf(stderr,
@@ -10937,7 +10943,7 @@ bool deepseek4_step_layer_range(
             const auto hc_pre_ffn_build_t0 = Ds4TimingClock::now();
             if (!build_prefill_hc_pre_graph(
                     prefill_hc_pre_graph, backend, w,
-                    fused_decode_graph_cache.fn_ffn_f16[(size_t)il],
+                    fused_decode_graph_cache.fn_ffn_weights[(size_t)il],
                     L.hc_ffn_base, hc_lw.ffn.scale_data.data(),
                     il, /*ffn=*/true, n_tokens, staggered_pre)) {
                 std::fprintf(stderr,

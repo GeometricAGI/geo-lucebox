@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 
 using namespace luce::common;
@@ -41,6 +43,9 @@ static std::vector<std::vector<int32_t>> generate(
             if (!remaining[i]) plan.decode.push_back({slots[i], pending[i], false});
         }
         if (done) {
+            // A shorter prompt may finish first, but remains in the cohort
+            // until every client has enough output. Compare equal prefixes.
+            for (auto & sequence : tokens) sequence.resize(count);
             return tokens;
         }
         const auto limits = engine.step_plan_limits((int)plan.decode.size());
@@ -134,17 +139,21 @@ static void check_prefill_parity(SeqEngine & engine,
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 2 || (std::getenv("LUCE_DS4_SPEC") &&
+    if ((argc != 2 && argc != 3) || (std::getenv("LUCE_DS4_SPEC") &&
                      std::strcmp(std::getenv("LUCE_DS4_SPEC"), "0") != 0)) {
-        std::fprintf(stderr, "Usage: LUCE_DS4_SPEC=0 test_ds4_paged_prefill_model target.gguf\n");
+        std::fprintf(stderr, "Usage: LUCE_DS4_SPEC=0 test_ds4_paged_prefill_model target.gguf [two-frozen-token-requests.json]\n");
         return 2;
     }
     DeepSeek4BackendConfig config;
     config.model_path = argv[1];
+#if defined(LUCE_BACKEND_CUDA)
+    config.device.backend = PlacementBackend::Cuda;
+#else
     config.device.backend = PlacementBackend::Hip;
+#endif
     config.device.gpu = 0;
     config.paged_attention = true;
-    config.max_concurrency = 4;
+    config.max_concurrency = argc == 3 ? 2 : 4;
     config.max_ctx = 512;
     config.kv_pool_tokens = 2048;
     DeepSeek4Backend backend(config);
@@ -159,9 +168,28 @@ int main(int argc, char ** argv) {
     };
     try {
         std::vector<std::vector<int32_t>> prompts;
-        for (const auto * task : tasks) prompts.push_back(tokenizer.encode(
+        if (argc == 3) {
+            std::ifstream input(argv[2]);
+            auto requests = nlohmann::json::parse(input);
+            for (const auto & request : requests.at("requests"))
+                prompts.push_back(request.at("token_ids").get<std::vector<int32_t>>());
+            if (prompts.size() != 2) throw std::runtime_error("requires two frozen token prompts");
+        } else for (const auto * task : tasks) prompts.push_back(tokenizer.encode(
             std::string("[bos][user]")+task+"[assistant]</think>"));
         const auto ar = generate(*backend.seq_engine(), prompts, 140);
+        if (argc == 3) {
+            for (size_t i = 0; i < prompts.size(); ++i) {
+                auto single = generate(*backend.seq_engine(), {prompts[i]}, 140);
+                if (single[0] != ar[i]) {
+                    const auto difference = std::mismatch(ar[i].begin(), ar[i].end(), single[0].begin());
+                    const auto index = difference.first-ar[i].begin();
+                    std::fprintf(stderr, "FAIL: slot=%zu token=%zu concurrent=%d serial=%d\n",
+                                 i, (size_t)index, ar[i][index], single[0][index]);
+                    throw std::runtime_error("concurrent vs serial token mismatch at slot " + std::to_string(i));
+                }
+            }
+            std::fprintf(stderr, "PASS: two concurrent sequences match serial generation\n");
+        }
         check_prefill_parity(*backend.seq_engine(), prompts, ar);
     } catch (const std::exception & e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());

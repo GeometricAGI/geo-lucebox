@@ -107,3 +107,29 @@ ctest --test-dir server/build -R 'ds41_attention_cuda|ds4_maskless_prefill_' --o
 
 CUDA/H200 is the initial execution target. A successful CUDA gate does not qualify
 HIP, Lucebox placement, concurrent paged execution, or whole-model golden quality.
+
+## CUDA paged concurrency (from the DS4.1 CUDA research branch)
+
+Resident single-GPU CUDA serving also accepts `--paged-attention
+--max-concurrency 2`. It retains native F32 hyper-connection controller
+projections in gathered graphs. CUDA tensor/expert parallel placement and
+legacy `deepseek4` CUDA paged serving remain unsupported. Allow GPU memory
+for two sequences and the gathered graph scratch space in addition to the
+resident weights.
+
+The optional CUDA/HIP `test_ds4_paged_prefill_model` accepts a JSON file
+containing exactly two requests with `token_ids` as its second positional
+argument after the GGUF. With `LUCE_DS4_SPEC=0`, it checks 140-token
+concurrent-versus-serial prefixes and chronological prefill reconstruction
+at tokens 53 and 129. This checks consistency within paged serving;
+separate golden evaluation is still needed against the non-paged engine.
+
+On an H200 with the tight128 mixed research artifact (2026-09-26), the
+two-slot CUDA pilot passed the frozen coding, GPQA, and AIME questions.
+It produced 3,379 tokens in 311.2 seconds, or 10.9 aggregate output
+tokens/s including prefill. The non-paged single-slot baseline produced
+2,168 tokens in approximately 306.7 seconds on the same three prompts.
+Longer generated reasoning erased the throughput improvement on this
+small pilot. These runs are separate evaluation cohorts; two-slot CUDA
+is not yet established as a faster replacement for the full quality run.
+

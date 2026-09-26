@@ -699,7 +699,7 @@ static bool ds4_build_fused_verify_graph(
         ggml_tensor * hc_flat = hc_cur;
         ggml_tensor * split_attn = nullptr;
         ggml_tensor * attn_working = ds4_build_fused_hc_pre(
-            ctx, w, hc_flat, mc.fn_attn_f16[(size_t) il], L.hc_attn_base,
+            ctx, w, hc_flat, mc.fn_attn_weights[(size_t) il], L.hc_attn_base,
             hlw.attn, &split_attn, projection_columns);
         if (!attn_working) return false;
         // HC-pre stores working and split values together per token. Materialize
@@ -1105,7 +1105,7 @@ static bool ds4_build_fused_verify_graph(
         hc_flat = hc_cur;
         ggml_tensor * split_ffn = nullptr;
         ggml_tensor * ffn_working = ds4_build_fused_hc_pre(
-            ctx, w, hc_flat, mc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
+            ctx, w, hc_flat, mc.fn_ffn_weights[(size_t) il], L.hc_ffn_base,
             hlw.ffn, &split_ffn, projection_columns);
         if (!ffn_working) return false;
         ggml_tensor * ffn_in = w.hc_staggered_pre
@@ -1365,7 +1365,7 @@ static bool ds4_build_fused_verify_graph(
         final_all = ds4_build_hc_collapse(ctx, hc_cur, carried_pre, n_embd, n_hc);
     } else {
         ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
-        ggml_tensor * omix = ds4_mul_mat_columns(ctx, mc.fn_out_f16, onorm, projection_columns);
+        ggml_tensor * omix = ds4_mul_mat_columns(ctx, mc.fn_out_weights, onorm, projection_columns);
         omix = ggml_reshape_2d(ctx, omix, ggml_nelements(omix) / q, q);
         ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
         if (!obase || hc_out_weights.scale_data.empty()) return false;
