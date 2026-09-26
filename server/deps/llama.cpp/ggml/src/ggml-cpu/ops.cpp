@@ -3827,7 +3827,8 @@ static void ggml_compute_forward_rms_norm_f32(
                 //     y[i00] = x[i00];
                 // }
 
-                const float scale = 1.0f/sqrtf(mean + eps);
+                const float scale = dst->op == GGML_OP_DSV41_RMS_NORM ?
+                    float(1.0/sqrt(double(mean + eps))) : 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);

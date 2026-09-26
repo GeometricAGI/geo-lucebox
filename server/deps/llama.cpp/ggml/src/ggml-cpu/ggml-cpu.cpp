@@ -426,6 +426,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         op->op == GGML_OP_SOFT_MAX_VISION_F32 || op->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+    if ((op->op==GGML_OP_MUL_MAT || op->op==GGML_OP_MUL_MAT_GROUPED_SRC) &&
+        ggml_get_op_params_i32(op,0)==GGML_PREC_RESEARCH_BF16_F32) return false;
 
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
@@ -439,7 +441,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         if (op->src[i] && (op->src[i]->type == GGML_TYPE_GQH3 ||
                            op->src[i]->type == GGML_TYPE_GQH2_H ||
                            op->src[i]->type == GGML_TYPE_GQH2_C ||
-                           op->src[i]->type == GGML_TYPE_GQH4)) {
+                           op->src[i]->type == GGML_TYPE_GQH4 || op->src[i]->type == GGML_TYPE_DSV41_INT3_G64 ||
+                           op->src[i]->type == GGML_TYPE_DSV41_INT3_G128)) {
             return false;
         }
     }

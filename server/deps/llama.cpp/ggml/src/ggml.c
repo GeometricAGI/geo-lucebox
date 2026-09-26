@@ -1075,6 +1075,40 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_gqh2_c,
         .from_float_ref           = (ggml_from_float_t) gqh_from_float_unsupported,
     },
+    [GGML_TYPE_DSV41_INT3_G64] = {
+        .type_name = "dsv41_int3_g64", .blck_size = 64, .type_size = 28,
+        .is_quantized = true, .to_float = (ggml_to_float_t) dequantize_row_dsv41_int3_g64,
+        .from_float_ref = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
+    [GGML_TYPE_DSV41_INT3_G128] = {
+        .type_name = "dsv41_int3_g128", .blck_size = 128, .type_size = 52,
+        .is_quantized = true, .to_float = (ggml_to_float_t) dequantize_row_dsv41_int3_g128,
+        .from_float_ref = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
+    [GGML_TYPE_GQH_T] = {
+        .type_name = "gqh_t",
+        .blck_size = GQH_SUPERBLOCK,
+        .type_size = GQHT_SB_BYTES,
+        .is_quantized = true,
+        .to_float = (ggml_to_float_t) dequantize_row_gqh_t,
+        .from_float_ref = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
+    [GGML_TYPE_GQH_T_G32_R4] = {
+        .type_name = "gqh_t_g32_r4",
+        .blck_size = GQH_SUPERBLOCK,
+        .type_size = GQHT_G32_R4_SB_BYTES,
+        .is_quantized = true,
+        .to_float = (ggml_to_float_t) dequantize_row_gqh_t_g32_r4,
+        .from_float_ref = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
+    [GGML_TYPE_GQH_T_G32_R3] = {
+        .type_name = "gqh_t_g32_r3",
+        .blck_size = GQH_SUPERBLOCK,
+        .type_size = GQHT_G32_R3_SB_BYTES,
+        .is_quantized = true,
+        .to_float = (ggml_to_float_t) dequantize_row_gqh_t_g32_r3,
+        .from_float_ref = (ggml_from_float_t) gqh_from_float_unsupported,
+    },
     [GGML_TYPE_GQH4] = {
         // GQH 4-bit rung (4.28125 bpw). Same head as gqh3, then 128 bytes of uint4 codes
         // (two per byte) into a 16-level grid +-(j/8)^gamma picked per tensor. The widest
@@ -1259,9 +1293,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOFT_MAX_VISION_F32",
     "MUL_MAT_VISION_AV_F32",
     "DS4_MOE_COMBINE",
+    "DSV41_CACHE_QUANT",
+    "DSV41_RMS_NORM",
+    "DSV41_SPARSE_ATTN",
+    "DSV41_FP8_MATMUL",
+    "DSV41_ENGRAM_GATE",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1391,9 +1430,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "soft_max_vision_f32(x)",
     "vision_av_f32(v,p)",
     "ds4_moe_combine(down,w,shared)",
+    "dsv41_cache_quant(x)",
+    "dsv41_rms_norm(x)",
+    "dsv41_sparse_attn(q,kv)",
+    "dsv41_fp8_matmul(w,s,x)",
+    "dsv41_engram_gate(x)",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -9559,6 +9603,17 @@ struct ggml_tensor * ggml_ds4_hc_out(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv41_cache_quant(
+        struct ggml_context * ctx, struct ggml_tensor * input, int mode) {
+    GGML_ASSERT(mode>=0 && mode<=2);
+    GGML_ASSERT(input->type==GGML_TYPE_BF16 && ggml_is_contiguous(input));
+    GGML_ASSERT(input->ne[0]%(mode==1?16:32)==0);
+    struct ggml_tensor * result=ggml_dup_tensor(ctx,input);
+    result->op=GGML_OP_DSV41_CACHE_QUANT;result->src[0]=input;
+    ggml_set_op_params_i32(result,0,mode);
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_indexer_qat(
         struct ggml_context * ctx,
         struct ggml_tensor  * input) {
@@ -9683,5 +9738,53 @@ struct ggml_tensor * ggml_ds4_moe_fused_combine_shared(
     result->src[0] = down_e;
     result->src[1] = weights;
     result->src[2] = shared_out;
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_engram_gate(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(ctx && a && a->type==GGML_TYPE_F32 && ggml_is_contiguous(a));
+    struct ggml_tensor * result=ggml_dup_tensor(ctx,a);
+    result->op=GGML_OP_DSV41_ENGRAM_GATE;result->src[0]=a;return result;
+}
+
+struct ggml_tensor * ggml_dsv41_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps) {
+    GGML_ASSERT(a && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] > 0 && a->ne[0] <= INT_MAX && ggml_nrows(a) <= INT_MAX);
+    GGML_ASSERT(isfinite(eps) && eps > 0);
+    struct ggml_tensor * result = ggml_rms_norm(ctx, a, eps);
+    result->op = GGML_OP_DSV41_RMS_NORM;
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_sparse_attn(struct ggml_context * ctx,
+        struct ggml_tensor * q, struct ggml_tensor * raw, struct ggml_tensor * compressed,
+        struct ggml_tensor * sinks, struct ggml_tensor * indices, float scale) {
+    GGML_ASSERT(q && raw && sinks && indices && isfinite(scale) && scale > 0);
+    GGML_ASSERT(q->type==GGML_TYPE_BF16 && ggml_is_contiguous(q) && q->ne[0]==512 && q->ne[3]==1);
+    GGML_ASSERT(q->ne[1]>0 && q->ne[1]<=128 && q->ne[2]>0 && q->ne[2]<=INT_MAX/128);
+    GGML_ASSERT(raw->type==GGML_TYPE_BF16 && ggml_is_contiguous(raw) && raw->ne[0]==512 && raw->ne[2]==1 && raw->ne[3]==1);
+    if(compressed)GGML_ASSERT(compressed->type==GGML_TYPE_BF16 && ggml_is_contiguous(compressed) && compressed->ne[0]==512 && compressed->ne[2]==1 && compressed->ne[3]==1);
+    GGML_ASSERT(raw->ne[1]+(compressed?compressed->ne[1]:0)<=INT_MAX);
+    GGML_ASSERT(sinks->type==GGML_TYPE_F32 && ggml_is_contiguous(sinks) && ggml_nelements(sinks)==q->ne[1]);
+    GGML_ASSERT(indices->type==GGML_TYPE_I32 && ggml_is_contiguous(indices) && indices->ne[0]>0 && indices->ne[0]<=4096 && indices->ne[1]==q->ne[2] && indices->ne[2]==1 && indices->ne[3]==1);
+    struct ggml_tensor * result=ggml_dup_tensor(ctx,q);
+    result->op=GGML_OP_DSV41_SPARSE_ATTN;
+    result->src[0]=q;result->src[1]=raw;result->src[2]=compressed;result->src[3]=sinks;result->src[4]=indices;
+    ggml_set_op_params(result,&scale,sizeof(scale));
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_fp8_matmul(struct ggml_context * ctx,
+        struct ggml_tensor * w,struct ggml_tensor * scales,struct ggml_tensor * x) {
+    GGML_ASSERT(ctx && w && scales && x);
+    GGML_ASSERT(w->type==GGML_TYPE_I8 && scales->type==GGML_TYPE_I8 && x->type==GGML_TYPE_BF16);
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_is_contiguous(scales) && ggml_is_contiguous(x));
+    GGML_ASSERT(w->ne[0]>0 && w->ne[0]<=INT_MAX-31 && w->ne[1]>0 && w->ne[1]<=INT_MAX-31);
+    GGML_ASSERT(w->ne[2]==1 && w->ne[3]==1 && scales->ne[2]==1 && scales->ne[3]==1);
+    GGML_ASSERT(scales->ne[0]==(w->ne[0]+31)/32 && scales->ne[1]==(w->ne[1]+31)/32);
+    GGML_ASSERT(x->ne[0]==w->ne[0] && x->ne[1]>0 && x->ne[1]<=65535 && x->ne[2]==1 && x->ne[3]==1);
+    struct ggml_tensor * result=ggml_new_tensor_2d(ctx,GGML_TYPE_BF16,w->ne[1],x->ne[1]);
+    result->op=GGML_OP_DSV41_FP8_MATMUL;
+    result->src[0]=w;result->src[1]=scales;result->src[2]=x;
     return result;
 }

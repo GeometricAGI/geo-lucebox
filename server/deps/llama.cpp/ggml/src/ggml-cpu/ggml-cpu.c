@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
+#include "../ggml-dsv41-quant.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
@@ -99,6 +100,64 @@ static float ggml_ds4_indexer_e2m1_round_cpu(float x) {
         }
     }
     return sign * ggml_ds4_indexer_e2m1_value_cpu(best);
+}
+
+static void ggml_compute_forward_dsv41_fp8_matmul(const struct ggml_compute_params * params,struct ggml_tensor * dst) {
+    const struct ggml_tensor * w=dst->src[0],* scales=dst->src[1],* x=dst->src[2];
+    int64_t cols=w->ne[0],rows=w->ne[1],blocks=scales->ne[0];
+    for(int64_t i=params->ith;i<rows*x->ne[1];i+=params->nth){
+        int64_t row=i%rows,token=i/rows;float sum=0;
+        for(int64_t col=0;col<cols;++col){
+            float v=ds41_decode_fp8(((const uint8_t *)w->data)[row*cols+col],((const uint8_t *)scales->data)[(row/32)*blocks+col/32]);
+            sum+=v*ds41_from_bf16(((const uint16_t *)x->data)[token*cols+col]);
+        }
+        ((uint16_t *)dst->data)[i]=ds41_to_bf16(sum);
+    }
+}
+
+static void ggml_compute_forward_dsv41_sparse_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * q=dst->src[0],* raw=dst->src[1],* comp=dst->src[2],* sinks=dst->src[3],* indices=dst->src[4];
+    const int heads=q->ne[1],count=indices->ne[0];
+    const int64_t raw_rows=raw->ne[1],rows=raw_rows+(comp?comp->ne[1]:0);
+    float scale;memcpy(&scale,dst->op_params,4);
+    for(int64_t row=params->ith;row<q->ne[1]*q->ne[2];row+=params->nth) {
+        const uint16_t * query=(const uint16_t *)q->data+row*512;
+        const int32_t * selected=(const int32_t *)indices->data+(row/heads)*count;
+        float acc[512]={0},maximum=-1e30f,denom=0;
+        for(int first=0;first<count;first+=64) {
+            float scores[64],prob[64],next=maximum;const uint16_t * values[64];
+            for(int j=0;j<64;++j) {
+                int ix=first+j<count?selected[first+j]:-1;
+                values[j]=ix<0 || ix>=rows?NULL:ix<raw_rows?(const uint16_t *)raw->data+(int64_t)ix*512:(const uint16_t *)comp->data+((int64_t)ix-raw_rows)*512;
+                float dot=0;
+                if(values[j])for(int d=0;d<512;++d)dot+=ds41_from_bf16(query[d])*ds41_from_bf16(values[j][d]);
+                scores[j]=values[j]?dot*scale:-INFINITY;next=fmaxf(next,scores[j]);
+            }
+            float rescale=expf(maximum-next),sum=0;
+            for(int j=0;j<64;++j){float p=expf(scores[j]-next);sum+=p;prob[j]=ds41_from_bf16(ds41_to_bf16(p));}
+            for(int d=0;d<512;++d){acc[d]*=rescale;for(int j=0;j<64;++j)if(values[j])acc[d]+=prob[j]*ds41_from_bf16(values[j][d]);}
+            denom=denom*rescale+sum;maximum=next;
+        }
+        float total=denom+expf(((const float *)sinks->data)[row%heads]-maximum);
+        uint16_t * out=(uint16_t *)dst->data+row*512;
+        for(int d=0;d<512;++d)out[d]=ds41_to_bf16(denom==0?0:acc[d]/total);
+    }
+}
+
+static void ggml_compute_forward_dsv41_cache_quant(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src=dst->src[0];
+    int mode=ggml_get_op_params_i32(dst,0),group=mode==1?16:32;
+    GGML_ASSERT(mode>=0 && mode<=2 && src->type==GGML_TYPE_BF16 && dst->type==GGML_TYPE_BF16);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst) && src->ne[0]%group==0);
+    const uint16_t * in=(const uint16_t *)src->data;uint16_t * out=(uint16_t *)dst->data;
+    const int64_t groups=ggml_nelements(src)/group;
+    for(int64_t g=params->ith;g<groups;g+=params->nth){
+        float amax=0;
+        for(int i=0;i<group;++i)amax=fmaxf(amax,fabsf(ds41_from_bf16(in[g*group+i])));
+        float scale=ds41_scale(amax,mode);
+        for(int i=0;i<group;++i)out[g*group+i]=ds41_quant_value(ds41_from_bf16(in[g*group+i]),scale,mode);
+    }
 }
 
 static void ggml_compute_forward_ds4_indexer_qat(
@@ -2036,6 +2095,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_norm(params, tensor);
             } break;
+        case GGML_OP_DSV41_ENGRAM_GATE: {
+            const float * x=(const float *)tensor->src[0]->data;float * y=(float *)tensor->data;
+            for(int64_t i=params->ith;i<ggml_nelements(tensor);i+=params->nth) {
+                if(isnan(x[i])){y[i]=x[i];continue;}
+                float z=copysignf(sqrtf(fmaxf(fabsf(x[i]),1e-6f)),x[i]);
+                y[i]=1.f/(1.f+expf(-z));
+            }
+        } break;
+        case GGML_OP_DSV41_RMS_NORM:
         case GGML_OP_RMS_NORM:
             {
                 ggml_compute_forward_rms_norm(params, tensor);
@@ -2069,6 +2137,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("GGML_OP_DS4_HC is only implemented for CUDA");
             }
+        case GGML_OP_DSV41_FP8_MATMUL:
+            { ggml_compute_forward_dsv41_fp8_matmul(params,tensor); } break;
+        case GGML_OP_DSV41_SPARSE_ATTN:
+            { ggml_compute_forward_dsv41_sparse_attn(params,tensor); } break;
+        case GGML_OP_DSV41_CACHE_QUANT:
+            { ggml_compute_forward_dsv41_cache_quant(params,tensor); } break;
         case GGML_OP_DS4_INDEXER_QAT:
             {
                 ggml_compute_forward_ds4_indexer_qat(params, tensor);
@@ -2568,6 +2642,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
+        case GGML_OP_DSV41_ENGRAM_GATE:
+        case GGML_OP_DSV41_RMS_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
@@ -2641,6 +2717,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_DSV41_FP8_MATMUL:
+        case GGML_OP_DSV41_SPARSE_ATTN:
+        case GGML_OP_DSV41_CACHE_QUANT:
         case GGML_OP_DS4_INDEXER_QAT:
         case GGML_OP_DS4_INDEXER_SCORE:
         case GGML_OP_DS4_INDEXER_MASK:

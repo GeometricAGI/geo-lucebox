@@ -19,6 +19,10 @@
 #include "ggml.h"
 #include "gqh-tables.h"
 
+#define GQHT_SB_BYTES 61
+#define GQHT_G32_R4_SB_BYTES 57
+#define GQHT_G32_R3_SB_BYTES 56
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,6 +31,13 @@ extern "C" {
 // tensor, not just its base -- to_float is called per row and the CUDA op splits
 // src0 by rows. Returns false if `p` falls in no registered tensor.
 GGML_API bool ggml_gqh_lookup(const void * p, float * tensor_scale, int * grid_code);
+// Borrowed host/backend scale pointers, valid until registration changes.
+// byte_offset locates a slice inside the original registered packed body.
+GGML_API bool ggml_gqh_lookup_input_scale(const void * p, const float ** host_values,
+        const void ** backend_values, int64_t * columns, size_t * byte_offset);
+
+void dequantize_row_dsv41_int3_g64(const void * x,float * y,int64_t k);
+void dequantize_row_dsv41_int3_g128(const void * x,float * y,int64_t k);
 
 // CPU decoders behind the type traits. gqh4/gqh3/gqh2_h abort on an unregistered
 // pointer rather than guess a scale; see the to_float comment in ggml.c.
@@ -34,6 +45,9 @@ void dequantize_row_gqh3  (const void * GGML_RESTRICT x, float * GGML_RESTRICT y
 void dequantize_row_gqh2_h(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_gqh2_c(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_gqh4  (const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_gqh_t(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_gqh_t_g32_r4(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void dequantize_row_gqh_t_g32_r3(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 #ifdef __cplusplus
 }

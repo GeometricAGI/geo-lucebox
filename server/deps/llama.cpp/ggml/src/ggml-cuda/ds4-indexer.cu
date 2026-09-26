@@ -1312,3 +1312,72 @@ void ggml_cuda_op_ds4_indexer_mask(
             n_selected, n_attn, raw_rows, n_comp, top_k);
     CUDA_CHECK(cudaGetLastError());
 }
+
+#include "../ggml-dsv41-quant.h"
+static __global__ void dsv41_cache_quant_kernel(const uint16_t * src,uint16_t * dst,int mode,int group) {
+    const int lane=threadIdx.x;const int64_t offset=(int64_t)blockIdx.x*group;
+    __shared__ float maxima[32];
+    float value=ds41_from_bf16(src[offset+lane]);maxima[lane]=fabsf(value);__syncthreads();
+    for(int stride=group/2;stride;stride/=2){if(lane<stride)maxima[lane]=fmaxf(maxima[lane],maxima[lane+stride]);__syncthreads();}
+    dst[offset+lane]=ds41_quant_value(value,ds41_scale(maxima[0],mode),mode);
+}
+void ggml_cuda_op_dsv41_cache_quant(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
+    const auto * src=dst->src[0];int mode=ggml_get_op_params_i32(dst,0),group=mode==1?16:32;
+    GGML_ASSERT(mode>=0 && mode<=2 && src->type==GGML_TYPE_BF16 && dst->type==GGML_TYPE_BF16);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst) && src->ne[0]%group==0);
+    const int64_t groups=ggml_nelements(src)/group;GGML_ASSERT(groups<=INT32_MAX);
+    dsv41_cache_quant_kernel<<<(unsigned)groups,group,0,ctx.stream()>>>(
+        (const uint16_t *)src->data,(uint16_t *)dst->data,mode,group);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Correctness-first DS4.1 selected-row attention. KV segments remain resident;
+// only 64 scores/probabilities are shared per head/query, with two output
+// accumulators per thread. No gathered KV or dense attention matrix is allocated.
+static __global__ void dsv41_sparse_attn_kernel(const uint16_t * q,const uint16_t * raw,
+        const uint16_t * comp,const float * sinks,const int32_t * indices,uint16_t * out,
+        int heads,int raw_rows,int rows,int count,float scale) {
+    const int row=blockIdx.x,tid=threadIdx.x;
+    const uint16_t * query=q+(int64_t)row*512;
+    const int32_t * selected=indices+(int64_t)(row/heads)*count;
+    __shared__ float scores[64],prob[64],maximum,denom,rescale;
+    __shared__ int ids[64];
+    float a0=0,a1=0;
+    if(tid==0){maximum=-1e30f;denom=0;}__syncthreads();
+    for(int first=0;first<count;first+=64) {
+        if(tid<64) {
+            int ix=first+tid<count?selected[first+tid]:-1;ids[tid]=ix>=0 && ix<rows?ix:-1;
+            float dot=0;
+            if(ids[tid]>=0) {
+                const uint16_t * value=ix<raw_rows?raw+(int64_t)ix*512:comp+((int64_t)ix-raw_rows)*512;
+                for(int d=0;d<512;++d)dot+=ds41_from_bf16(query[d])*ds41_from_bf16(value[d]);
+            }
+            scores[tid]=ids[tid]>=0?dot*scale:-INFINITY;
+        }
+        __syncthreads();
+        if(tid==0) {
+            float next=maximum;for(int j=0;j<64;++j)next=fmaxf(next,scores[j]);
+            rescale=expf(maximum-next);float sum=0;
+            for(int j=0;j<64;++j){float p=expf(scores[j]-next);sum+=p;prob[j]=ds41_from_bf16(ds41_to_bf16(p));}
+            denom=denom*rescale+sum;maximum=next;
+        }
+        __syncthreads();a0*=rescale;a1*=rescale;
+        for(int j=0;j<64;++j)if(ids[j]>=0) {
+            const int ix=ids[j];const uint16_t * value=ix<raw_rows?raw+(int64_t)ix*512:comp+((int64_t)ix-raw_rows)*512;
+            a0+=prob[j]*ds41_from_bf16(value[tid]);a1+=prob[j]*ds41_from_bf16(value[tid+256]);
+        }
+        __syncthreads();
+    }
+    float total=denom+expf(sinks[row%heads]-maximum);
+    out[(int64_t)row*512+tid]=ds41_to_bf16(denom==0?0:a0/total);
+    out[(int64_t)row*512+tid+256]=ds41_to_bf16(denom==0?0:a1/total);
+}
+void ggml_cuda_op_dsv41_sparse_attn(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
+    auto * q=dst->src[0];auto * raw=dst->src[1];auto * comp=dst->src[2];
+    float scale;memcpy(&scale,dst->op_params,4);
+    dsv41_sparse_attn_kernel<<<q->ne[1]*q->ne[2],256,0,ctx.stream()>>>(
+        (const uint16_t *)q->data,(const uint16_t *)raw->data,comp?(const uint16_t *)comp->data:nullptr,
+        (const float *)dst->src[3]->data,(const int32_t *)dst->src[4]->data,(uint16_t *)dst->data,
+        q->ne[1],raw->ne[1],raw->ne[1]+(comp?comp->ne[1]:0),dst->src[4]->ne[0],scale);
+    CUDA_CHECK(cudaGetLastError());
+}

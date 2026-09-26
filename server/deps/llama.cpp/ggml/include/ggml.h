@@ -446,13 +446,21 @@ extern "C" {
         GGML_TYPE_GQH2_H  = 109, // GQH 2.28125 bpw; 256-weight superblock,  73 B; 5 B per-tensor header in GGUF KV
         GGML_TYPE_GQH2_C  = 110, // GQH 2.0625  bpw; 256-weight superblock,  66 B; no header (fp16 d in-block)
         GGML_TYPE_GQH4    = 111, // GQH 4.28125 bpw; 256-weight superblock, 137 B; 5 B per-tensor header in GGUF KV
-        GGML_TYPE_COUNT   = 112,
+        GGML_TYPE_GQH_T   = 112, // ternary, group16/r4, 61 B per 256 weights
+        GGML_TYPE_GQH_T_G32_R4 = 113, // research group32/r4, 57 B per 256 weights
+        GGML_TYPE_GQH_T_G32_R3 = 114, // research group32/r3, 56 B per 256 weights
+        GGML_TYPE_DSV41_INT3_G64 = 115, // dense 3-bit codes + F32 scale, 28B/64
+        GGML_TYPE_DSV41_INT3_G128 = 116, // dense 3-bit codes + F32 scale, 52B/128
+        GGML_TYPE_COUNT   = 117,
     };
 
     // precision
     enum ggml_prec {
         GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
         GGML_PREC_F32     = 10,
+        // Explicit DS4.1 research GQH2_H/3/4: inverse AWQ, BF16 weights, F32 dot.
+        GGML_PREC_GQH_BF16_F32 = 20,
+        GGML_PREC_RESEARCH_BF16_F32 = GGML_PREC_GQH_BF16_F32,
     };
 
     // model file types
@@ -630,6 +638,14 @@ extern "C" {
         GGML_OP_SOFT_MAX_VISION_F32, // inference-only HIP source-order DS4V softmax
         GGML_OP_MUL_MAT_VISION_AV_F32, // inference-only HIP source-layout DS4V AV
         GGML_OP_DS4_MOE_COMBINE,
+
+        GGML_OP_DSV41_CACHE_QUANT, // BF16 cache rounding without V4 Hadamard
+        GGML_OP_DSV41_RMS_NORM, // double sum of materialized F32 squares
+        GGML_OP_DSV41_SPARSE_ATTN, // selected BF16 MLA rows, block-64 online softmax
+
+        GGML_OP_DSV41_FP8_MATMUL, // raw E4M3 + group32x32 E8 weights
+
+        GGML_OP_DSV41_ENGRAM_GATE, // sigmoid(copysign(sqrt(max(abs(x),1e-6)),x))
 
         GGML_OP_COUNT,
     };
@@ -1421,6 +1437,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 eps);
+
+    // Contiguous F32 input. F64 square-sum accumulation and reciprocal root;
+    // F32 square, mean, scale and output boundaries. Separate from fused RMSNorm.
+    GGML_API struct ggml_tensor * ggml_dsv41_engram_gate(struct ggml_context *, struct ggml_tensor *);
+    GGML_API struct ggml_tensor * ggml_dsv41_rms_norm(
+        struct ggml_context * ctx, struct ggml_tensor * a, float eps);
 
     GGML_API struct ggml_tensor * ggml_rms_norm(
             struct ggml_context * ctx,
@@ -2884,6 +2906,26 @@ extern "C" {
     // row is Hadamard-rotated and passed through the model's blockwise FP4
     // activation-simulation round trip. The operation is out-of-place so the
     // pre-QAT query remains available to the main attention path.
+    // Modes: 0 = FP4/group32/E8M0 (index), 1 = FP4/group16/E4M3 (KV),
+    // 2 = FP8/group32/E8M0 (window). Contiguous BF16 input/output.
+    // Q BF16 [512,heads,queries], raw/optional compressed BF16 [512,rows],
+    // sink F32 [heads], selection I32 [selected,queries] in logical raw+compressed
+    // order. -1 is padding. Output BF16 matches Q shape. No RoPE is implicit.
+    // Raw I8 E4M3 weight bytes [columns,rows], I8 E8M0 scales
+    // [ceil(columns/32),ceil(rows/32)], BF16 input [columns,tokens].
+    // Input activation rounding is the caller's responsibility. BF16 output.
+    GGML_API struct ggml_tensor * ggml_dsv41_fp8_matmul(
+        struct ggml_context * ctx, struct ggml_tensor * weight,
+        struct ggml_tensor * scales, struct ggml_tensor * input);
+
+    GGML_API struct ggml_tensor * ggml_dsv41_sparse_attn(
+        struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * raw,
+        struct ggml_tensor * compressed, struct ggml_tensor * sinks,
+        struct ggml_tensor * indices, float scale);
+
+    GGML_API struct ggml_tensor * ggml_dsv41_cache_quant(
+            struct ggml_context * ctx, struct ggml_tensor * input, int mode);
+
     GGML_API struct ggml_tensor * ggml_ds4_indexer_qat(
             struct ggml_context * ctx,
             struct ggml_tensor  * input);
@@ -3539,6 +3581,21 @@ extern "C" {
     // the tensor's data pointer here. Decoding an unregistered GQH tensor aborts.
     GGML_API void ggml_gqh_register(const void * base, size_t nbytes, float tensor_scale, int grid_code);
     GGML_API void ggml_gqh_unregister(const void * base);
+    // Attach ternary AWQ column divisors to an already registered 2D tensor.
+    // Host values are validated and copied. backend_values, when non-null, must
+    // contain identical F32 values on the weight's device and remain alive until
+    // all users are synchronized and the weight is unregistered. A null backend
+    // pointer permits CPU decoding only. Re-registering the header clears this
+    // metadata. Registration/unregistration must not race in-flight operations.
+    GGML_API bool ggml_gqh_register_ternary_input_scale(
+            const struct ggml_tensor * weights, const float * host_values,
+            int64_t columns, const void * backend_values);
+    // Scalar GQH compensation for GGML_PREC_GQH_BF16_F32 MUL_MAT only.
+    // Same ownership/lifetime rules as ternary scales; generic fast GQH paths
+    // and CPU to_float do not implement this compensated research contract.
+    GGML_API bool ggml_gqh_register_research_input_scale(
+            const struct ggml_tensor * weights, const float * host_values,
+            int64_t columns, const void * backend_values);
 
     // The int8 weight-LUT denominator for a rung's level grid, and the level error
     // it leaves. Every GQH grid's amax is exactly 1.0, so baking the codebook to

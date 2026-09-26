@@ -1889,6 +1889,16 @@ if(LUCE_TESTS)
         add_test(NAME test_gqh_headers COMMAND test_gqh_headers)
     endif()
 
+    # Reuse the research runtime's conditioned ternary decode/lifetime gate.
+    # This checks the shared registry without requiring a model or a GPU.
+    add_executable(test_gqh_compensation test/test_gqh_compensation.cpp)
+    target_link_libraries(test_gqh_compensation PRIVATE ggml-base)
+    foreach(GQH_TERNARY_RUNG gqh_t gqh_t_g32_r4 gqh_t_g32_r3)
+        add_test(NAME test_gqh_compensation_${GQH_TERNARY_RUNG}
+            COMMAND test_gqh_compensation ${GQH_TERNARY_RUNG}
+                "${GQH_TEST_DIR}/gqh-vectors/${GQH_TERNARY_RUNG}_64x1024.wire.bin")
+    endforeach()
+
     # Shipped GQH3 5120x17408 gate/up pair + SWIGLU graph (Qwen3.8-GQH-Q3KXL FFN).
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gqh_pair_glu.cpp"
             AND EXISTS "${GQH_TEST_DIR}/gqh-vectors/gqh3_64x1024.wire.bin")

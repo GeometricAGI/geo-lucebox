@@ -25,3 +25,5 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // dflash: residual ADD + RMS_NORM + MUL fusion (see norm.cu)
 void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add_tensor, ggml_tensor * rms_tensor, ggml_tensor * mul_tensor);
+
+void ggml_cuda_op_dsv41_engram_gate(ggml_backend_cuda_context &, ggml_tensor *);

@@ -13,3 +13,7 @@ void ggml_cuda_op_ds4_indexer_score(
 void ggml_cuda_op_ds4_indexer_mask(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst);
+
+void ggml_cuda_op_dsv41_cache_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_dsv41_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

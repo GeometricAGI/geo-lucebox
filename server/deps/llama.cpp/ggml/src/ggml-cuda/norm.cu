@@ -564,6 +564,20 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
 }
 
+// Small DS4.1 source-cache rows: materialize F32 squares, sum in F64 so
+// reduction order cannot cross a downstream BF16/FP4 midpoint spuriously.
+static __global__ void dsv41_rms_norm_accurate(const float * x, float * y, int cols, float eps) {
+    const int row=blockIdx.x, lane=threadIdx.x;
+    __shared__ double partial[32];
+    double sum=0;
+    for(int i=lane;i<cols;i+=32) { float v=x[(int64_t)row*cols+i]; volatile float sq=v*v; sum+=double(sq); }
+    partial[lane]=sum; __syncthreads();
+    for(int offset=16;offset;offset/=2) { if(lane<offset)partial[lane]+=partial[lane+offset]; __syncthreads(); }
+    const float mean=float(partial[0]/double(cols));
+    const float scale=float(1.0/sqrt(double(mean+eps)));
+    for(int i=lane;i<cols;i+=32)y[(int64_t)row*cols+i]=x[(int64_t)row*cols+i]*scale;
+}
+
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
@@ -585,6 +599,12 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
+    if(dst->op==GGML_OP_DSV41_RMS_NORM) {
+        GGML_ASSERT(ggml_is_contiguous(src0) && ne00<=INT_MAX && ggml_nrows(src0)<=INT_MAX);
+        dsv41_rms_norm_accurate<<<ggml_nrows(src0),32,0,stream>>>(src0_d,dst_d,ne00,eps);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
@@ -814,4 +834,13 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+static __global__ void dsv41_engram_gate_kernel(const float * x,float * y,int64_t n) {
+    int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<n){if(isnan(x[i])){y[i]=x[i];return;}float z=copysignf(sqrtf(fmaxf(fabsf(x[i]),1e-6f)),x[i]);y[i]=1.f/(1.f+expf(-z));}
+}
+void ggml_cuda_op_dsv41_engram_gate(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
+    const auto n=ggml_nelements(dst);
+    dsv41_engram_gate_kernel<<<(n+255)/256,256,0,ctx.stream()>>>((const float *)dst->src[0]->data,(float *)dst->data,n);
 }

@@ -14,6 +14,8 @@ struct gqh_entry {
     size_t       nbytes;
     float        tensor_scale;
     int          grid_code;
+    std::vector<float> input_scale;
+    const void * backend_input_scale = nullptr;
 };
 std::mutex                  g_gqh_mtx;
 std::vector<gqh_entry>      g_gqh_registry;
@@ -45,6 +47,48 @@ bool ggml_gqh_lookup(const void * p, float * tensor_scale, int * grid_code) {
         if ((const uint8_t *) p >= b && (const uint8_t *) p < b + e.nbytes) {
             *tensor_scale = e.tensor_scale;
             *grid_code    = e.grid_code;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool gqh_register_input_scale(const ggml_tensor * w, const float * host,
+                                         int64_t columns, const void * backend) {
+    if (!w || !host || columns <= 0 || columns != w->ne[0] || columns % 256 ||
+        w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w)) return false;
+    for (int64_t i = 0; i < columns; ++i) {
+        if (!std::isfinite(host[i]) || host[i] <= 0) return false;
+    }
+    std::lock_guard<std::mutex> lk(g_gqh_mtx);
+    for (auto & e : g_gqh_registry) {
+        if (e.base == w->data && e.nbytes == ggml_nbytes(w)) {
+            e.input_scale.assign(host, host + columns);
+            e.backend_input_scale = backend;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_gqh_register_ternary_input_scale(const ggml_tensor * w,const float * host,int64_t columns,const void * backend) {
+    return w && (w->type==GGML_TYPE_GQH_T || w->type==GGML_TYPE_GQH_T_G32_R4 || w->type==GGML_TYPE_GQH_T_G32_R3)
+        && gqh_register_input_scale(w,host,columns,backend);
+}
+bool ggml_gqh_register_research_input_scale(const ggml_tensor * w,const float * host,int64_t columns,const void * backend) {
+    return w && (w->type==GGML_TYPE_GQH2_H || w->type==GGML_TYPE_GQH3 || w->type==GGML_TYPE_GQH4)
+        && gqh_register_input_scale(w,host,columns,backend);
+}
+
+bool ggml_gqh_lookup_input_scale(const void * p, const float ** host, const void ** backend,
+                                 int64_t * columns, size_t * offset) {
+    std::lock_guard<std::mutex> lk(g_gqh_mtx);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(p);
+    for (const auto & e : g_gqh_registry) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(e.base);
+        if (address >= base && address - base < e.nbytes && !e.input_scale.empty()) {
+            *host = e.input_scale.data(); *backend = e.backend_input_scale;
+            *columns = e.input_scale.size(); *offset = address - base;
             return true;
         }
     }
@@ -380,6 +424,44 @@ void dequantize_row_gqh4(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y,
     }
 }
 
+template<int GROUP, int BITS>
+static void dequantize_row_ternary(const void * vx, float * y, int64_t k) {
+    constexpr int ratios = GROUP == 16 ? 8 : BITS;
+    constexpr int stride = 1 + ratios + 52;
+    float scale; int code;
+    gqh_header_or_abort(vx, k, stride, &scale, &code);
+    GGML_ASSERT(code == 0 && std::isfinite(scale) && scale > 0);
+    const float * input_scale = nullptr; const void * backend_scale = nullptr;
+    int64_t columns = 0; size_t offset = 0;
+    const bool compensated = ggml_gqh_lookup_input_scale(vx, &input_scale, &backend_scale, &columns, &offset);
+    GGML_ASSERT(!compensated || offset % stride == 0);
+    const size_t first_column = compensated ? ((offset / stride) * 256) % columns : 0;
+    const uint8_t * b = static_cast<const uint8_t *>(vx);
+    constexpr int powers[5] = {1, 3, 9, 27, 81};
+    for (int64_t sb = 0; sb < k/256; ++sb, b += stride) {
+        GGML_ASSERT((b[0] & 127) != 127);
+        for (int j=0;j<52;++j) GGML_ASSERT(b[1+ratios+j] < (j == 51 ? 3 : 243));
+        const int exponent=(b[0]>>3)&15, mantissa=b[0]&7;
+        float d = exponent ? std::ldexp(1.0f+float(mantissa)*0.125f,exponent-7) : std::ldexp(float(mantissa),-9);
+        if (b[0]&128) d=-d;
+        const float real=d*scale;
+        for (int j=0;j<256;++j) {
+            const int bit=(j/GROUP)*BITS;
+            unsigned ratio=b[1+bit/8]>>(bit%8);
+            if (bit%8+BITS>8) ratio|=unsigned(b[2+bit/8])<<(8-bit%8);
+            ratio&=(1<<BITS)-1;
+            const float subscale=real*(float(ratio)/float((1<<BITS)-1));
+            const int trit=(b[1+ratios+j/5]/powers[j%5])%3-1;
+            y[sb*256+j]=float(trit)*subscale;
+            if (compensated) y[sb*256+j] /= input_scale[(first_column + sb*256+j) % columns];
+        }
+    }
+}
+
+void dequantize_row_gqh_t(const void * x, float * y, int64_t k) { dequantize_row_ternary<16,4>(x,y,k); }
+void dequantize_row_gqh_t_g32_r4(const void * x, float * y, int64_t k) { dequantize_row_ternary<32,4>(x,y,k); }
+void dequantize_row_gqh_t_g32_r3(const void * x, float * y, int64_t k) { dequantize_row_ternary<32,3>(x,y,k); }
+
 void dequantize_row_gqh2_h(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
     float scale;
     int   code;
@@ -431,3 +513,13 @@ void dequantize_row_gqh2_c(const void * GGML_RESTRICT vx, float * GGML_RESTRICT 
         }
     }
 }
+
+// Losslessly repacked research INT3: each group keeps its original F32 scale.
+template<int GROUP> static void dequantize_dsv41_int3(const void * vx,float * y,int64_t k){
+ GGML_ASSERT(k%GROUP==0);constexpr int stride=4+GROUP*3/8;const auto * x=static_cast<const uint8_t *>(vx);
+ for(int64_t g=0;g<k/GROUP;++g){const auto * b=x+g*stride;float scale;memcpy(&scale,b,4);
+  for(int j=0;j<GROUP;++j){int bit=j*3,shift=bit%8;unsigned code=b[4+bit/8]>>shift;if(shift+3>8)code|=unsigned(b[5+bit/8])<<(8-shift);y[g*GROUP+j]=(int(code&7)-4)*scale;}
+ }
+}
+void dequantize_row_dsv41_int3_g64(const void * x,float * y,int64_t k){dequantize_dsv41_int3<64>(x,y,k);}
+void dequantize_row_dsv41_int3_g128(const void * x,float * y,int64_t k){dequantize_dsv41_int3<128>(x,y,k);}

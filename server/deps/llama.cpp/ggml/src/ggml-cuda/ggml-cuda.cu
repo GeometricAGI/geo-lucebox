@@ -39,6 +39,10 @@
 #include "ggml-cuda/moe-fused-combine.cuh"
 #include "ggml-cuda/rocmfp3_mix.cuh"
 #include "ggml-cuda/gqh.cuh"
+#include "ggml-cuda/ternary.cuh"
+#include "ggml-cuda/research-gqh.cuh"
+#include "ggml-cuda/dsv41-fp8.cuh"
+#include "ggml-cuda/mxfp4-f32.cuh"
 #include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2819,6 +2823,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const ggml_tensor * dst  = tensor;
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+    if (ggml_cuda_mxfp4_f32_supported(src0, src1, dst)) return false;
 
     bool use_mul_mat_vec_f =
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
@@ -2855,6 +2860,7 @@ static inline void ggml_cuda_set_fusion_glu_params(ggml_cuda_mm_fusion_args_host
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+    if(tensor->op==GGML_OP_MUL_MAT && ggml_get_op_params_i32(tensor,0)==GGML_PREC_RESEARCH_BF16_F32)return false;
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2960,6 +2966,8 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         ggml_tensor * gate,
         ggml_tensor * up,
         ggml_tensor * glu) {
+    if((gate->op==GGML_OP_MUL_MAT&&ggml_get_op_params_i32(gate,0)==GGML_PREC_RESEARCH_BF16_F32)||
+       (up->op==GGML_OP_MUL_MAT&&ggml_get_op_params_i32(up,0)==GGML_PREC_RESEARCH_BF16_F32))return false;
     const ggml_tensor * src0 = up->src[0];
     const ggml_tensor * src1 = up->src[1];
     const ggml_tensor * ids  = up->src[2];
@@ -3258,6 +3266,20 @@ static bool gqh_census_type(enum ggml_type t) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
     const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
+    if(ggml_get_op_params_i32(dst,0)==GGML_PREC_RESEARCH_BF16_F32){
+        GGML_ASSERT(!split&&!grouped_src&&ggml_cuda_research_gqh_supported(src0,src1,dst));
+        ggml_cuda_research_gqh_mul_mat(src0,src1,dst,ctx.stream());return;
+    }
+    if (!split && !grouped_src && ggml_cuda_mxfp4_f32_supported(src0,src1,dst)) {
+        ggml_cuda_mxfp4_f32(src0,src1,dst,ctx.stream());
+        return;
+    }
+    if (ggml_cuda_ternary_type(src0->type)) {
+        GGML_ASSERT(!split && !grouped_src && ggml_cuda_ternary_supported(src0,src1,dst));
+        ggml_cuda_ternary_mul_mat(src0,src1,dst,ctx.stream());
+        return;
+    }
+
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -3916,6 +3938,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DS4_HC:
             ggml_cuda_op_ds4_hc(ctx, dst);
             break;
+        case GGML_OP_DSV41_FP8_MATMUL:
+            ggml_cuda_op_dsv41_fp8_matmul(ctx,dst);
+            break;
+        case GGML_OP_DSV41_SPARSE_ATTN:
+            ggml_cuda_op_dsv41_sparse_attn(ctx,dst);
+            break;
+        case GGML_OP_DSV41_CACHE_QUANT:
+            ggml_cuda_op_dsv41_cache_quant(ctx,dst);
+            break;
         case GGML_OP_DS4_INDEXER_QAT:
             ggml_cuda_op_ds4_indexer_qat(ctx, dst);
             break;
@@ -3958,6 +3989,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SILU_BACK:
             ggml_cuda_op_silu_back(ctx, dst);
             break;
+        case GGML_OP_DSV41_ENGRAM_GATE:
+            ggml_cuda_op_dsv41_engram_gate(ctx,dst);
+            break;
+        case GGML_OP_DSV41_RMS_NORM:
         case GGML_OP_RMS_NORM:
             ggml_cuda_op_rms_norm(ctx, dst);
             break;
@@ -6699,6 +6734,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // These research-only types have no generic quantized GPU fallback.
+    for(int i=0;i<GGML_MAX_SRC;++i)if(op->src[i] &&
+       (op->src[i]->type==GGML_TYPE_DSV41_INT3_G64||op->src[i]->type==GGML_TYPE_DSV41_INT3_G128)){
+        if(op->op==GGML_OP_NONE||op->op==GGML_OP_VIEW||op->op==GGML_OP_RESHAPE||op->op==GGML_OP_TRANSPOSE||op->op==GGML_OP_PERMUTE)continue;
+        if(i!=0||op->op!=GGML_OP_MUL_MAT||ggml_get_op_params_i32(op,0)!=GGML_PREC_RESEARCH_BF16_F32)return false;
+    }
+
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
     // split buffers can only be used with GGML_OP_MUL_MAT
@@ -6774,6 +6816,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_DS4_HC:
             return true;
+        case GGML_OP_DSV41_ENGRAM_GATE:
+            return op->type==GGML_TYPE_F32 && op->src[0]->type==GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) && ggml_nelements(op)<=INT_MAX;
+        case GGML_OP_DSV41_RMS_NORM:
+            return op->src[0]->type==GGML_TYPE_F32 && op->type==GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) && op->ne[0]<=INT_MAX && ggml_nrows(op)<=INT_MAX;
+        case GGML_OP_DSV41_FP8_MATMUL:
+            return op->src[0]->type==GGML_TYPE_I8 && op->src[1]->type==GGML_TYPE_I8 &&
+                op->src[2]->type==GGML_TYPE_BF16 && op->type==GGML_TYPE_BF16;
+        case GGML_OP_DSV41_SPARSE_ATTN:
+            return op->type==GGML_TYPE_BF16 && op->ne[0]==512 && ggml_is_contiguous(op->src[0]);
+        case GGML_OP_DSV41_CACHE_QUANT: {
+            int mode=ggml_get_op_params_i32(op,0);
+            return mode>=0 && mode<=2 && op->type==GGML_TYPE_BF16 &&
+                op->src[0]->type==GGML_TYPE_BF16 && ggml_is_contiguous(op->src[0]) &&
+                op->src[0]->ne[0]%(mode==1?16:32)==0;
+        }
         case GGML_OP_DS4_INDEXER_QAT:
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] == 128 &&
@@ -6820,6 +6879,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if(op->op!=GGML_OP_MUL_MAT_ID&&ggml_get_op_params_i32(op,0)==GGML_PREC_RESEARCH_BF16_F32){
+                    return op->op==GGML_OP_MUL_MAT&&(!a->buffer||!ggml_backend_buft_is_cuda_split(a->buffer->buft))&&ggml_cuda_research_gqh_supported(a,b,op);
+                }
+                if (ggml_cuda_ternary_type(a->type)) {
+                    return op->op==GGML_OP_MUL_MAT &&
+                        (!a->buffer || !ggml_backend_buft_is_cuda_split(a->buffer->buft)) &&
+                        ggml_cuda_ternary_supported(a,b,op);
+                }
+
                 if (ggml_mul_mat_is_grouped_src(op)) {
                     const ggml_tensor * physical = b->view_src;
                     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;

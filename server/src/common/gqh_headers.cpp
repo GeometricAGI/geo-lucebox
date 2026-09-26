@@ -41,12 +41,12 @@ struct gqh_kv_entry {
 };
 
 static bool gqh_qtype_has_header(int32_t q) {
-    return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H || q == GGML_TYPE_GQH4;
+    return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H || q == GGML_TYPE_GQH4 ||
+           q == GGML_TYPE_GQH_T || q == GGML_TYPE_GQH_T_G32_R4 || q == GGML_TYPE_GQH_T_G32_R3;
 }
 
 static bool gqh_qtype_is_matvec(int32_t q) {
-    return q == GGML_TYPE_GQH3 || q == GGML_TYPE_GQH2_H ||
-           q == GGML_TYPE_GQH2_C || q == GGML_TYPE_GQH4;
+    return gqh_qtype_has_header(q) || q == GGML_TYPE_GQH2_C;
 }
 
 bool ggml_context_has_gqh(ggml_context * ctx) {
@@ -167,7 +167,10 @@ bool register_gqh_headers(const std::string & gguf_path, ggml_context * ctx) {
             }
             off += 12;
             if (!gqh_qtype_has_header((int32_t) qtype)) {
-                return fail("'" + name + "': qtype " + std::to_string(qtype) + " is not 108/109/111");
+                return fail("'" + name + "': qtype " + std::to_string(qtype) + " is not a supported header-bearing GQH type");
+            }
+            if ((qtype == GGML_TYPE_GQH_T || qtype == GGML_TYPE_GQH_T_G32_R4 || qtype == GGML_TYPE_GQH_T_G32_R3) && grid_code != 0) {
+                return fail("ternary reserved header byte must be zero");
             }
             if (grid_code >= GQH_GRID_CODES_MAX) {
                 return fail("'" + name + "': grid code " + std::to_string(grid_code) +

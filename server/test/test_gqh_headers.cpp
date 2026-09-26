@@ -278,6 +278,17 @@ int main() {
               "gqh2_c budget 8 caps to 7");
     }
 
+    // Ternary layouts share the header transport but reserve grid code zero.
+    for (ggml_type type : {GGML_TYPE_GQH_T, GGML_TYPE_GQH_T_G32_R4, GGML_TYPE_GQH_T_G32_R3}) {
+        model m({ { "blk.0.ffn_gate.weight", type } });
+        const std::string good=write_kv_gguf(build_kv({
+            { "blk.0.ffn_gate.weight", uint32_t(type), 2.0f, 0 } }), ("gqh_hdr_ternary_"+std::to_string(type)).c_str());
+        check(register_gqh_headers(good,m.ctx), "ternary header registration");
+        const std::string bad=write_kv_gguf(build_kv({
+            { "blk.0.ffn_gate.weight", uint32_t(type), 2.0f, 1 } }), ("gqh_hdr_ternary_bad_"+std::to_string(type)).c_str());
+        check_refused(register_gqh_headers(bad,m.ctx), "ternary reserved code is not a grid parameter");
+    }
+
     for (const std::string & f : tmp_files) {
         std::remove(f.c_str());
     }

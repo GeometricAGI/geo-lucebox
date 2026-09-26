@@ -6,7 +6,7 @@
 // which is what the loader fills from GGUF KV; this test registers the same way.
 // gqh2_c needs no registration at all.
 //
-// usage: test-gqh-cpu-decode <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32>
+// usage: test-gqh-cpu-decode <gqh3|gqh2_h|gqh2_c|gqh4|gqh_t|gqh_t_g32_r4|gqh_t_g32_r3> <rows> <cols> <wire.bin> <decode.f32>
 // exit:  0 = bit-identical, 1 = mismatch or error
 
 #include "ggml.h"
@@ -32,7 +32,7 @@ static bool read_file(const char * path, std::vector<uint8_t> & out) {
 
 int main(int argc, char ** argv) {
     if (argc != 6) {
-        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c|gqh4> <rows> <cols> <wire.bin> <decode.f32>\n", argv[0]);
+        fprintf(stderr, "usage: %s <gqh3|gqh2_h|gqh2_c|gqh4|gqh_t|gqh_t_g32_r4|gqh_t_g32_r3> <rows> <cols> <wire.bin> <decode.f32>\n", argv[0]);
         return 1;
     }
     const std::string rung = argv[1];
@@ -44,6 +44,9 @@ int main(int argc, char ** argv) {
     else if (rung == "gqh2_h") { type = GGML_TYPE_GQH2_H; }
     else if (rung == "gqh4")   { type = GGML_TYPE_GQH4; }
     else if (rung == "gqh2_c") { type = GGML_TYPE_GQH2_C; }
+    else if (rung == "gqh_t") { type = GGML_TYPE_GQH_T; }
+    else if (rung == "gqh_t_g32_r4") { type = GGML_TYPE_GQH_T_G32_R4; }
+    else if (rung == "gqh_t_g32_r3") { type = GGML_TYPE_GQH_T_G32_R3; }
     else { fprintf(stderr, "unknown rung %s\n", rung.c_str()); return 1; }
 
     const bool has_header = type != GGML_TYPE_GQH2_C;
