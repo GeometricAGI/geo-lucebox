@@ -93,5 +93,17 @@ python server/tests/test_ds41_tokenizer_parity.py \
   --requests /data/frozen/requests-gpu-*.json
 ```
 
+The DS4 sparse D=512 attention implementation is available to CUDA and HIP.
+`ds41_attention_cuda` compares masked/indexed F16 and F32 cache attention,
+including sink normalization, with an independent scalar oracle. It covers
+255/256/257 and 2048 cache rows, single-token and batched queries, and changed
+inputs on graph replay. `ds4_maskless_prefill_*` additionally checks explicit
+masks against analytic visibility, inverse RoPE, compressed-cache ratios 1/2/4,
+and long-context selected-row schedules on either backend.
+
+```sh
+ctest --test-dir server/build -R 'ds41_attention_cuda|ds4_maskless_prefill_' --output-on-failure
+```
+
 CUDA/H200 is the initial execution target. A successful CUDA gate does not qualify
 HIP, Lucebox placement, concurrent paged execution, or whole-model golden quality.

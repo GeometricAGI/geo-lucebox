@@ -40,7 +40,14 @@ extern "C" size_t ggml_backend_cuda_get_fattn_wmma256_launch_count(void) {
     return g_fattn_wmma256_launch_count;
 }
 
+// DS4 sparse D=512 attention uses portable CUDA/HIP kernels.
+__device__ static unsigned long long ds4_fa_ballot(int predicate) {
 #if defined(GGML_USE_HIP)
+    return __ballot(predicate);
+#else
+    return __ballot_sync(0xffffffffu, predicate);
+#endif
+}
 
 __device__ static float ds4_fa_block_sum(float v) {
     __shared__ float smem[256];
@@ -303,7 +310,7 @@ __global__ static void ds4_fa_visibility_bounds_kernel(
 
     for (int base = 0; base < raw_rows; base += warpSize) {
         const int r = base + lane;
-        const unsigned long long active = __ballot(
+        const unsigned long long active = ds4_fa_ballot(
             r < raw_rows &&
             ds4_fa_load<Mask, Mask>(token_mask + r) > -1.0e20f);
         if (lane == 0 && active != 0) {
@@ -315,7 +322,7 @@ __global__ static void ds4_fa_visibility_bounds_kernel(
     }
     for (int base = raw_rows; base < n_kv; base += warpSize) {
         const int r = base + lane;
-        const unsigned long long active = __ballot(
+        const unsigned long long active = ds4_fa_ballot(
             r < n_kv &&
             ds4_fa_load<Mask, Mask>(token_mask + r) > -1.0e20f);
         if (lane == 0 && active != 0) {
@@ -502,7 +509,7 @@ __global__ static void ds4_fa_indexed_rows_parallel_kernel(
         const int c = base + tid;
         const bool selected = c < n_comp_rows &&
             ds4_fa_load<Mask, Mask>(token_mask + raw_rows + c) > -1.0e20f;
-        const unsigned long long selected_bits = __ballot(selected);
+        const unsigned long long selected_bits = ds4_fa_ballot(selected);
         if (lane == 0) {
             warp_offsets[warp] = __popcll(selected_bits);
         }
@@ -948,7 +955,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         }
         for (int base = 0; base < raw_rows; base += warpSize) {
             const int r = base + lane;
-            const unsigned long long active = __ballot(
+            const unsigned long long active = ds4_fa_ballot(
                 r < raw_rows && scores[r] != 0.0f);
             if (lane == 0 && active != 0) {
                 if (value_bounds[0] == raw_rows) {
@@ -959,7 +966,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         }
         for (int base = raw_rows; base < n_kv; base += warpSize) {
             const int r = base + lane;
-            const unsigned long long active = __ballot(
+            const unsigned long long active = ds4_fa_ballot(
                 r < n_kv && scores[r] != 0.0f);
             if (lane == 0 && active != 0) {
                 if (value_bounds[2] == n_kv) {
@@ -1229,7 +1236,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
             }
             for (int base = 0; base < raw_rows; base += warpSize) {
                 const int r = base + lane;
-                const unsigned long long active = __ballot(
+                const unsigned long long active = ds4_fa_ballot(
                     r < raw_rows &&
                     scores[(size_t) j * n_kv + r] != 0.0f);
                 if (lane == 0 && active != 0) {
@@ -1241,7 +1248,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
             }
             for (int base = raw_rows; base < n_kv; base += warpSize) {
                 const int r = base + lane;
-                const unsigned long long active = __ballot(
+                const unsigned long long active = ds4_fa_ballot(
                     r < n_kv && scores[(size_t) j * n_kv + r] != 0.0f);
                 if (lane == 0 && active != 0) {
                     if (bounds[2] == n_kv) {
@@ -3618,7 +3625,6 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             device_warp_size == 32 && n_tokens >= streaming_min_tokens &&
             active_row_upper_bound > 0 &&
             n_kv >= 3 * active_row_upper_bound) {
-#if defined(GGML_USE_HIP)
             if (kv_f32) {
                 // Eight heads reuse each K/V load. Four adjacent values per
                 // thread share score loads and row-loop control while each
@@ -3646,7 +3652,6 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 ++g_mla_stream_topk_launch_count;
                 return true;
             }
-#endif
             // Off unless the gfx1151 profile sets GGML_CUDA_MLA_STREAM_WMMA;
             // =0 is the kill switch back to the scalar streaming kernel.
             const bool use_wmma = kv_f16 &&
@@ -3983,8 +3988,6 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     }
     return true;
 }
-
-#endif // defined(GGML_USE_HIP)
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -4600,14 +4603,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     if (ggml_flash_attn_ext_is_ds4(dst)) {
-#if defined(GGML_USE_HIP)
         if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {
             GGML_ABORT("unsupported DeepSeek4 D=512 flash-attention contract");
         }
         return;
-#else
-        GGML_ABORT("DeepSeek4 D=512 flash attention is only available on HIP");
-#endif // defined(GGML_USE_HIP)
     }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
@@ -4632,11 +4631,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (ggml_flash_attn_ext_is_ds4(dst)) {
-#if defined(GGML_USE_HIP)
         return ggml_cuda_ds4_flash_attn_d512_f32_supported(dst);
-#else
-        return false;
-#endif // defined(GGML_USE_HIP)
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

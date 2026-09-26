@@ -6,7 +6,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#if defined(GGML_USE_HIP)
 #include <hip/hip_runtime.h>
+#else
+#include <cuda_runtime.h>
+#endif
 #include <cstring>
 #include <vector>
 
@@ -15,11 +19,11 @@ static bool check(ggml_backend_t backend, int start, int tokens,
                   int expected_launches, bool require_byte_identity,
                   bool f32_kv = false, int heads = 16,
                   bool stress_weight_bounds = false, int window = 128,
-                  bool require_compact_identity = true) {
+                  bool require_compact_identity = true, int ratio = 4) {
     constexpr int dim = 512, selected = 512;
     const int prior = std::min(start, window);
     const int raw = prior + tokens;
-    const int compressed = (start + tokens) / 4;
+    const int compressed = (start + tokens) / ratio;
     const int rows = raw + compressed;
     ggml_init_params params{4u << 20, nullptr, true};
     ggml_context * ctx = ggml_init(params);
@@ -44,6 +48,7 @@ static bool check(ggml_backend_t backend, int start, int tokens,
         if (direct) ggml_flash_attn_ext_set_ds4_indexer_topk(out, topk);
         ggml_flash_attn_ext_set_ds4_inverse_rope(
             out, start, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 163840, true);
+        if (maskless) ggml_flash_attn_ext_set_ds4_causal_ratio(out, ratio);
         ggml_set_output(out);
         return out;
     };
@@ -115,7 +120,7 @@ static bool check(ggml_backend_t backend, int start, int tokens,
             for (int rank = 0; rank < selected; ++rank) {
                 const int row = (t * 17 + selected - 1 - rank) % compressed;
                 tv[size_t(t) * selected + rank] = row;
-                if (row < (start + t + 1) / 4) col[raw + row] = ggml_fp32_to_fp16(0.0f);
+                if (row < (start + t + 1) / ratio) col[raw + row] = ggml_fp32_to_fp16(0.0f);
             }
         }
         ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
@@ -204,17 +209,29 @@ int main(int argc, char ** argv) {
         configured = set_flag("GGML_DS4_FA_NO_SPLIT_KV", nullptr) && configured;
     }
     if (!configured) return 2;
+#if defined(GGML_USE_HIP)
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess || properties.warpSize != 32) {
         std::puts("SKIP: requires a native wave32 HIP device");
         return 77;
     }
+#else
+    cudaDeviceProp properties{};
+    if (cudaGetDeviceProperties(&properties, 0) != cudaSuccess || properties.warpSize != 32) {
+        std::puts("SKIP: requires a CUDA warp32 device");
+        return 77;
+    }
+#endif
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) return 1;
     // gfx1151 streams every eligible indexed shape by default (explicit-mask
     // and analytic requests alike), so the default mode dispatches twice
     // there; other wave32 devices default to the analytic ratio-4 request only.
+#if defined(GGML_USE_HIP)
     const bool gfx1151 = std::strstr(properties.gcnArchName, "gfx1151") != nullptr;
+#else
+    const bool gfx1151 = false;
+#endif
     const int expected_launches = defaults ? (gfx1151 ? 2 : 1) : disabled ? 0 : 2;
     bool ok = true;
     if (short_maskless) {
@@ -225,6 +242,9 @@ int main(int argc, char ** argv) {
         ok = check(backend, 4096, 8, 0, false, f32_kv, 16, false, 4, false);
         ggml_backend_free(backend);
         return ok ? 0 : 1;
+    }
+    for (int ratio : {1, 2}) {
+        ok = check(backend, 4096, 129, expected_launches, !defaults, f32_kv, 16, false, 128, true, ratio) && ok;
     }
     if (!defaults && !disabled) {
         ok = check(backend, 0, 10240, expected_launches, true, f32_kv);
