@@ -148,8 +148,12 @@ __global__ void hc_sumsq_kernel(const float * x, int n, float * sums) {
     if (tid == 0) sums[bid] = smem[0];
 }
 
+__device__ inline float hc_weight(__half value) { return __half2float(value); }
+__device__ inline float hc_weight(float value) { return value; }
+
+template<typename Weight>
 __global__ void hc_mix_kernel(const float * x,
-                              const __half * fn,
+                              const Weight * fn,
                               int cols,
                               float inv_rms,
                               float * mix) {
@@ -157,9 +161,9 @@ __global__ void hc_mix_kernel(const float * x,
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     float acc = 0.0f;
-    const __half * w = fn + (size_t)row * (size_t)cols;
+    const Weight * w = fn + (size_t)row * (size_t)cols;
     for (int c = tid; c < cols; c += blockDim.x) {
-        acc += __half2float(w[c]) * (x[c] * inv_rms);
+        acc += hc_weight(w[c]) * (x[c] * inv_rms);
     }
     smem[tid] = acc;
     __syncthreads();
@@ -421,8 +425,8 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
                                int           n_embd,
                                int           n_hc,
                                float         eps,
-                               float *       mix_host) {
-    return deepseek4_cuda_hc_pre_mix_batch(hc_state_host, 1, fn_device, n_embd, n_hc, eps, mix_host);
+                               float *       mix_host, bool fn_f32) {
+    return deepseek4_cuda_hc_pre_mix_batch(hc_state_host, 1, fn_device, n_embd, n_hc, eps, mix_host, fn_f32);
 }
 
 bool deepseek4_cuda_hc_pre_mix_batch(const float * hc_states_host,
@@ -431,12 +435,12 @@ bool deepseek4_cuda_hc_pre_mix_batch(const float * hc_states_host,
                                      int           n_embd,
                                      int           n_hc,
                                      float         eps,
-                                     float *       mix_host) {
+                                     float *       mix_host, bool fn_f32) {
     // The kernels are built for the mix of n_hc = 4 copies (kMixDim values:
     // pre, post and the 4 x 4 combination); the caller falls back to the
     // host path otherwise.
     if (!hc_states_host || !fn_device || !mix_host || n_tokens <= 0 || n_embd <= 0 ||
-        n_hc * (n_hc + 2) != kMixDim) {
+        n_embd > INT32_MAX/4 || n_hc * (n_hc + 2) != kMixDim) {
         return false;
     }
     const int hc_dim = n_embd * n_hc;
@@ -467,11 +471,13 @@ bool deepseek4_cuda_hc_pre_mix_batch(const float * hc_states_host,
         float ss = 0.0f;
         for (int i = 0; i < kSums; ++i) ss += sums[(size_t) t * kSums + i];
         const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
-        hc_mix_kernel<<<kMixDim, kThreads>>>(scratch.d_state + (size_t) t * hc_dim,
-                                             static_cast<const __half *>(fn_device),
-                                             hc_dim,
-                                             inv_rms,
-                                             scratch.d_mix + (size_t) t * kMixDim);
+        if (fn_f32) {
+            hc_mix_kernel<float><<<kMixDim, kThreads>>>(scratch.d_state + (size_t)t * hc_dim,
+                static_cast<const float *>(fn_device),hc_dim,inv_rms,scratch.d_mix + (size_t)t * kMixDim);
+        } else {
+            hc_mix_kernel<__half><<<kMixDim, kThreads>>>(scratch.d_state + (size_t)t * hc_dim,
+                static_cast<const __half *>(fn_device),hc_dim,inv_rms,scratch.d_mix + (size_t)t * kMixDim);
+        }
     }
     if (cudaGetLastError() != cudaSuccess) return false;
     if (cudaMemcpy(mix_host, scratch.d_mix, sizeof(float) * kMixDim * n_tokens,

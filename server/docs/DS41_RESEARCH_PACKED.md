@@ -79,7 +79,10 @@ multiple tokens, broadcast/per-route inputs, and repeated execution of one graph
 `test_packed_arena` checks allocation footprints, disjoint weights/scales and borrowed lifetimes.
 `test_ds4_engram` checks native split-table reads against interleaved rows, threaded
 reads, moves, overflow and overlap rejection. The existing conditioning tests cover
-registry ownership and lifetime.
+registry ownership and lifetime. `test_ds41_hc_f32` checks native F32 and legacy
+F16 hyper-connection projections against an independent CPU reference, including
+single-token and batched execution. Native F32 controllers remain F32 in both
+the CUDA projection and CPU fallback.
 
 ```sh
 ctest --test-dir server/build -R 'test_packed_(experts|arena)_|test_gqh_compensation_|DeepSeek4EngramFixture' --output-on-failure

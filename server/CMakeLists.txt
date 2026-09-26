@@ -1913,6 +1913,13 @@ if(LUCE_TESTS)
         add_test(NAME test_gqh_headers COMMAND test_gqh_headers)
     endif()
 
+    if(LUCE_GPU_BACKEND STREQUAL "cuda")
+        add_executable(test_ds41_hc_f32 test/test_ds41_hc_f32.cpp)
+        target_include_directories(test_ds41_hc_f32 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_ds41_hc_f32 PRIVATE luce_common ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+        add_test(NAME test_ds41_hc_f32 COMMAND test_ds41_hc_f32)
+    endif()
+
     add_executable(test_packed_arena test/test_packed_arena.cpp)
     target_include_directories(test_packed_arena PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src")
     target_link_libraries(test_packed_arena PRIVATE luce_common ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})

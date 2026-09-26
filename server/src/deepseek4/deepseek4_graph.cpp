@@ -3977,7 +3977,7 @@ static bool ds4_try_gpu_hc_pre(float * working,
                                int sinkhorn_iters,
                                float hc_eps) {
 #if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!fn_tensor || !fn_tensor->data) {
+    if (!fn_tensor || !fn_tensor->data || fn_tensor->type!=GGML_TYPE_F16) {
         return false;
     }
     return deepseek4_cuda_hc_pre(hc_state,
@@ -4809,6 +4809,7 @@ struct HcPreResult {
 // CUDA HC scalar parameters).
 struct HcWeightsCpu {
     std::vector<uint16_t> fn_data;   // [hc_dim * mix_dim] F16
+    std::vector<float> fn_data_f32;  // Preserve native F32 controller weights.
     std::vector<float> scale_data;   // [3]
     std::vector<float> base_data;    // [2*n_hc + n_hc*n_hc]
     bool loaded = false;
@@ -5161,6 +5162,17 @@ static bool ds4_hc_cuda_enabled() {
 #endif
 }
 
+static void cpu_hc_mix_f32(const float * state, const HcWeightsCpu & weights,
+                           int n_embd, int n_hc, float eps, float * flat, float * mix) {
+    const int cols=n_embd*n_hc, rows=2*n_hc+n_hc*n_hc;
+    cpu_rms_norm(flat,state,cols,eps);
+    for(int row=0;row<rows;++row) {
+        float sum=0;
+        for(int c=0;c<cols;++c)sum+=weights.fn_data_f32[size_t(row)*cols+c]*flat[c];
+        mix[row]=sum;
+    }
+}
+
 static HcPreResult hc_pre_auto(const float * hc_state,
                                const HcWeightsCpu & weights,
                                ggml_tensor * fn_tensor,
@@ -5169,10 +5181,11 @@ static HcPreResult hc_pre_auto(const float * hc_state,
                                int sinkhorn_iters,
                                float hc_eps) {
 #if defined(LUCE_BACKEND_CUDA)
-    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
+    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data &&
+        (fn_tensor->type==GGML_TYPE_F16 || fn_tensor->type==GGML_TYPE_F32)) {
         float mix[24];
         if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
-                                      n_embd, n_hc, hc_eps, mix)) {
+                                      n_embd, n_hc, hc_eps, mix, fn_tensor->type==GGML_TYPE_F32)) {
             return finish_hc_pre_from_mix(hc_state, mix,
                                           weights.scale_data.data(),
                                           weights.base_data.data(),
@@ -5182,6 +5195,11 @@ static HcPreResult hc_pre_auto(const float * hc_state,
 #else
     (void)fn_tensor;
 #endif
+    if (!weights.fn_data_f32.empty()) {
+        std::vector<float> flat(size_t(n_embd)*n_hc),mix(2*n_hc+n_hc*n_hc);
+        cpu_hc_mix_f32(hc_state,weights,n_embd,n_hc,hc_eps,flat.data(),mix.data());
+        return finish_hc_pre_from_mix(hc_state,mix.data(),weights.scale_data.data(),weights.base_data.data(),n_embd,n_hc,sinkhorn_iters);
+    }
     return cpu_hc_pre(hc_state, weights.fn_data.data(),
                       weights.scale_data.data(), weights.base_data.data(),
                       n_embd, n_hc, sinkhorn_iters, hc_eps);
@@ -5202,10 +5220,11 @@ static void hc_pre_auto_into(float * working,
                              bool serial_fn,
                              float * pre_out = nullptr) {
 #if defined(LUCE_BACKEND_CUDA)
-    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
+    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data &&
+        (fn_tensor->type==GGML_TYPE_F16 || fn_tensor->type==GGML_TYPE_F32)) {
         float mix[24];
         if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
-                                      n_embd, n_hc, hc_eps, mix)) {
+                                      n_embd, n_hc, hc_eps, mix, fn_tensor->type==GGML_TYPE_F32)) {
             finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
                                         weights.scale_data.data(),
                                         weights.base_data.data(),
@@ -5216,6 +5235,11 @@ static void hc_pre_auto_into(float * working,
 #else
     (void)fn_tensor;
 #endif
+    if (!weights.fn_data_f32.empty()) {
+        cpu_hc_mix_f32(hc_state,weights,n_embd,n_hc,hc_eps,flat,mix_scratch);
+        finish_hc_pre_from_mix_into(working,post,comb,hc_state,mix_scratch,weights.scale_data.data(),weights.base_data.data(),n_embd,n_hc,sinkhorn_iters,pre_out);
+        return;
+    }
     cpu_hc_pre_into(working, post, comb,
                     hc_state, weights.fn_data.data(),
                     weights.scale_data.data(), weights.base_data.data(),
@@ -5256,8 +5280,9 @@ static void hc_pre_batch(std::vector<float> & working,
         bool device_mix = false;
 #if defined(LUCE_BACKEND_CUDA)
         device_mix = ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data &&
+            (fn_tensor->type==GGML_TYPE_F16 || fn_tensor->type==GGML_TYPE_F32) &&
             deepseek4_cuda_hc_pre_mix_batch(hc_state, n_tokens, fn_tensor->data,
-                                            n_embd, n_hc, hc_eps, mix.data());
+                                            n_embd, n_hc, hc_eps, mix.data(), fn_tensor->type==GGML_TYPE_F32);
 #endif
         if (!device_mix) {
             std::vector<float> flat(hc_dim * (size_t) n_tokens);
@@ -5270,8 +5295,13 @@ static void hc_pre_batch(std::vector<float> & working,
                 for (int r = begin; r < end; ++r) {
                     const int t = r / mix_dim;
                     const int row = r % mix_dim;
-                    mix[(size_t) r] = cpu_dot_f16_row(fn + (size_t) row * hc_dim,
-                                                      flat.data() + (size_t) t * hc_dim, (int) hc_dim);
+                    if (weights.fn_data_f32.empty()) {
+                        mix[(size_t)r]=cpu_dot_f16_row(fn+(size_t)row*hc_dim,flat.data()+(size_t)t*hc_dim,(int)hc_dim);
+                    } else {
+                        float sum=0;
+                        for(size_t c=0;c<hc_dim;++c)sum+=weights.fn_data_f32[size_t(row)*hc_dim+c]*flat[size_t(t)*hc_dim+c];
+                        mix[size_t(r)]=sum;
+                    }
                 }
             });
         }
@@ -5475,12 +5505,14 @@ static bool load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
         dst.base_data.clear();
         return false;
     }
+    if(fn->type==GGML_TYPE_F32 && !load_tensor_to_f32_cpu(dst.fn_data_f32,fn)) return false;
     dst.loaded = true;
     return true;
 }
 
 static void reset_hc_weights_cpu(HcWeightsCpu & w) {
     w.fn_data.clear();
+    w.fn_data_f32.clear();
     w.scale_data.clear();
     w.base_data.clear();
     w.loaded = false;
