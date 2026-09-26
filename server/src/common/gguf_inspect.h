@@ -6,9 +6,12 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 
 namespace luce::common {
+
+std::string sha256_bytes(const uint8_t * data, size_t bytes);
 
 struct GgufModelInfo {
     std::string arch;       // e.g. "qwen35", "laguna", "qwen3", "gemma4"

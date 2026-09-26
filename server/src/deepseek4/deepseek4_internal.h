@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -119,7 +120,11 @@ struct DeepSeek4StepTelemetry {
 
 // ─── Per-layer tensor pointers ──────────────────────────────────────────
 
+struct DeepSeek4PackedExperts;
+
 struct DeepSeek4Layer {
+    // Descriptor tensors for immutable, individually packed gate/up/down experts.
+    std::array<ggml_tensor *,3> packed_experts{};
     // ── Attention ────────────────────────────────────────────────────
     ggml_tensor * attn_norm          = nullptr;  // [n_embd]
 
@@ -210,6 +215,8 @@ struct DeepSeek4Layer {
 // ─── Global weights ─────────────────────────────────────────────────────
 
 struct DeepSeek4Weights {
+    std::shared_ptr<DeepSeek4PackedExperts> packed_expert_owner;
+    std::string packed_research_directory, packed_native_index_sha256;
     ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;

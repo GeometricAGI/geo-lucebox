@@ -1,6 +1,7 @@
 // DeepSeek V4.1 Engram: init from loaded weights and the ggml apply subgraph.
 #include "deepseek4_engram.h"
 #include "deepseek4_internal.h"
+#include "common/dsv41_native_matrix.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -30,10 +31,24 @@ bool DeepSeek4EngramRuntime::init(const DeepSeek4Weights & w, const std::string 
     rows_read_ = 0;
     if (!hasher_.init(w, err)) return false;
     if (!hasher_.present()) return true;
+    std::unique_ptr<Dsv41NativeStore> native;
+    if (!w.packed_research_directory.empty()) {
+        try { native = std::make_unique<Dsv41NativeStore>(w.packed_research_directory, w.packed_native_index_sha256); }
+        catch (const std::exception & e) { if (err) *err = e.what(); return false; }
+    }
     for (int l = 0; l < hasher_.n_layers(); ++l) {
         const int il = hasher_.layer_id(l);
         const DeepSeek4Weights::Engram::Table * tab = nullptr;
         for (const auto & t : w.engram.tables) if (t.layer_id == il) tab = &t;
+        if (!tab && native) {
+            try {
+                auto source = native->engram("layers." + std::to_string(il) + ".engram.embed", hasher_.rows(l));
+                DeepSeek4EngramTable table;
+                if (!table.open_native(source.path, source.weight_offset, source.scale_offset, source.rows, err)) return false;
+                tables_.push_back(std::move(table));
+                continue;
+            } catch (const std::exception & e) { if (err) *err = e.what(); return false; }
+        }
         if (!tab || tab->rows == 0 || tab->row_bytes != (uint32_t) DeepSeek4EngramTable::kRowBytes) {
             if (err) *err = "engram: layer " + std::to_string(il) + " has no embedded 264-byte-row table in the GGUF "
                             "(PR #28696 files carry Q8_0 tables, which this reader does not decode)";

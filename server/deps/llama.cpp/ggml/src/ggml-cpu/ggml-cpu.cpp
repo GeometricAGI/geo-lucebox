@@ -1,4 +1,5 @@
 #include "ggml-backend.h"
+#include "ggml-packed-experts.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "repack.h"
@@ -421,6 +422,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (ggml_packed_experts_is_op(op)) return ggml_packed_experts_supports_device(op,dev);
     // No extra-buffer handler may accidentally advertise this HIP-only op.
     if (op->op == GGML_OP_MUL_MAT_BIAS_BF16 || op->op == GGML_OP_RMS_NORM_VISION_F32 ||
         op->op == GGML_OP_SOFT_MAX_VISION_F32 || op->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;

@@ -134,9 +134,29 @@ bool DeepSeek4EngramTable::open(const std::string & path, uint64_t offset, uint6
     return true;
 }
 
+bool DeepSeek4EngramTable::open_native(const std::string & path, uint64_t weight_offset,
+                                       uint64_t scale_offset, uint64_t rows, std::string * err) {
+    close();
+    if (!file_.open(path, /*direct=*/false, err)) {
+        if (err) *err = "native engram: " + *err;
+        return false;
+    }
+    const uint64_t size = file_.size();
+    bool valid = rows > 0 && weight_offset <= size && scale_offset <= size &&
+        rows <= (size - weight_offset) / kDim && rows <= (size - scale_offset) / 8;
+    if (valid) valid = weight_offset + rows * kDim <= scale_offset || scale_offset + rows * 8 <= weight_offset;
+    if (!valid) {
+        file_.close();
+        if (err) *err = "native engram: invalid or overlapping table extents";
+        return false;
+    }
+    offset_ = weight_offset; scale_offset_ = scale_offset; rows_ = rows; native_ = true;
+    return true;
+}
+
 void DeepSeek4EngramTable::close() {
     file_.close();
-    offset_ = 0; rows_ = 0;
+    offset_ = 0; rows_ = 0; scale_offset_ = 0; native_ = false;
 }
 
 namespace {
@@ -174,7 +194,12 @@ bool DeepSeek4EngramTable::read(const uint32_t * row_ids, size_t count, float * 
             if (i > begin && req[i].row == req[i - 1].row) {
                 std::memcpy(dst, previous, kDim * sizeof(float));
             } else {
-                if (!file_.read_at(offset_ + (uint64_t) req[i].row * kRowBytes, raw, kRowBytes) ||
+                const uint64_t row = req[i].row;
+                const bool read_ok = native_
+                    ? file_.read_at(offset_ + row * kDim, raw, kDim) &&
+                      file_.read_at(scale_offset_ + row * 8, raw + kDim, 8)
+                    : file_.read_at(offset_ + row * kRowBytes, raw, kRowBytes);
+                if (!read_ok ||
                     !decode_row(raw, dst)) {
                     errs[(size_t) p] = errno ? errno : EIO;
                     return;
@@ -199,7 +224,10 @@ bool DeepSeek4EngramTable::read(const uint32_t * row_ids, size_t count, float * 
 void DeepSeek4EngramTable::prefetch(const uint32_t * row_ids, size_t count) const {
     if (!file_.is_open()) return;
     for (size_t i = 0; i < count; ++i) {
-        if (row_ids[i] < rows_) file_.advise_willneed(offset_ + (uint64_t) row_ids[i] * kRowBytes, kRowBytes);
+        if (row_ids[i] >= rows_) continue;
+        const uint64_t stride = native_ ? kDim : kRowBytes;
+        if (native_) file_.advise_willneed(scale_offset_ + (uint64_t) row_ids[i] * 8, 8);
+        file_.advise_willneed(offset_ + (uint64_t) row_ids[i] * stride, stride);
     }
 }
 

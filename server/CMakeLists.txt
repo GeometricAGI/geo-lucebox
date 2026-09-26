@@ -562,6 +562,14 @@ add_library(luce_common STATIC
     src/gemma4/gemma4_layer_split_adapter.cpp
     # DeepSeek V4 Flash target arch (and V4.1 Flash)
     src/common/gqh_headers.cpp
+    src/common/dsv41_int3_payload.cpp
+    src/common/dsv41_native_fp4.cpp
+    src/common/dsv41_native_matrix.cpp
+    src/common/dsv41_nvfp4_payload.cpp
+    src/common/dsv41_packed_matrix.cpp
+    src/common/dsv41_research_artifact.cpp
+    src/common/dsv41_scale_palette.cpp
+    src/deepseek4/deepseek4_packed_experts.cpp
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_candidates.cpp
@@ -1025,6 +1033,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
     else()
         target_link_libraries(pflash_daemon PRIVATE hip::host)
     endif()
+endif()
+
+# Authenticate packed weights once at load with hardware-accelerated SHA when available.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    target_link_libraries(luce_common PUBLIC OpenSSL::Crypto)
+    set_property(SOURCE src/common/gguf_inspect.cpp APPEND PROPERTY COMPILE_DEFINITIONS LUCE_HAVE_OPENSSL=1)
+endif()
+
+# Exact DS4.1 Unicode pre-tokenization; other model families do not need PCRE2.
+find_path(LUCE_PCRE2_INCLUDE_DIR pcre2.h)
+find_library(LUCE_PCRE2_LIBRARY NAMES pcre2-8)
+if(LUCE_PCRE2_INCLUDE_DIR AND LUCE_PCRE2_LIBRARY)
+    target_include_directories(luce_common PRIVATE ${LUCE_PCRE2_INCLUDE_DIR})
+    target_link_libraries(luce_common PUBLIC ${LUCE_PCRE2_LIBRARY})
+    target_compile_definitions(luce_common PRIVATE LUCE_HAVE_PCRE2=1)
 endif()
 
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
@@ -1888,6 +1912,18 @@ if(LUCE_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include")
         add_test(NAME test_gqh_headers COMMAND test_gqh_headers)
     endif()
+
+    add_executable(test_packed_arena test/test_packed_arena.cpp)
+    target_include_directories(test_packed_arena PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src")
+    target_link_libraries(test_packed_arena PRIVATE luce_common ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME test_packed_arena_cpu COMMAND test_packed_arena cpu "${GQH_TEST_DIR}/gqh-vectors/gqh_t_64x1024.wire.bin")
+    add_test(NAME test_packed_arena_gpu COMMAND test_packed_arena cuda "${GQH_TEST_DIR}/gqh-vectors/gqh_t_64x1024.wire.bin")
+
+    add_executable(test_packed_experts test/test_packed_experts.cpp)
+    target_include_directories(test_packed_experts PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src")
+    target_link_libraries(test_packed_experts PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME test_packed_experts_cpu COMMAND test_packed_experts cpu "${GQH_TEST_DIR}/gqh-vectors")
+    add_test(NAME test_packed_experts_gpu COMMAND test_packed_experts cuda "${GQH_TEST_DIR}/gqh-vectors")
 
     # Reuse the research runtime's conditioned ternary decode/lifetime gate.
     # This checks the shared registry without requiring a model or a GPU.

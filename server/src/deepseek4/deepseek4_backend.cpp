@@ -4246,6 +4246,14 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
 
+        if (w_.packed_expert_owner) {
+            size_t nonfinite=0;
+            for(float v:logits) nonfinite += !std::isfinite(v);
+            if(logits.size()!=size_t(w_.n_vocab) || nonfinite) {
+                std::fprintf(stderr,"[deepseek41-packed] invalid logits: count=%zu nonfinite=%zu\n",logits.size(),nonfinite);
+                return false;
+            }
+        }
         int32_t next_token = 0;
         const auto sample_t0 = Clock::now();
         if (process_logits) {
@@ -4260,6 +4268,8 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                 }
             }
         }
+        if (w_.packed_expert_owner && generated<4 && env_flag_enabled("LUCE_DS41_PACKED_TRACE"))
+            std::fprintf(stderr,"[ds41-packed-trace] generated=%d token=%d logit=%g\n",generated,next_token,logits[next_token]);
         if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
 
         // Budget hook: steer the tail of the window into the close sequence, then let the model

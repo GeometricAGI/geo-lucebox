@@ -11,6 +11,10 @@
 #include <sys/stat.h>
 #include <vector>
 
+#ifdef LUCE_HAVE_OPENSSL
+#include <openssl/evp.h>
+#endif
+
 namespace luce::common {
 
 bool derive_effective_target_layer_count(const std::string & arch,
@@ -344,6 +348,26 @@ void write_sidecar_sha(const std::string & path, const std::string & sha, int64_
 }
 
 }  // namespace
+
+std::string sha256_bytes(const uint8_t * data, size_t bytes) {
+#ifdef LUCE_HAVE_OPENSSL
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int count = 0;
+    if (EVP_Digest(data, bytes, digest, &count, EVP_sha256(), nullptr) != 1 || count != 32) return {};
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result(64, '0');
+    for (size_t i = 0; i < 32; ++i) {
+        result[2*i] = hex[digest[i] >> 4];
+        result[2*i+1] = hex[digest[i] & 15];
+    }
+    return result;
+#else
+    Sha256Ctx c;
+    sha256_init(c);
+    sha256_update(c, data, bytes);
+    return sha256_final(c);
+#endif
+}
 
 GgufMetadata read_gguf_metadata(const std::string & path,
                                 bool compute_sha256) {

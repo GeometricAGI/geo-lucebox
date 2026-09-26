@@ -115,6 +115,7 @@ public:
     // A separate, unbuffered descriptor on the GGUF; `offset` is the absolute
     // byte offset of the table, `rows` its row count.
     bool open(const std::string & path, uint64_t offset, uint64_t rows, std::string * err);
+    bool open_native(const std::string & path, uint64_t weight_offset, uint64_t scale_offset, uint64_t rows, std::string * err);
     void close();
     bool is_open() const { return file_.is_open(); }
     uint64_t rows() const { return rows_; }
@@ -131,7 +132,8 @@ public:
 private:
     ReadOnlyFile file_;
     uint64_t offset_ = 0;
-    uint64_t rows_ = 0;
+    uint64_t rows_ = 0, scale_offset_ = 0;
+    bool native_ = false;
 };
 
 

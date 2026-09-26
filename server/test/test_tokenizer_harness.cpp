@@ -13,6 +13,7 @@
 //   → {"cmd":"quit"}
 
 #include "server/tokenizer.h"
+#include "server/chat_template.h"
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
@@ -45,7 +46,13 @@ int main(int argc, char ** argv) {
             json req = json::parse(line);
             std::string cmd = req.value("cmd", "");
 
-            if (cmd == "encode") {
+            if (cmd == "ds41_render") {
+                std::vector<ChatMessage> messages;
+                for (const auto & m : req.at("messages")) messages.push_back({m.at("role"),m.at("content"),""});
+                const auto rendered=render_chat_template(messages,chat_format_for_arch("deepseek41"),true,
+                    req.value("thinking",true),"",req.value("reasoning_effort",std::string("high")));
+                std::cout << json({{"text",rendered},{"ids",tok.encode(rendered)}}).dump() << "\n" << std::flush;
+            } else if (cmd == "encode") {
                 std::string text = req["text"].get<std::string>();
                 auto ids = tok.encode(text);
                 json resp = {{"ids", ids}};

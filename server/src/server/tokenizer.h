@@ -79,7 +79,7 @@ private:
     int32_t eos_chat_id_ = -1;  // <|im_end|> for Qwen3
 
     // Pre-tokenizer type
-    enum class PreTokenizer { QWEN2, QWEN35 };
+    enum class PreTokenizer { QWEN2, QWEN35, DEEPSEEK41 };
     PreTokenizer pre_type_ = PreTokenizer::QWEN35;
 
     // Decode mode: SentencePiece tokens use UTF-8 with ▁ for space;

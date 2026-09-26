@@ -40,6 +40,7 @@
 #include "ggml-cuda/rocmfp3_mix.cuh"
 #include "ggml-cuda/gqh.cuh"
 #include "ggml-cuda/ternary.cuh"
+#include "ggml-cuda/packed-experts.cuh"
 #include "ggml-cuda/research-gqh.cuh"
 #include "ggml-cuda/dsv41-fp8.cuh"
 #include "ggml-cuda/mxfp4-f32.cuh"
@@ -4003,6 +4004,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_GROUPED_SRC:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (!ggml_packed_experts_is_op(dst)) return false;
+            ggml_cuda_packed_experts(ctx, dst);
+            break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
@@ -6873,6 +6878,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     (op->src[2]->type == GGML_TYPE_F32 &&
                      op->src[2]->view_offs % sizeof(float4) == 0 &&
                      op->src[2]->nb[1] % sizeof(float4) == 0));
+        case GGML_OP_CUSTOM:
+            return ggml_packed_experts_supports_device(op,dev);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_GROUPED_SRC:
         case GGML_OP_MUL_MAT_ID:

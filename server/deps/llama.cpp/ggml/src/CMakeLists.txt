@@ -206,6 +206,7 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             gqh.cpp
+            ggml-packed-experts.cpp
             gqh.h
             gqh-tables.h
             ../rocmfp4/rocmfp4.c

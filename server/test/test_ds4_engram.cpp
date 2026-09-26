@@ -320,3 +320,32 @@ TEST_CASE(DeepSeek4EngramFixture, table_read_rejects_nan_codes) {
     const uint32_t id = 0;
     CHECK(!table.read(&id, 1, vals.data(), 1));
 }
+
+TEST_CASE(DeepSeek4EngramFixture, native_table_matches_interleaved_and_moves) {
+    auto r0=synthetic_row(0), r1=synthetic_row(1);
+    TempTable interleaved({r0,r1});
+    std::vector<uint8_t> split;
+    split.insert(split.end(),r0.begin(),r0.begin()+256);
+    split.insert(split.end(),r1.begin(),r1.begin()+256);
+    split.insert(split.end(),r0.begin()+256,r0.end());
+    split.insert(split.end(),r1.begin()+256,r1.end());
+    TempTable native({split});
+    DeepSeek4EngramTable a,b;
+    std::string error;
+    CHECK(a.open(interleaved.path,interleaved.offset,2,&error));
+    CHECK(b.open_native(native.path,native.offset,native.offset+512,2,&error));
+    DeepSeek4EngramTable moved(std::move(b));
+    CHECK(!b.is_open());
+    b=std::move(moved);
+    CHECK(!moved.is_open());
+    std::vector<uint32_t> ids(300);
+    for(size_t i=0;i<ids.size();++i)ids[i]=(i/3)%2;
+    b.prefetch(ids.data(),ids.size());
+    std::vector<float> expected(ids.size()*256),actual(expected.size());
+    CHECK(a.read(ids.data(),ids.size(),expected.data(),4));
+    CHECK(b.read(ids.data(),ids.size(),actual.data(),4));
+    CHECK(expected==actual);
+    CHECK(!b.open_native(native.path,native.offset,native.offset,2,&error));
+    CHECK(!b.open_native(native.path,UINT64_MAX-1,native.offset,2,&error));
+    CHECK(!b.open(native.path,native.offset,UINT64_MAX,&error));
+}

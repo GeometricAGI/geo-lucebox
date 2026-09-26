@@ -1,3 +1,4 @@
+#include "ggml-packed-experts.h"
 // DeepSeek V4 Flash ggml compute graph builder.
 //
 // Implements the full forward pass using ggml ops:
@@ -54,6 +55,16 @@
 #endif
 
 namespace luce::common {
+static ggml_tensor * ds4_packed_or_regular_product(ggml_context * ctx,const DeepSeek4Layer & layer,
+ int surface,ggml_tensor * regular,ggml_tensor * input,ggml_tensor * ids,int64_t rows) {
+    if (layer.packed_experts[surface]) {
+        if (!ggml_is_contiguous(input)) input = ggml_cont(ctx, input);
+        if (!ggml_is_contiguous(ids)) ids = ggml_cont(ctx, ids);
+        return ggml_packed_experts_mul_mat_id(ctx,layer.packed_experts[surface],input,ids,rows);
+    }
+    return ggml_mul_mat_id(ctx,regular,input,ids);
+}
+
 
 ggml_tensor * deepseek4_preserve_raw_rows(
         ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows) {
@@ -605,15 +616,15 @@ static bool build_cached_decode_ffn_graph(
 
         const int n_ff_exp = w.n_ff_exp;
         ggml_tensor * cur_3d = ggml_reshape_3d(out.sg.ctx, ffn_normed, w.n_embd, 1, n_tokens);
-        ggml_tensor * gate_e = ggml_mul_mat_id(out.sg.ctx, L.ffn_gate_exps, cur_3d, out.hash_ids);
-        ggml_tensor * up_e = ggml_mul_mat_id(out.sg.ctx, L.ffn_up_exps, cur_3d, out.hash_ids);
-        ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
-        ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
+        ggml_tensor * gate_e = ds4_packed_or_regular_product(out.sg.ctx, L, 0, L.ffn_gate_exps, cur_3d, out.hash_ids, w.n_ff_exp);
+        ggml_tensor * up_e = ds4_packed_or_regular_product(out.sg.ctx, L, 1, L.ffn_up_exps, cur_3d, out.hash_ids, w.n_ff_exp);
+        if (!ggml_packed_experts_is_op(gate_e)) ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
+        if (!ggml_packed_experts_is_op(up_e)) ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
         gate_e = ggml_reshape_3d(out.sg.ctx, gate_e, n_ff_exp, n_used, n_tokens);
         up_e = ggml_reshape_3d(out.sg.ctx, up_e, n_ff_exp, n_used, n_tokens);
         ggml_tensor * mid_e = build_clamped_swiglu(out.sg.ctx, gate_e, up_e, w.swiglu_clamp_exp);
-        ggml_tensor * down_e = ggml_mul_mat_id(out.sg.ctx, L.ffn_down_exps, mid_e, out.hash_ids);
-        ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
+        ggml_tensor * down_e = ds4_packed_or_regular_product(out.sg.ctx, L, 2, L.ffn_down_exps, mid_e, out.hash_ids, w.n_embd);
+        if (!ggml_packed_experts_is_op(down_e)) ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
         down_e = ggml_reshape_3d(out.sg.ctx, down_e, w.n_embd, n_used, n_tokens);
 
         ggml_tensor * probs_3d = ggml_reshape_3d(out.sg.ctx, probs, 1, w.n_expert, n_tokens);
@@ -4724,17 +4735,17 @@ static ggml_tensor * build_moe_ffn(
         Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens, selection_bias);
         n_used = (int) routing.selected->ne[0];
         ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
-        ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, routing.selected);
-        ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, routing.selected);
-        ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
-        ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
+        ggml_tensor * gate_e = ds4_packed_or_regular_product(ctx, L, 0, L.ffn_gate_exps, cur_3d, routing.selected, w.n_ff_exp);
+        ggml_tensor * up_e = ds4_packed_or_regular_product(ctx, L, 1, L.ffn_up_exps, cur_3d, routing.selected, w.n_ff_exp);
+        if (!ggml_packed_experts_is_op(gate_e)) ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
+        if (!ggml_packed_experts_is_op(up_e)) ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
 
         gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
         up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
         ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
 
-        ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, routing.selected);
-        ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
+        ggml_tensor * down_e = ds4_packed_or_regular_product(ctx, L, 2, L.ffn_down_exps, mid_e, routing.selected, w.n_embd);
+        if (!ggml_packed_experts_is_op(down_e)) ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
         down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
 
         if (ds4_moe_fused_combine_enabled()) {
@@ -6674,15 +6685,15 @@ static ggml_tensor * ds4_build_hash_routed_ffn(
     const int n_ff_exp = w.n_ff_exp;
     ggml_tensor * cur_3d = ggml_reshape_3d(
         ctx, ffn_normed, w.n_embd, 1, n_tokens);
-    ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, hash_ids);
-    ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, hash_ids);
-    ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
-    ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
+    ggml_tensor * gate_e = ds4_packed_or_regular_product(ctx, L, 0, L.ffn_gate_exps, cur_3d, hash_ids, w.n_ff_exp);
+    ggml_tensor * up_e = ds4_packed_or_regular_product(ctx, L, 1, L.ffn_up_exps, cur_3d, hash_ids, w.n_ff_exp);
+    if (!ggml_packed_experts_is_op(gate_e)) ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
+    if (!ggml_packed_experts_is_op(up_e)) ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
     gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
     up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
     ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
-    ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, hash_ids);
-    ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
+    ggml_tensor * down_e = ds4_packed_or_regular_product(ctx, L, 2, L.ffn_down_exps, mid_e, hash_ids, w.n_embd);
+    if (!ggml_packed_experts_is_op(down_e)) ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
     down_e = ggml_reshape_3d(ctx, down_e, w.n_embd, n_used, n_tokens);
 
     ggml_tensor * probs_3d = ggml_reshape_3d(
@@ -10208,6 +10219,14 @@ bool deepseek4_step_layer_range(
             }
         }
     };
+    const auto trace_packed_values = [&](const char * stage, int layer, const std::vector<float> & values) {
+        if (!w.packed_expert_owner || kv_start >= 2 || !ds4_env_flag("LUCE_DS41_PACKED_TRACE")) return;
+        size_t bad=0; double sum=0; float maximum=0;
+        for (float v:values) { if(!std::isfinite(v)) ++bad; else { sum+=double(v)*v; maximum=std::max(maximum,std::fabs(v)); } }
+        std::fprintf(stderr,"[ds41-packed-trace] pos=%d tokens=%d layer=%d stage=%s n=%zu nonfinite=%zu rms=%g max=%g\n",
+            kv_start,n_tokens,layer,stage,values.size(),bad,values.empty()?0:std::sqrt(sum/values.size()),maximum);
+    };
+    trace_packed_values("embedding",-1,hc_state);
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
@@ -10249,6 +10268,7 @@ bool deepseek4_step_layer_range(
             hc_state_backend = prefill_hc_post_graph.residual_hc;
         }
 
+        trace_packed_values("after_engram",il,hc_state);
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
         if (use_backend_prefill_hc) {
@@ -10872,6 +10892,8 @@ bool deepseek4_step_layer_range(
             }
         }
 
+        trace_packed_values("attention",il,attn_out_host);
+        trace_packed_values("after_attention",il,hc_state);
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
         if (trace_prefill) {
@@ -10991,6 +11013,7 @@ bool deepseek4_step_layer_range(
         }
         if (telemetry) telemetry->hc_pre_ffn_us += ds4_elapsed_us(hc_pre_ffn_t0, Ds4TimingClock::now());
 
+        trace_packed_values("ffn_input",il,ffn_working);
         // ── Build & run FFN graph ───────────────────────────────────
         {
             // Hash-routed layers: use pre-computed expert IDs from hash table
@@ -11220,6 +11243,8 @@ bool deepseek4_step_layer_range(
                 capture_hc_layer(il, hc_state.data());
             }
         }
+        trace_packed_values("ffn_output",il,ffn_out_host);
+        trace_packed_values("after_ffn",il,hc_state);
     }
 
     if ((use_backend_prefill_hc || use_backend_decode_hc_graph ||

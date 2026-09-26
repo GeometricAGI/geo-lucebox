@@ -1,3 +1,5 @@
+#include "deepseek4_packed_experts.h"
+#include <filesystem>
 // Loads DeepSeek V4 Flash ("deepseek4") and V4.1 Flash ("deepseek41") from a
 // GGUF file. Metadata keys are `<arch>.<key>`; the sidecar keys our encoder
 // writes (deepseek4.{p4mix,dmix,gumix}.sidecar) stay literal.
@@ -1860,6 +1862,32 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         out.arch = arch;
     }
     const bool is_v41 = out.arch == "deepseek41";
+    auto packed_string = [&](const char * key) -> std::string {
+        const int64_t id=gguf_find_key(gctx,key);
+        if(id<0)return {};
+        if(gguf_get_kv_type(gctx,id)!=GGUF_TYPE_STRING)return {};
+        return gguf_get_val_str(gctx,id);
+    };
+    bool packed_metadata_present=false, packed_metadata_valid=true;
+    for (const char * k : {"geoquant.research.artifact", "geoquant.research.manifest_sha256",
+                           "geoquant.research.source_index_sha256", "geoquant.research.native_index_sha256"}) {
+        const auto id=gguf_find_key(gctx,k);
+        if(id>=0) packed_metadata_present=true;
+        if(id<0 || packed_string(k).empty()) packed_metadata_valid=false;
+    }
+    if(packed_metadata_present && !packed_metadata_valid) {
+        set_last_error("incomplete or malformed packed research metadata");
+        gguf_free(gctx);ggml_free(meta_ctx);return false;
+    }
+    const std::string packed_root=packed_string("geoquant.research.artifact");
+    const std::string packed_manifest=packed_string("geoquant.research.manifest_sha256");
+    const std::string packed_source=packed_string("geoquant.research.source_index_sha256");
+    const std::string packed_index=packed_string("geoquant.research.native_index_sha256");
+    if(!packed_root.empty() && (!is_v41 || plan_in.skip_expert_tensors || plan_in.expert_metadata_only || plan_in.layer_begin!=0 || !plan_in.load_output || plan_in.metadata_only)) {
+        set_last_error("packed research experts require a full resident DS4.1 load");
+        gguf_free(gctx);ggml_free(meta_ctx);return false;
+    }
+
     // Every model key is `<arch>.<name>`. Two converters write deepseek41 files:
     // llama.cpp PR #28696 uses llama.cpp names (block_count, attention.head_count,
     // ...) and antirez's DwarfStar converter uses the HF config names
@@ -2175,6 +2203,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Build load plan ─────────────────────────────────────────────────
     TargetLoadPlan plan = plan_in;
     if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
+    if (!packed_root.empty() && plan.layer_end != int(n_layer)) return fail("packed research experts require all layers");
     if (plan.expert_metadata_only) {
         plan.load_output = false;
         plan.skip_expert_tensors = true;
@@ -2610,6 +2639,16 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         return false;
     }
 
+    if(!packed_root.empty()) {
+        std::string error;
+        const auto root=(std::filesystem::path(path).parent_path()/packed_root).lexically_normal();
+        if(!load_deepseek4_packed_experts(out,root.string(),packed_source,packed_manifest,packed_index,error)) {
+            set_last_error("packed expert load: "+error);
+            std::fprintf(stderr,"[deepseek41-packed] %s\n",error.c_str());
+            free_deepseek4_weights(out);return false;
+        }
+    }
+
     std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer, %.1f MB dense TP split%s\n",
                  allocs.size(), (double)total_buf_size / (1024.0 * 1024.0),
                  (double)split_total_buf_size / (1024.0 * 1024.0),
@@ -2848,6 +2887,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
 
 void free_deepseek4_weights(DeepSeek4Weights & w) {
     deepseek4_release_runtime_graphs(w);
+    w.packed_expert_owner.reset();
     // Drop expert registry entries before their GPU buffers. Otherwise reloads can
     // resolve a reused device address to stale decode tables.
     for (auto & L : w.layers) {
@@ -2892,6 +2932,8 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.routing_buf) { ggml_backend_buffer_free(w.routing_buf); w.routing_buf = nullptr; }
     if (w.routing_ctx) { ggml_free(w.routing_ctx); w.routing_ctx = nullptr; }
+    w.packed_research_directory.clear();
+    w.packed_native_index_sha256.clear();
     w.layers.clear();
     w.selection_bias_host.clear();
     w.embedder.tok_embd_owned.clear();

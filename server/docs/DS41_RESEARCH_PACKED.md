@@ -1,0 +1,94 @@
+# DS4.1 mixed research checkpoint bridge
+
+The `deepseek41` loader can attach a geo-quant research checkpoint to a GGUF
+containing the dense weights, model metadata, vocabulary and engram hash layout.
+Routed experts are authenticated and loaded once into shared per-layer GPU allocations, individually packed, onto the
+chosen backend. The production attention, routing and decode graphs dispatch
+through a packed-expert operation whose descriptors hold stable weight pointers.
+Changing routing IDs does not reload or re-quantize weights. Shared allocations avoid the large per-allocation GPU granularity overhead of tens of thousands of small expert buffers. The research runner's
+per-token matrix cache is not involved.
+
+Supported expert payloads: GQH ternary (16/4, 32/4 and 32/3 scale layouts), GQH2_H,
+GQH3, GQH4, INT3 group 64/128, NVFP4 and native MXFP4. Existing AWQ compensation
+is applied once, before BF16 rounding, using the authenticated artifact's scales.
+Native FP8 experts are rejected until a scaled binding is implemented. Each matrix
+retains its selected format; heterogeneous layers need no uniform-format padding.
+
+This first integration requires a complete, resident, single-device load. It does
+not implement cross-device expert placement, streaming experts, or a shipping GGUF
+encoding for these descriptors. Descriptors contain runtime device pointers and
+must never be serialized or migrated between backends. Their owning weights live
+until every referencing graph has been released.
+
+## Execution and storage contract
+
+Dense weights are decoded with geo-quant's reference codec into the envelope.
+Small normalization/routing tensors are widened exactly to F32. Expert weights
+are decoded to BF16 values within the routed product, with F32 accumulation.
+This preserves decoded **weights**, but is a new production execution contract:
+it does not claim the native research runner's FP8 activation rounding or identical
+whole-model output. Evaluate the engine against the frozen golden suite before
+using its results to make quantization quality claims.
+
+Native engram weight and scale ranges are resolved from the pinned native index,
+validated against safetensors metadata, and read with bounded `pread` calls. No
+extra interleaved copy of the roughly 189 GiB tables is needed. This path uses the
+OS page cache. The artifact must remain immutable while a server uses it; the
+native index identity pins the mapping, not the content of every native shard.
+
+The envelope is an additional dense-weight file. It does not reduce artifact
+storage or establish that a Lucebox deployment fits. Measure runtime residency,
+workspace and KV memory separately on the target hardware.
+
+## Build and export
+
+Build with the normal `LUCE_GPU_BACKEND=cuda` or HIP configuration. PCRE2 (`pcre2-8`
+headers and library) enables the exact three-pass DS4.1 Unicode pre-tokenizer.
+A build lacking PCRE2 explicitly rejects this tokenizer instead of silently using
+Qwen splitting. OpenSSL is optional and accelerates one-time payload SHA256 checks.
+
+Use a geo-quant checkout that provides the DS4.1 research codecs and an authenticated
+binding plan for the artifact:
+
+```sh
+python server/scripts/export_ds41_research_gguf.py \
+  --artifact /data/research-artifact \
+  --plan /data/model-plan.json \
+  --engram-layout /data/engram/layout.bin \
+  --engram-layout-sha256 <layout-sha256-from-manifest> \
+  --geoquant /path/to/geo-quant \
+  --output /data/production/model.gguf
+```
+
+The exporter refuses to overwrite an existing envelope, validates source identities,
+and writes through a partial file. The artifact path is relative to the envelope.
+Move both together or export another envelope when staging elsewhere. Temporary
+dense tensor spooling requires additional disk space during export.
+
+```sh
+CUDA_VISIBLE_DEVICES=0 server/build/luce_server /data/production/model.gguf \
+  --target-device cuda:0 --host 127.0.0.1 --port 8094 \
+  --max-ctx 16384 --chunk 32 --max-concurrency 1
+```
+
+## Validation
+
+`test_packed_experts` compares mixed-format CPU/CUDA products with the existing
+independent row decoders, including non-identity AWQ, changed and duplicate routes,
+multiple tokens, broadcast/per-route inputs, and repeated execution of one graph.
+`test_packed_arena` checks allocation footprints, disjoint weights/scales and borrowed lifetimes.
+`test_ds4_engram` checks native split-table reads against interleaved rows, threaded
+reads, moves, overflow and overlap rejection. The existing conditioning tests cover
+registry ownership and lifetime.
+
+```sh
+ctest --test-dir server/build -R 'test_packed_(experts|arena)_|test_gqh_compensation_|DeepSeek4EngramFixture' --output-on-failure
+python server/tests/test_ds41_tokenizer_parity.py \
+  --harness server/build/test_tokenizer_harness \
+  --gguf /data/production/model.gguf \
+  --tokenizer /data/research-artifact/tokenizer.json \
+  --requests /data/frozen/requests-gpu-*.json
+```
+
+CUDA/H200 is the initial execution target. A successful CUDA gate does not qualify
+HIP, Lucebox placement, concurrent paged execution, or whole-model golden quality.

@@ -65,6 +65,7 @@ static void append_available_tools(std::string & result,
 }
 
 ChatFormat chat_format_for_arch(const std::string & arch) {
+    if (arch == "deepseek41") return ChatFormat::DEEPSEEK41;
     if (arch_is_deepseek4_family(arch)) return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
@@ -469,6 +470,7 @@ std::string render_chat_template(
         break;
     }
 
+    case ChatFormat::DEEPSEEK41:
     case ChatFormat::DEEPSEEK4: {
         // DeepSeek V4 Flash DSML renderer, matching the ds4 reference server:
         //   <｜begin▁of▁sentence｜>{system}<｜User｜>{user}<｜Assistant｜></think>
@@ -481,7 +483,14 @@ std::string render_chat_template(
         }
 
         result = "<｜begin▁of▁sentence｜>";
-        if (enable_thinking && reasoning_effort == "high") {
+        if (format == ChatFormat::DEEPSEEK41) {
+            if (enable_thinking || !system_content.empty() || !tools_json.empty()) result += "<｜System｜>";
+            if (enable_thinking) {
+                const int effort = reasoning_effort == "low" ? 50 : reasoning_effort == "max" ? 100 : 75;
+                result += "Reasoning Effort: " + std::to_string(effort) +
+                    " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+            }
+        } else if (enable_thinking && reasoning_effort == "high") {
             result += "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n";
             result += "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n";
             result += "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";

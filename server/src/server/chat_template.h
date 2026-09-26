@@ -27,6 +27,7 @@ enum class ChatFormat {
     BAILINGMOE3, // <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
     LAGUNA,    // <|begin_of_sentence|><|User|>...<|Assistant|>
     GEMMA4,    // <bos><|turn>role\n...<turn|>\n
+    DEEPSEEK41, // Numeric effort and System marker for V4.1.
     DEEPSEEK4, // <｜begin▁of▁sentence｜>...<｜User｜>...<｜Assistant｜>
 };
 

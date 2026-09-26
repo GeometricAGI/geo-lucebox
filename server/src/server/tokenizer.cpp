@@ -15,6 +15,12 @@
 #include <cstring>
 #include <limits>
 #include <utility>
+#include <memory>
+#include <stdexcept>
+#ifdef LUCE_HAVE_PCRE2
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+#endif
 
 namespace luce::common {
 
@@ -147,7 +153,55 @@ static bool is_newline(uint32_t cp) {
 //   \s+(?!\S) |
 //   \s+
 
+
+#ifdef LUCE_HAVE_PCRE2
+// DS4.1 applies three Split(Isolated) passes, then byte-level BPE. Applying
+// a single Qwen regex changes both code and multilingual prompt token IDs.
+static std::vector<std::string> ds41_pre_tokenize(const std::string & text) {
+    struct Patterns {
+        pcre2_code * code[3]{};
+        Patterns() {
+            const char * patterns[] = {R"DS41(\p{N}{1,3})DS41",
+                R"DS41([一-龥぀-ゟ゠-ヿ]+)DS41",
+                R"DS41([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)DS41"};
+            for (int i=0;i<3;++i) {
+                int error; PCRE2_SIZE offset;
+                code[i]=pcre2_compile(reinterpret_cast<PCRE2_SPTR>(patterns[i]), PCRE2_ZERO_TERMINATED,
+                                      PCRE2_UTF | PCRE2_UCP, &error, &offset, nullptr);
+                if (!code[i]) { for (auto p:code) if (p) pcre2_code_free(p); throw std::runtime_error("DS4.1 tokenizer regex compile failed"); }
+            }
+        }
+        ~Patterns() { for (auto p:code) pcre2_code_free(p); }
+    };
+    static const Patterns patterns;
+    std::vector<std::string> parts{text};
+    for (auto code:patterns.code) {
+        std::unique_ptr<pcre2_match_data, decltype(&pcre2_match_data_free)> match(pcre2_match_data_create_from_pattern(code,nullptr), pcre2_match_data_free);
+        if (!match) throw std::bad_alloc();
+        std::vector<std::string> split;
+        for (const auto & part:parts) {
+            size_t pos=0;
+            while (pos<part.size()) {
+                int rc=pcre2_match(code,reinterpret_cast<PCRE2_SPTR>(part.data()),part.size(),pos,0,match.get(),nullptr);
+                if (rc==PCRE2_ERROR_NOMATCH) { split.push_back(part.substr(pos)); break; }
+                if (rc<0) throw std::runtime_error("DS4.1 tokenizer requires valid UTF-8");
+                auto offsets=pcre2_get_ovector_pointer(match.get());
+                if (offsets[1]<=pos) throw std::runtime_error("DS4.1 tokenizer made no progress");
+                if (offsets[0]>pos) split.push_back(part.substr(pos,offsets[0]-pos));
+                split.push_back(part.substr(offsets[0],offsets[1]-offsets[0]));
+                pos=offsets[1];
+            }
+        }
+        parts=std::move(split);
+    }
+    return parts;
+}
+#endif
+
 std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const {
+#ifdef LUCE_HAVE_PCRE2
+    if (pre_type_ == PreTokenizer::DEEPSEEK41) return ds41_pre_tokenize(text);
+#endif
     std::vector<std::string> pieces;
     const char * s = text.c_str();
     const size_t len = text.size();
@@ -638,7 +692,15 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
     int pre_key = gguf_find_key(gctx, "tokenizer.ggml.pre");
     if (pre_key >= 0) {
         const char * pre = gguf_get_val_str(gctx, pre_key);
-        if (pre && std::strcmp(pre, "qwen35") == 0) {
+        if (pre && std::strcmp(pre, "deepseek-v4") == 0) {
+#ifdef LUCE_HAVE_PCRE2
+            pre_type_ = PreTokenizer::DEEPSEEK41;
+#else
+            std::fprintf(stderr, "[tokenizer] DS4.1 requires PCRE2 support; rebuild with libpcre2-8 development files\n");
+            gguf_free(gctx);
+            return false;
+#endif
+        } else if (pre && std::strcmp(pre, "qwen35") == 0) {
             pre_type_ = PreTokenizer::QWEN35;
         } else {
             pre_type_ = PreTokenizer::QWEN2;
@@ -670,7 +732,7 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 
     std::fprintf(stderr, "[tokenizer] loaded vocab=%d merges=%zu bos=%d eos=%d eot=%d pre=%s sp=%s\n",
                  n_vocab, merge_rank_.size(), bos_id_, eos_id_, eos_chat_id_,
-                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2",
+                 pre_type_ == PreTokenizer::DEEPSEEK41 ? "deepseek-v4" : pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2",
                  is_sentencepiece_ ? "yes" : "no");
     return true;
 }
