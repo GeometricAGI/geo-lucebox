@@ -1493,11 +1493,43 @@ bool DeepSeek4Backend::apply_routing_adjustments() {
     return true;
 }
 
+static size_t ds4_device_headroom_bytes(int device);
+
+// Linux MemAvailable in bytes, 0 when unknown.
+static uint64_t ds4_host_available_bytes() {
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    uint64_t bytes = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { bytes = (uint64_t) kb << 10; break; }
+    }
+    std::fclose(f);
+    return bytes;
+}
+
+// Host RAM kept free of the locked expert tier: the OS and this process's
+// own host buffers (a layer-major prompt keeps its HC state and embeddings,
+// (n_hc + 1) * n_embd floats per token, on the host).
+static uint64_t ds4_host_reserve_bytes(const DeepSeek4Weights & w, int max_ctx) {
+    return (8ULL << 30) + (uint64_t) std::max(0, max_ctx) * (uint64_t) (w.n_hc + 1) *
+                              (uint64_t) w.n_embd * sizeof(float);
+}
+
+// The streamed expert cache the secondary keeps in its carve: LUCE_EXPERT_STREAM_CACHE_MB,
+// 4.5 GiB when unset.
+static uint64_t ds4_stream_cache_request_bytes() {
+    const char * v = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
+    return v && *v ? (uint64_t) std::atoll(v) << 20 : (uint64_t) 4608 << 20;
+}
+
 // Replaces the uniform hot set with an explicit three-tier ownership: the
 // placement file (or the uniform placement when only protected experts are
 // given), protected experts pinned to the primary, fitted to the primary
 // budget (what the uniform placement spends) and the secondary device.
-bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, MoeHybridConfig & hybrid_cfg) {
+bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, int secondary_gpu,
+                                              MoeHybridConfig & hybrid_cfg) {
     if (!load_routing_adjustments()) return false;
     if (cfg_.expert_placement_path.empty() && w_.protected_experts.empty()) return true;
 
@@ -1513,13 +1545,38 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, MoeHybridCon
     }
     uint64_t secondary_budget = 0;
     if (secondary_owner) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(expert_backend_), &free_bytes, &total_bytes);
+        uint64_t carve_reserve = 4ULL << 30;   // compute buffers on the secondary
+        uint64_t host_bytes = 0;
+        if (secondary_gpu >= 0) {
+            // An integrated secondary also holds experts in locked host memory
+            // past its carve. The carve keeps the streamed expert cache, the
+            // headroom and a margin for the buffers allocated after the experts.
+            carve_reserve = ds4_device_headroom_bytes(secondary_gpu) + ds4_stream_cache_request_bytes() +
+                            (1ULL << 30);
+            const uint64_t avail = ds4_host_available_bytes();
+            const uint64_t keep = ds4_host_reserve_bytes(w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192);
+            host_bytes = ggml_backend_cuda_set_host_spill(secondary_gpu, carve_reserve,
+                                                          avail > keep ? avail - keep : 0);
+            if (host_bytes > 0) {
+                std::fprintf(stderr, "[deepseek4] device %d: experts past the carve (keeping %.2f GiB free) "
+                             "go to locked host memory, up to %.2f GiB (%.2f GiB available, %.2f GiB kept)\n",
+                             secondary_gpu, carve_reserve / 1073741824.0, host_bytes / 1073741824.0,
+                             avail / 1073741824.0, keep / 1073741824.0);
+            }
+        }
+        const uint64_t capacity = (free_bytes > carve_reserve ? free_bytes - carve_reserve : 0) + host_bytes;
+        secondary_budget = capacity;
         if (const char * mb = std::getenv("LUCE_EXPERT_SECONDARY_BUDGET_MB")) {
             secondary_budget = (uint64_t) std::strtoull(mb, nullptr, 10) * 1024ULL * 1024ULL;
-        } else {
-            size_t free_bytes = 0, total_bytes = 0;
-            ggml_backend_dev_memory(ggml_backend_get_device(expert_backend_), &free_bytes, &total_bytes);
-            constexpr uint64_t reserve = 4ULL << 30;   // compute buffers on the secondary
-            secondary_budget = free_bytes > reserve ? free_bytes - reserve : 0;
+            if (host_bytes > 0 && secondary_budget > capacity) {
+                std::fprintf(stderr, "[deepseek4] LUCE_EXPERT_SECONDARY_BUDGET_MB=%s exceeds the %.2f GiB "
+                             "device %d can hold (carve and locked host memory)\n",
+                             mb, capacity / 1073741824.0, secondary_gpu);
+                ggml_backend_cuda_set_host_spill(secondary_gpu, 0, 0);
+                return false;
+            }
         }
     }
 
@@ -2160,6 +2217,14 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     }
     cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
     cache_opts.direct_path = cfg_.model_path;
+    // Once experts are locked in host memory the page cache is too small to
+    // hold the streamed tier, so every load reads the drive directly.
+    // LUCE_EXPERT_STREAM_DIRECT=0/1 overrides.
+    if (const char * v = std::getenv("LUCE_EXPERT_STREAM_DIRECT"); v && *v) {
+        cache_opts.direct_all = std::atoi(v) != 0;
+    } else {
+        cache_opts.direct_all = ggml_backend_cuda_host_spill_bytes(cache_opts.device) > 0;
+    }
     const char * cache_mb = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
     const bool disabled = cache_mb && *cache_mb && std::atoll(cache_mb) == 0;
     if (!disabled) {
@@ -2247,7 +2312,17 @@ bool DeepSeek4Backend::log_device_memory(const char * when) const {
 // refuses a configuration that leaves less than the device's headroom, rather
 // than let the driver overcommit it at the first request.
 bool DeepSeek4Backend::check_device_headroom() const {
-    const bool ok = log_device_memory(nullptr);
+    bool ok = log_device_memory(nullptr);
+    // Locked host memory cannot be reclaimed: the host keeps the OS reserve free.
+    const size_t locked = stream_cache_device_ >= 0 ? ggml_backend_cuda_host_spill_bytes(stream_cache_device_) : 0;
+    if (locked > 0) {
+        const uint64_t avail = ds4_host_available_bytes();
+        const uint64_t need = 4ULL << 30;
+        std::fprintf(stderr, "[deepseek4] host memory: %.2f GiB available beside %.2f GiB of locked experts "
+                     "(headroom %.2f GiB)%s\n", avail / 1073741824.0, locked / 1073741824.0,
+                     need / 1073741824.0, avail < need ? ": does not fit" : "");
+        ok = ok && avail >= need;
+    }
     if (!ok) {
         std::fprintf(stderr, "[deepseek4] the configuration does not fit the devices with their "
                      "headroom; lower LUCE_EXPERT_BUDGET_MB / LUCE_EXPERT_SECONDARY_BUDGET_MB, "
@@ -2816,7 +2891,8 @@ bool DeepSeek4Backend::init_hybrid_model() {
         hybrid_cfg.materialize_cold_experts = true;
         hybrid_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
     }
-    if (!apply_expert_ownership(inprocess_tp, hybrid_cfg)) return fail_hybrid_init();
+    const int host_spill_gpu = same_runtime_tp ? tp.secondary_gpu : -1;
+    if (!apply_expert_ownership(inprocess_tp, host_spill_gpu, hybrid_cfg)) return fail_hybrid_init();
     if (vision_) {
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
         hipDeviceProp_t primary_properties{}, cold_properties{};
@@ -2883,7 +2959,15 @@ bool DeepSeek4Backend::init_hybrid_model() {
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
             *hybrid, &err, expert_backend_, spare_rows)) {
         std::fprintf(stderr, "[deepseek4] failed to build hybrid expert storage: %s\n", err.c_str());
+        ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
         return fail_hybrid_init();
+    }
+    // Only the expert stacks go to host memory; everything allocated later
+    // stays in the carve.
+    ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
+    if (const size_t spilled = ggml_backend_cuda_host_spill_bytes(host_spill_gpu)) {
+        std::fprintf(stderr, "[deepseek4] device %d: %.2f GiB of secondary experts in locked host memory\n",
+                     host_spill_gpu, spilled / 1073741824.0);
     }
     if (same_runtime_tp && has_mix_experts &&
         !register_deepseek4_moe_hybrid_mix_tables(
