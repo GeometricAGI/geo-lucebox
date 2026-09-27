@@ -63,7 +63,42 @@ static void full_model_check(const char * model, const char * requests, const ch
     unsetenv("LUCE_DS41_TYPED_EXPERTS");
     std::fprintf(stderr,"PASS: full-model fixed-token optimization parity\n");
 }
+// Fixed protocol for geo-evo. The caller freezes tokens outside the editable kernel tree.
+static void stack_benchmark(const char * model, const char * requests) {
+    setenv("GGML_CUDA_DISABLE_GRAPHS","1",1);
+    setenv("LUCE_DS41_REUSE_ATTN_WORKSPACE","1",1);
+    setenv("LUCE_DS41_TYPED_EXPERTS","1",1);
+    setenv("LUCE_DS4_HC_DEVICE_RMS","1",1);
+    DeepSeek4BackendConfig config;
+    config.model_path=model;
+    config.device.backend=PlacementBackend::Cuda;
+    config.device.gpu=0;
+    config.max_ctx=512;
+    std::ifstream input(requests);
+    const auto bundle=nlohmann::json::parse(input);
+    check(!bundle.at("requests").empty(),"empty benchmark fixture");
+    DeepSeek4Backend engine(config);
+    check(engine.init(),"model initialization failed");
+    nlohmann::json rows=nlohmann::json::array();
+    for (const auto & item : bundle.at("requests")) {
+        GenerateRequest request;
+        request.prompt=item.at("token_ids").get<std::vector<int32_t>>();
+        check(!request.prompt.empty() && request.prompt.size()+128<=512,"invalid benchmark prompt size");
+        request.n_gen=128;
+        request.force_ar_decode=true;
+        // One warmup, then three measured repetitions in the same loaded model.
+        for (int repeat=-1; repeat<3; ++repeat) {
+            auto result=engine.generate_impl(request,DaemonIO{});
+            check(!result.error && result.tokens.size()==128,"incomplete benchmark generation");
+            if (repeat<0) continue;
+            rows.push_back({{"tokens",result.tokens},{"prompt_tokens",request.prompt.size()},
+                            {"prefill_s",result.prefill_s},{"decode_s",result.decode_s}});
+        }
+    }
+    std::printf("GEO_DS41_RESULT %s\n",nlohmann::json({{"schema",1},{"rows",rows}}).dump().c_str());
+}
 int main(int argc, char ** argv)try {
+    if (argc==4 && std::strcmp(argv[3],"stack")==0) { stack_benchmark(argv[1],argv[2]); return 0; }
     check(argc==1 || argc==3 || (argc==4 && (std::strcmp(argv[3],"workspace")==0 || std::strcmp(argv[3],"experts")==0)),
           "usage: test_ds41_hc_f32 [model.gguf frozen-token-requests.json [workspace|experts]]");
     if (argc==4 && std::strcmp(argv[3],"experts")==0) setenv("GGML_CUDA_DISABLE_GRAPHS","1",1);
