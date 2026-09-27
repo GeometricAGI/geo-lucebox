@@ -52,6 +52,9 @@ struct MoeExpertCacheOptions {
     // The file the storage maps from its first byte; bulk loads read it with
     // O_DIRECT. Empty: bulk loads read through the mapping.
     std::string direct_path;
+    // Every load, not only bulk ones, reads with O_DIRECT and skips the page
+    // cache: for hosts whose RAM cannot cache the streamed experts anyway.
+    bool direct_all = false;
 };
 
 class MoeStreamedExpertCache;
@@ -314,6 +317,7 @@ private:
     size_t warm_next_ = 0;
     size_t refill_from_ = SIZE_MAX;    // warm_ entries from here reload evicted decode slots
     bool bulk_ = false;
+    bool direct_all_ = false;          // every load reads with O_DIRECT
     int direct_fd_ = -1;               // the model file opened with O_DIRECT, or -1
     std::vector<uint64_t> evicted_hot_; // decode slots bulk loads evicted, oldest first
     int warm_loading_ = 0;

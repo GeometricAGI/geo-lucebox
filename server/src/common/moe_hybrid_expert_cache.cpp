@@ -232,6 +232,7 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
     }
     if (!opts.direct_path.empty()) {
         direct_fd_ = ::open(opts.direct_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        direct_all_ = opts.direct_all && direct_fd_ >= 0;
     }
     for (Loader * l : loaders_) threads_.emplace_back(&MoeStreamedExpertCache::loader_main, this, l);
     if (!mailbox_.init(this, (int) storage.layers.size(), cfg.n_expert, cfg.n_expert_used, err)) {
@@ -377,7 +378,7 @@ bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot,
     size_t at = 0;
     size_t staged_at[3] = {0, 0, 0};
     // Bulk loads read the drive directly into page-aligned staging.
-    bool direct = s.bulk && direct_fd_ >= 0;
+    bool direct = (s.bulk || direct_all_) && direct_fd_ >= 0;
     for (int i = 0; i < 3 && direct; ++i) {
         if (r.size[i] == 0) continue;
         const uint8_t * src = direct_read(direct_fd_, staging + at, r.off[i], r.size[i]);
@@ -555,7 +556,7 @@ int MoeStreamedExpertCache::lookup_or_load_locked(int layer, int expert, bool fr
     s.last_use = ++tick_;
     slot_of_[k] = slot;
     const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) layer], expert);
-    advise_willneed(storage_->mmap_data, storage_->mmap_size, r);
+    if (!direct_all_) advise_willneed(storage_->mmap_data, storage_->mmap_size, r);
     if (front) jobs_.push_front(slot); else jobs_.push_back(slot);
     stats_.loads += 1;
     stats_.bytes += r.size[0] + r.size[1] + r.size[2];
