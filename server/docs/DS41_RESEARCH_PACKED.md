@@ -133,3 +133,9 @@ Longer generated reasoning erased the throughput improvement on this
 small pilot. These runs are separate evaluation cohorts; two-slot CUDA
 is not yet established as a faster replacement for the full quality run.
 
+
+## Reduce DS4.1 CUDA decode allocation churn and specialize packed experts (from the DS4.1 CUDA research branch)
+
+Resident CUDA profiling and opt-in decode optimizations are documented in
+[DS41_CUDA_PERFORMANCE.md](DS41_CUDA_PERFORMANCE.md).
+

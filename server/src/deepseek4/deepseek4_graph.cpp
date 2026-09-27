@@ -3823,8 +3823,11 @@ static bool build_cached_decode_attn_graph(
         int comp_attn_count,
         int index_comp_count,
         const Ds4DecodeSharedInputs * shared = nullptr,
-        const Ds4IndexSelectionStore * selection = nullptr) {
+        const Ds4IndexSelectionStore * selection = nullptr,
+        ggml_gallocr_t reusable_alloc = nullptr,
+        bool reserve_workspace = false) {
     out.free();
+    out.sg.alloc = reusable_alloc;
 
     const size_t ctx_size = 48 * 1024 * 1024;
     ggml_init_params params{};
@@ -3926,7 +3929,28 @@ static bool build_cached_decode_attn_graph(
     ggml_set_output(out.sg.hidden_states);
     ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
 
-    out.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!out.sg.alloc) out.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (reserve_workspace) {
+        // History shapes grow almost every token. Reserve in coarse increments
+        // so rebuilding metadata can reuse the same device allocation.
+        size_t needed = 0;
+        ggml_gallocr_reserve_n_size(out.sg.alloc, out.sg.gf, nullptr, nullptr, &needed);
+        if (ggml_gallocr_get_buffer_size(out.sg.alloc, 0) < needed) {
+            constexpr size_t quantum = 4 * 1024 * 1024;
+            const size_t capacity = ((needed + quantum - 1) / quantum) * quantum;
+            ggml_context * measure = ggml_init({ggml_tensor_overhead() +
+                ggml_graph_overhead_custom(4, false) + 4096, nullptr, true});
+            if (!measure) { out.free(); return false; }
+            auto * slab = ggml_new_tensor_1d(measure, GGML_TYPE_I8, capacity);
+            ggml_set_input(slab);
+            ggml_set_output(slab);
+            auto * graph = ggml_new_graph_custom(measure, 4, false);
+            ggml_build_forward_expand(graph, slab);
+            const bool reserved = ggml_gallocr_reserve(out.sg.alloc, graph);
+            ggml_free(measure);
+            if (!reserved) { out.free(); return false; }
+        }
+    }
     if (!ggml_gallocr_alloc_graph(out.sg.alloc, out.sg.gf)) {
         out.free();
         return false;
@@ -10472,6 +10496,22 @@ bool deepseek4_step_layer_range(
                                candidate.index_flush == index_flush;
                     });
                 if (it == per_layer.end()) {
+                    const bool reuse_workspace = w.hc_staggered_pre &&
+                        ds4_env_flag("LUCE_DS41_REUSE_ATTN_WORKSPACE");
+                    ggml_gallocr_t reusable_alloc = nullptr;
+                    if (reuse_workspace && !per_layer.empty()) {
+                        ggml_backend_synchronize(backend);
+                        reusable_alloc = per_layer.back().sg.alloc;
+                        per_layer.back().sg.alloc = nullptr;
+                        // Retire captures before reassigning the shared arena.
+                        // No old graph may retain pointers into its new layout.
+                        for (auto & old : per_layer) {
+                            layer_range_cache.decode_attn_cache_bytes -= std::min(
+                                layer_range_cache.decode_attn_cache_bytes, old.device_bytes);
+                            old.free();
+                        }
+                        per_layer.clear();
+                    }
                     if (per_layer.size() >= 20) {
                         layer_range_cache.decode_attn_cache_bytes -= std::min(
                             layer_range_cache.decode_attn_cache_bytes,
@@ -10492,7 +10532,8 @@ bool deepseek4_step_layer_range(
                     const auto attn_build_t0 = Ds4TimingClock::now();
                     if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, comp_lc, il, kv_start,
                                                         n_raw, n_comp_attn, n_index_comp,
-                                                        shared_inputs, &layer_range_cache.index_selection)) {
+                                                        shared_inputs, &layer_range_cache.index_selection,
+                                                        reusable_alloc, reuse_workspace)) {
                         // Out of memory (tight primary GPU in split mode):
                         // the decode attention graphs accumulate one ~16 MiB
                         // entry per (layer, shape) as n_comp grows. Evict all

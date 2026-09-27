@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
@@ -16,14 +17,17 @@ static float bf16(float x) { return ggml_bf16_to_fp32(ggml_fp32_to_bf16(x)); }
 int main(int argc, char ** argv) try {
     check(argc == 3, "usage: test_packed_experts cpu|cuda fixture_directory");
     const bool cpu = std::string(argv[1]) == "cpu";
+    // Each pass explicitly exercises both kernels, without replaying a graph
+    // captured with the previous diagnostic setting.
+    if (!cpu) setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
     ggml_backend_t backend = cpu ? ggml_backend_cpu_init() : ggml_backend_cuda_init(0);
     check(backend, "backend init failed");
     if (cpu) ggml_backend_cpu_set_n_threads(backend, 4);
-    constexpr int rows=64, cols=1024, experts=9, routes=6, tokens=3;
+    constexpr int rows=64, cols=1024, experts=12, routes=6, tokens=3;
     const ggml_type types[experts] = {GGML_TYPE_GQH_T, GGML_TYPE_GQH_T_G32_R4, GGML_TYPE_GQH_T_G32_R3,
         GGML_TYPE_DSV41_INT3_G64, GGML_TYPE_DSV41_INT3_G128, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
-        GGML_TYPE_BF16, GGML_TYPE_F32};
-    const char * names[] = {"gqh_t", "gqh_t_g32_r4", "gqh_t_g32_r3"};
+        GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_GQH2_H, GGML_TYPE_GQH3, GGML_TYPE_GQH4};
+    const char * names[] = {"gqh_t", "gqh_t_g32_r4", "gqh_t_g32_r3", "gqh2_h", "gqh3", "gqh4"};
     auto ctx = ggml_init({ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(128,false), nullptr, true});
     ggml_tensor * weights[experts];
     for (int e=0;e<experts;++e) weights[e]=ggml_new_tensor_2d(ctx,types[e],cols,rows);
@@ -37,11 +41,11 @@ int main(int argc, char ** argv) try {
     std::vector<std::vector<float>> reference(experts,std::vector<float>(rows*cols));
     std::vector<ggml_packed_expert> desc(experts);
     for(int e=0;e<experts;++e){
-        auto w=weights[e];std::vector<uint8_t> body(ggml_nbytes(w));float global=1;
-        if(e<3){
-            std::ifstream f(std::string(argv[2])+"/"+names[e]+"_64x1024.wire.bin",std::ios::binary);
-            uint8_t code=0;f.read(reinterpret_cast<char *>(&global),4);f.read(reinterpret_cast<char *>(&code),1);
-            check(code==0 && bool(f.read(reinterpret_cast<char *>(body.data()),body.size())),"bad fixture");
+        auto w=weights[e];std::vector<uint8_t> body(ggml_nbytes(w));float global=1;uint8_t code=0;
+        if(e<3||e>=9){
+            std::ifstream f(std::string(argv[2])+"/"+names[e<3?e:e-6]+"_64x1024.wire.bin",std::ios::binary);
+            f.read(reinterpret_cast<char *>(&global),4);f.read(reinterpret_cast<char *>(&code),1);
+            check(bool(f.read(reinterpret_cast<char *>(body.data()),body.size())),"bad fixture");
         }else if(e==3||e==4){
             int group=e==3?64:128,stride=4+group*3/8;
             for(size_t b=0;b<body.size();b+=stride){float scale=.037f;memcpy(body.data()+b,&scale,4);for(int j=4;j<stride;++j)body[b+j]=uint8_t((b+j)*37);}
@@ -53,9 +57,9 @@ int main(int argc, char ** argv) try {
         }else{
             for(int i=0;i<rows*cols;++i){float v=std::sin(float(i)*.17f)*.13f;if(e==7){auto b=ggml_fp32_to_bf16(v);memcpy(body.data()+i*2,&b,2);}else memcpy(body.data()+i*4,&v,4);}
         }
-        const bool header=e<5||e==6;
+        const bool header=e<5||e==6||e>=9;
         ggml_tensor host=*w;host.buffer=nullptr;host.data=body.data();
-        if(header)ggml_gqh_register(host.data,body.size(),global,0);
+        if(header)ggml_gqh_register(host.data,body.size(),global,code);
         if(e<3)check(ggml_gqh_register_ternary_input_scale(&host,divisors.data(),cols,nullptr),"host compensation failed");
         if(e==8)memcpy(reference[e].data(),body.data(),body.size());
         else ggml_get_type_traits(w->type)->to_float(body.data(),reference[e].data(),rows*cols);
@@ -64,7 +68,7 @@ int main(int argc, char ** argv) try {
         for(auto & v:reference[e])v=bf16(v);
         if(header)ggml_gqh_unregister(host.data);
         ggml_backend_tensor_set(w,body.data(),0,body.size());
-        if(header)ggml_gqh_register(w->data,body.size(),global,0);
+        if(header)ggml_gqh_register(w->data,body.size(),global,code);
         if(e<3)check(ggml_gqh_register_ternary_input_scale(w,divisors.data(),cols,scale_tensor->data),"device compensation failed");
         check(ggml_packed_expert_init(&desc[e],w),"descriptor rejected");
     }
@@ -89,8 +93,16 @@ int main(int argc, char ** argv) try {
             for(size_t i=0;i<routing.size();++i)routing[i]=int((i/2+pass*3)%experts); // Duplicate and changing GPU routes.
             ggml_backend_tensor_set(x,input.data(),0,input.size()*4);
             ggml_backend_tensor_set(ids,routing.data(),0,routing.size()*4);
+            setenv("LUCE_DS41_TYPED_EXPERTS","1",1);
             check(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"compute failed");
             ggml_backend_tensor_get(y,actual.data(),0,actual.size()*4);
+            if (!cpu) {
+                std::vector<float> generic(actual.size());
+                setenv("LUCE_DS41_TYPED_EXPERTS","0",1);
+                check(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"generic compute failed");
+                ggml_backend_tensor_get(y,generic.data(),0,generic.size()*4);
+                check(std::memcmp(actual.data(),generic.data(),actual.size()*4)==0,"typed kernel changed output bits");
+            }
             for(int t=0;t<tokens;++t)for(int r=0;r<routes;++r)for(int row=0;row<rows;++row){
                 double want=0;int e=routing[t*routes+r];
                 for(int c=0;c<cols;++c)want+=double(reference[e][row*cols+c])*input[(t*input_routes+r%input_routes)*cols+c];

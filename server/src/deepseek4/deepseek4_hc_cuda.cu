@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -151,15 +153,30 @@ __global__ void hc_sumsq_kernel(const float * x, int n, float * sums) {
 __device__ inline float hc_weight(__half value) { return __half2float(value); }
 __device__ inline float hc_weight(float value) { return value; }
 
-template<typename Weight>
+template<typename Weight, bool DeviceRms = false>
 __global__ void hc_mix_kernel(const float * x,
                               const Weight * fn,
                               int cols,
                               float inv_rms,
-                              float * mix) {
+                              float * mix, const float * sums = nullptr, float eps = 0.0f) {
     __shared__ float smem[kThreads];
+    __shared__ float device_inv_rms;
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
+#if !defined(__HIPCC__)
+    if constexpr (DeviceRms) {
+        // Preserve the host's ordered FP32 sum, division, sqrt and reciprocal.
+        // rsqrtf or a parallel reduction would change the controller outputs.
+        if (tid == 0) {
+            float ss = 0.0f;
+            for (int i = 0; i < kSums; ++i) ss = __fadd_rn(ss, sums[i]);
+            device_inv_rms = __fdiv_rn(1.0f,
+                __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, float(cols)), eps)));
+        }
+        __syncthreads();
+        inv_rms = device_inv_rms;
+    }
+#endif
     float acc = 0.0f;
     const Weight * w = fn + (size_t)row * (size_t)cols;
     for (int c = tid; c < cols; c += blockDim.x) {
@@ -462,21 +479,43 @@ bool deepseek4_cuda_hc_pre_mix_batch(const float * hc_states_host,
                                              scratch.d_sums + (size_t) t * kSums);
     }
     if (cudaGetLastError() != cudaSuccess) return false;
-    std::vector<float> sums((size_t) kSums * n_tokens);
-    if (cudaMemcpy(sums.data(), scratch.d_sums, sizeof(float) * sums.size(),
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-        return false;
-    }
-    for (int t = 0; t < n_tokens; ++t) {
-        float ss = 0.0f;
-        for (int i = 0; i < kSums; ++i) ss += sums[(size_t) t * kSums + i];
-        const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
-        if (fn_f32) {
-            hc_mix_kernel<float><<<kMixDim, kThreads>>>(scratch.d_state + (size_t)t * hc_dim,
-                static_cast<const float *>(fn_device),hc_dim,inv_rms,scratch.d_mix + (size_t)t * kMixDim);
-        } else {
-            hc_mix_kernel<__half><<<kMixDim, kThreads>>>(scratch.d_state + (size_t)t * hc_dim,
-                static_cast<const __half *>(fn_device),hc_dim,inv_rms,scratch.d_mix + (size_t)t * kMixDim);
+    bool device_rms = false;
+#if !defined(__HIPCC__)
+    // Diagnostic fallback for exact numerical and latency comparisons.
+    const char * mode = std::getenv("LUCE_DS4_HC_DEVICE_RMS");
+    device_rms = !mode || std::strcmp(mode, "0") != 0;
+#endif
+    if (device_rms) {
+        for (int t = 0; t < n_tokens; ++t) {
+            if (fn_f32) {
+                hc_mix_kernel<float, true><<<kMixDim, kThreads>>>(
+                    scratch.d_state + (size_t)t * hc_dim, static_cast<const float *>(fn_device),
+                    hc_dim, 0.0f, scratch.d_mix + (size_t)t * kMixDim,
+                    scratch.d_sums + (size_t)t * kSums, eps);
+            } else {
+                hc_mix_kernel<__half, true><<<kMixDim, kThreads>>>(
+                    scratch.d_state + (size_t)t * hc_dim, static_cast<const __half *>(fn_device),
+                    hc_dim, 0.0f, scratch.d_mix + (size_t)t * kMixDim,
+                    scratch.d_sums + (size_t)t * kSums, eps);
+            }
+        }
+    } else {
+        std::vector<float> sums((size_t) kSums * n_tokens);
+        if (cudaMemcpy(sums.data(), scratch.d_sums, sizeof(float) * sums.size(),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+        for (int t = 0; t < n_tokens; ++t) {
+            float ss = 0.0f;
+            for (int i = 0; i < kSums; ++i) ss += sums[(size_t) t * kSums + i];
+            const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
+            if (fn_f32) {
+                hc_mix_kernel<float><<<kMixDim, kThreads>>>(scratch.d_state + (size_t)t * hc_dim,
+                    static_cast<const float *>(fn_device),hc_dim,inv_rms,scratch.d_mix + (size_t)t * kMixDim);
+            } else {
+                hc_mix_kernel<__half><<<kMixDim, kThreads>>>(scratch.d_state + (size_t)t * hc_dim,
+                    static_cast<const __half *>(fn_device),hc_dim,inv_rms,scratch.d_mix + (size_t)t * kMixDim);
+            }
         }
     }
     if (cudaGetLastError() != cudaSuccess) return false;
