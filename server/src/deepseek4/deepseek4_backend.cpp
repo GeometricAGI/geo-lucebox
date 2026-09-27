@@ -1513,7 +1513,7 @@ static uint64_t ds4_host_available_bytes() {
 // own host buffers (a layer-major prompt keeps its HC state and embeddings,
 // (n_hc + 1) * n_embd floats per token, on the host).
 static uint64_t ds4_host_reserve_bytes(const DeepSeek4Weights & w, int max_ctx) {
-    return (8ULL << 30) + (uint64_t) std::max(0, max_ctx) * (uint64_t) (w.n_hc + 1) *
+    return (5ULL << 30) + (uint64_t) std::max(0, max_ctx) * (uint64_t) (w.n_hc + 1) *
                               (uint64_t) w.n_embd * sizeof(float);
 }
 
