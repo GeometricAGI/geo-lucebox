@@ -89,6 +89,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <cerrno>
+#if defined(GGML_USE_HIP) && defined(__linux__)
+#include <sys/mman.h>
+#include <sys/resource.h>
+#endif
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -259,6 +265,99 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
     return use;
 }
 
+// Host spill for integrated GPUs (ggml_backend_cuda_set_host_spill): while it
+// is on, a device allocation that would leave less than `carve_reserve` free in
+// the carve goes to locked host memory instead, which the GPU reads from the
+// same DRAM. Those buffers are tracked here and released with cudaFreeHost.
+struct ggml_cuda_host_spill_state {
+    size_t carve_reserve = 0;
+    size_t host_left = 0;
+    size_t host_used = 0;
+};
+static std::mutex g_host_spill_mutex;
+static ggml_cuda_host_spill_state g_host_spill[GGML_CUDA_MAX_DEVICES];
+static std::unordered_map<void *, std::pair<int, size_t>> g_host_spill_ptrs;
+
+static bool ggml_cuda_host_spill_take(void * p) {
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    auto it = g_host_spill_ptrs.find(p);
+    if (it == g_host_spill_ptrs.end()) return false;
+    g_host_spill[it->second.first].host_used -= it->second.second;
+    g_host_spill_ptrs.erase(it);
+    return true;
+}
+
+// Host bytes this process may lock: RLIMIT_MEMLOCK, its soft limit first
+// raised to the hard one.
+static size_t ggml_cuda_lockable_host_bytes() {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) return 0;
+    if (rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) (void) getrlimit(RLIMIT_MEMLOCK, &rl);
+    }
+    return rl.rlim_cur == RLIM_INFINITY ? SIZE_MAX : (size_t) rl.rlim_cur;
+#else
+    return 0;
+#endif
+}
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+// Locked, coarse-grained host memory for a device buffer. It must be locked:
+// the GPU does not mark the host pages it reads as accessed, so reclaim takes
+// them for cold and swaps them out, and every swap-in evicts all GPU queues of
+// the process until the pages are back.
+static bool ggml_cuda_host_spill_malloc(void ** ptr, size_t size, int device) {
+    {
+        std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+        ggml_cuda_host_spill_state & st = g_host_spill[device];
+        if (st.carve_reserve == 0 || st.host_left < size) return false;
+    }
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= size + g_host_spill[device].carve_reserve) {
+        return false;
+    }
+    if (hipHostMalloc(ptr, size, hipHostMallocNonCoherent) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
+    if (mlock(*ptr, size) != 0) {
+        GGML_LOG_WARN("ggml_cuda: cannot lock %.1f MiB of host memory for device %d (%s)\n",
+                      size / 1048576.0, device, strerror(errno));
+        (void) hipHostFree(*ptr);
+        *ptr = nullptr;
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    g_host_spill[device].host_left -= size;
+    g_host_spill[device].host_used += size;
+    g_host_spill_ptrs[*ptr] = {device, size};
+    return true;
+}
+#endif
+
+size_t ggml_backend_cuda_set_host_spill(int device, size_t carve_reserve, size_t host_bytes) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !ggml_cuda_device_is_integrated(device)) {
+        return 0;
+    }
+    if (carve_reserve == 0 || host_bytes == 0) {
+        carve_reserve = 0;
+        host_bytes = 0;
+    }
+    host_bytes = std::min(host_bytes, ggml_cuda_lockable_host_bytes());
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    g_host_spill[device].carve_reserve = host_bytes > 0 ? carve_reserve : 0;
+    g_host_spill[device].host_left = host_bytes;
+    return host_bytes;
+}
+
+size_t ggml_backend_cuda_host_spill_bytes(int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return 0;
+    std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+    return g_host_spill[device].host_used;
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * out_managed = nullptr) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -289,6 +388,12 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
         }
 #endif // defined(GGML_USE_HIP)
     } else {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+        if (ggml_cuda_host_spill_malloc(ptr, size, device)) {
+            if (out_managed) *out_managed = true;  // CPU-addressable
+            return cudaSuccess;
+        }
+#endif // defined(GGML_USE_HIP) && defined(__linux__)
         err = cudaMalloc(ptr, size);
 #if defined(GGML_USE_HIP)
         // An integrated GPU with a large carve (e.g. 64 GiB) can fill its
@@ -811,7 +916,11 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (ggml_cuda_host_spill_take(dev_ptr)) {
+            CUDA_CHECK(cudaFreeHost(dev_ptr));
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
