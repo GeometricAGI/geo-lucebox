@@ -1608,6 +1608,11 @@ bool DeepSeek4Backend::requires_monolithic_model() const {
 bool DeepSeek4Backend::validate_model_features() const {
     if (!w_.hc_staggered_pre) return true;
     const char * unsupported = nullptr;
+#if !defined(LUCE_BACKEND_HIP) && !defined(GGML_USE_HIP)
+    // Qualified on ROCm only: on CUDA the candidate-block selection (past
+    // 16,384 compressed rows) does not match the reference yet.
+    unsupported = "a CUDA build (V4.1 is qualified on ROCm)";
+#endif
     if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
         unsupported = "fused decode";
     } else if (cfg_.fused_verify_f16_kv) {
