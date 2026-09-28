@@ -283,7 +283,10 @@ static bool ggml_cuda_host_spill_take(void * p) {
     std::lock_guard<std::mutex> lock(g_host_spill_mutex);
     auto it = g_host_spill_ptrs.find(p);
     if (it == g_host_spill_ptrs.end()) return false;
-    g_host_spill[it->second.first].host_used -= it->second.second;
+    ggml_cuda_host_spill_state & st = g_host_spill[it->second.first];
+    st.host_used -= it->second.second;
+    // The freed bytes go back to the budget while spill is on.
+    if (st.carve_reserve > 0) st.host_left += it->second.second;
     g_host_spill_ptrs.erase(it);
     return true;
 }

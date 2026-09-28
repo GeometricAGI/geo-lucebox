@@ -290,6 +290,8 @@ private:
     // Caller holds mu_. Marks a slot used; outside bulk mode it joins the
     // decode working set.
     void touch_locked(int slot);
+    // Caller holds mu_. Drops one pin; wakes a refill waiting for a slot.
+    void unpin_locked(int slot);
     // Caller holds mu_. Claims an empty slot for the next warm expert and
     // marks it loading; -1 when the warm list is done or no slot is empty.
     int  next_warm_locked();
@@ -323,6 +325,7 @@ private:
     std::deque<int> jobs_;
     std::vector<uint64_t> warm_;       // warm start keys, most used first
     size_t warm_next_ = 0;
+    bool warm_blocked_ = false;        // a refill waits for a slot to be unpinned
     size_t refill_from_ = SIZE_MAX;    // warm_ entries from here reload evicted decode slots
     std::atomic<bool> in_call_{false}; // an eval or acquire is running
     bool bulk_ = false;

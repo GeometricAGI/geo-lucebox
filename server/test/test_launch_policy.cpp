@@ -194,6 +194,24 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(contains_flag(args, "--ds4-expert-placement"));
         CHECK(contains_flag(args, "--ds4-router-bias"));
         CHECK(contains_flag(args, "--ds4-protected-experts"));
+        // The measured recipe (DS41.md): these values move the numbers.
+        const auto value_of = [&](const char * flag) -> std::string {
+            for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == flag) return args[i + 1];
+            return {};
+        };
+        CHECK(value_of("--max-ctx") == "131072");
+        CHECK(value_of("--chunk") == "4096");
+        CHECK(value_of("--ds4-prefill") == "dense");
+        CHECK(value_of("--expert-device") == "hip:1");
+        CHECK(value_of("--ds4-expert-placement") == "share/deepseek41/placement_lucebox.json");
+        CHECK(value_of("--ds4-router-bias") == "share/deepseek41/router_bias_lucebox_40x384_f32.bin");
+        CHECK(value_of("--ds4-protected-experts") == "share/deepseek41/massive_experts.json");
+        bool budget = false;
+        for (const LaunchProfileEnv & entry : profile->env) {
+            budget = budget || (std::string(entry.name) == "LUCE_EXPERT_BUDGET_MB" &&
+                                std::string(entry.value) == "10500");
+        }
+        CHECK(budget);
         for (const LaunchProfileEnv & entry : profile->env) {
             const std::string name = entry.name;
             CHECK(name != "LUCE_DS4_MOE_TP");

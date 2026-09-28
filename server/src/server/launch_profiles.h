@@ -107,8 +107,8 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
             "DeepSeek V4.1 Flash on the Lucebox: dense work, hot experts and the "
             "drafter on the R9700 (gfx1201), a second expert stack on Strix Halo "
             "(gfx1151, carve plus locked host memory), the rest streamed from SSD; "
-            "the Lucebox placement and router bias from server/share/deepseek41 "
-            "(paths relative to the repository root)",
+            "the Lucebox placement and router bias from share/deepseek41 (next to "
+            "the binary, or server/share from the repository root)",
             {
                 {"--target-device", "hip:0"},
                 {"--expert-device", "hip:1"},
@@ -116,9 +116,10 @@ inline const std::vector<LaunchProfile> & launch_profiles() {
                 {"--max-ctx", "131072"},
                 {"--chunk", "4096"},
                 {"--ds4-prefill", "dense"},
-                {"--ds4-expert-placement", "server/share/deepseek41/placement_lucebox.json"},
-                {"--ds4-router-bias", "server/share/deepseek41/router_bias_lucebox_40x384_f32.bin"},
-                {"--ds4-protected-experts", "server/share/deepseek41/massive_experts.json"},
+                // share/... values resolve against the install (server_main.cpp).
+                {"--ds4-expert-placement", "share/deepseek41/placement_lucebox.json"},
+                {"--ds4-router-bias", "share/deepseek41/router_bias_lucebox_40x384_f32.bin"},
+                {"--ds4-protected-experts", "share/deepseek41/massive_experts.json"},
             },
             {
                 {"LUCE_EXPERT_BUDGET_MB", "10500"},

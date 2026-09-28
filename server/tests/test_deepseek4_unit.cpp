@@ -1824,7 +1824,9 @@ static std::vector<int> reference_topk_rows(const std::vector<double> & score, i
     k = std::min(k, (int) order.size());
     std::vector<int> out(order.begin(), order.begin() + k);
     std::sort(out.begin(), out.end());
-    if (margin) {
+    if (margin && k == 0) {
+        *margin = 1e300;
+    } else if (margin) {
         const double s1 = score[(size_t) order[(size_t) k - 1]];
         *margin = k < (int) order.size()
             ? (s1 - score[(size_t) order[(size_t) k]]) / std::max(std::fabs(s1), 1e-30) : 1e300;

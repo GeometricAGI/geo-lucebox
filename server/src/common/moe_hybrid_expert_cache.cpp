@@ -272,6 +272,7 @@ void MoeStreamedExpertCache::destroy() {
     jobs_.clear();
     warm_.clear();
     warm_next_ = 0;
+    warm_blocked_ = false;
     warm_loading_ = 0;
     warm_loads_ = warm_bytes_ = 0;
     predicted_.clear();
@@ -305,7 +306,9 @@ void MoeStreamedExpertCache::loader_main(Loader * self) {
     cudaStreamCreateWithFlags(&self->stream, cudaStreamNonBlocking);
     std::unique_lock<std::mutex> lk(mu_);
     while (true) {
-        cv_.wait(lk, [&] { return stopping_ || !jobs_.empty() || warm_next_ < warm_.size(); });
+        cv_.wait(lk, [&] {
+            return stopping_ || !jobs_.empty() || (warm_next_ < warm_.size() && !warm_blocked_);
+        });
         if (stopping_) break;
         // Demand and prefetch loads first; the warm start only fills idle time.
         const bool warm = jobs_.empty();
@@ -430,6 +433,13 @@ int MoeStreamedExpertCache::evict_locked(bool refill) {
     return best;
 }
 
+void MoeStreamedExpertCache::unpin_locked(int slot) {
+    if (--slots_[(size_t) slot].pins == 0 && warm_blocked_) {
+        warm_blocked_ = false;  // a pending refill may take a slot now
+        cv_.notify_all();
+    }
+}
+
 void MoeStreamedExpertCache::touch_locked(int slot) {
     Slot & s = slots_[(size_t) slot];
     s.last_use = ++tick_;
@@ -503,9 +513,17 @@ int MoeStreamedExpertCache::next_warm_locked() {
         const bool refill = rank >= refill_from_;
         const int slot = evict_locked(refill);
         if (slot < 0 || (!refill && slots_[(size_t) slot].state != SlotState::Empty)) {
-            warm_next_ = warm_.size();  // the pool is full: never evict for it
-            refill_from_ = SIZE_MAX;
-            return -1;
+            if (refill) {
+                // No reusable bulk slot yet (they are pinned): retry this
+                // entry once a slot is unpinned.
+                warm_next_ = rank;
+                warm_blocked_ = true;
+                return -1;
+            }
+            // The warm start never evicts: the pool is full, so go on to
+            // the refill entries, if any.
+            warm_next_ = refill_from_ < warm_.size() ? refill_from_ : warm_.size();
+            continue;
         }
         Slot & s = slots_[(size_t) slot];
         if (s.layer >= 0) slot_of_.erase(key(s.layer, s.expert));
@@ -569,7 +587,7 @@ void MoeStreamedExpertCache::stage(int layer, const int32_t * selected, int n_ro
     if (!ready() || layer < 0 || (size_t) layer >= storage_->layers.size()) return;
     const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
     std::lock_guard<std::mutex> lk(mu_);
-    for (int slot : staged_) --slots_[(size_t) slot].pins;
+    for (int slot : staged_) unpin_locked(slot);
     staged_.clear();
     staged_layer_ = layer;
     // At most half the slots, so an eval chunk always finds room next to them.
@@ -689,7 +707,7 @@ bool MoeStreamedExpertCache::pin_ready_locked(std::unique_lock<std::mutex> & lk,
 void MoeStreamedExpertCache::release_staged(int layer) {
     std::lock_guard<std::mutex> lk(mu_);
     if (staged_layer_ != layer) return;
-    for (int slot : staged_) --slots_[(size_t) slot].pins;
+    for (int slot : staged_) unpin_locked(slot);
     staged_.clear();
     staged_layer_ = -1;
 }
@@ -750,7 +768,7 @@ bool MoeStreamedExpertCache::acquire(int layer, const int32_t * selected, int n_
 void MoeStreamedExpertCache::release_acquired() {
     std::lock_guard<std::mutex> lk(mu_);
     for (int slot : acquired_) {
-        --slots_[(size_t) slot].pins;
+        unpin_locked(slot);
         touch_locked(slot);
     }
     acquired_.clear();
@@ -830,7 +848,7 @@ bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
         const auto unpin = [&] {
             std::lock_guard<std::mutex> lk(mu_);
             for (int slot : slots) {
-                --slots_[(size_t) slot].pins;
+                unpin_locked(slot);
                 touch_locked(slot);
             }
         };
@@ -838,7 +856,7 @@ bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
             std::lock_guard<std::mutex> lk(mu_);
             if (!failed_.empty()) {
                 if (err) *err = failed_;
-                for (int slot : slots) --slots_[(size_t) slot].pins;
+                for (int slot : slots) unpin_locked(slot);
                 return false;
             }
         }

@@ -3258,7 +3258,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
         hybrid_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
     }
     const int host_spill_gpu = same_runtime_tp ? tp.secondary_gpu : -1;
-    if (!apply_expert_ownership(inprocess_tp, host_spill_gpu, hybrid_cfg)) return fail_hybrid_init();
+    if (!apply_expert_ownership(inprocess_tp, host_spill_gpu, hybrid_cfg)) {
+        if (host_spill_gpu >= 0) ggml_backend_cuda_set_host_spill(host_spill_gpu, 0, 0);
+        return fail_hybrid_init();
+    }
     if (vision_) {
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
         hipDeviceProp_t primary_properties{}, cold_properties{};
@@ -3628,7 +3631,8 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     }
     // A restored target sizes its streamed expert tier last again.
     if (moe_hybrid_ && !expert_cache_.ready() && !init_streamed_expert_tier()) return false;
-    size_hybrid_prefill_chunk();
+    // The same post-load checks as init(): a restore that no longer fits fails.
+    if (moe_hybrid_ && (!check_device_headroom() || !size_hybrid_prefill_chunk())) return false;
     cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }

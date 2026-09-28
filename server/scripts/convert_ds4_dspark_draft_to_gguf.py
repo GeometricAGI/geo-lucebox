@@ -151,6 +151,7 @@ def load_f32(st: Shards, name: str) -> np.ndarray:
         w = np.empty((out, half * 2), dtype=np.float32)
         w[:, 0::2] = E2M1[q & 0x0F]
         w[:, 1::2] = E2M1[q >> 4]
+        assert sshape == [out, half * 2 // 32], (name, sshape)  # one E8M0 per 32 inputs
         blk = (half * 2) // sshape[1]
         return (w.reshape(out, sshape[1], blk) * scale[:, :, None]).reshape(out, half * 2)
     raise ValueError(f"{name}: unsupported dtype {dtype}")

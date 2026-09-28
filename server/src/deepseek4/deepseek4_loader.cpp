@@ -2063,6 +2063,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (!read_deepseek4_engram(gctx, meta_ctx, P + "engram.", n_layer, n_vocab, engram, engram_err)) {
             return fail(engram_err);
         }
+        // V4.1 applies its Engram on every path: a file without it would
+        // serve tokens that do not match the model.
+        if (is_v41 && engram.layer_ids.empty()) {
+            return fail("a deepseek41 GGUF needs its Engram metadata (" + P + "engram.*)");
+        }
     }
 
     const uint32_t kMissingSpecial = 0xFFFFFFFFu;

@@ -239,13 +239,17 @@ TEST_CASE(DeepSeek4EngramFixture, hash_carries_history_across_calls) {
     CHECK(done == kTokens.size());
     CHECK(out == kExpectedRows);
 
-    // A copied history is a snapshot: hashing from it again reproduces the rows.
+    // A copied history is a snapshot (speculative rollback restores one):
+    // copied mid-sequence, both copies hash the same continuation, and it is
+    // the row the uninterrupted sequence produced.
     DeepSeek4EngramHistory start;
-    std::vector<uint32_t> first(per_token), again(per_token);
+    std::vector<uint32_t> prefix(3 * per_token), first(per_token), again(per_token);
+    hasher.hash(start, kTokens.data(), nullptr, 3, prefix.data());
     DeepSeek4EngramHistory snap = start;
-    hasher.hash(start, kTokens.data(), nullptr, 1, first.data());
-    hasher.hash(snap, kTokens.data(), nullptr, 1, again.data());
+    hasher.hash(start, kTokens.data() + 3, nullptr, 1, first.data());
+    hasher.hash(snap, kTokens.data() + 3, nullptr, 1, again.data());
     CHECK(first == again);
+    CHECK(std::equal(first.begin(), first.end(), kExpectedRows.begin() + 3 * per_token));
 }
 
 TEST_CASE(DeepSeek4EngramFixture, dead_slot_blocks_longer_ngrams) {

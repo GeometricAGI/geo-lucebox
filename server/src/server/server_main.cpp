@@ -33,6 +33,7 @@
 #include "kvflash_pager.h"
 #include "kv_quant.h"
 
+#include <filesystem>
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -554,12 +555,21 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
                 return 2;
             }
-        } else if (std::strcmp(argv[i], "--ds4-expert-placement") == 0 && i + 1 < argc) {
-            bargs.ds4_expert_placement = argv[++i];
-        } else if (std::strcmp(argv[i], "--ds4-router-bias") == 0 && i + 1 < argc) {
-            bargs.ds4_router_bias = argv[++i];
-        } else if (std::strcmp(argv[i], "--ds4-protected-experts") == 0 && i + 1 < argc) {
-            bargs.ds4_protected_experts = argv[++i];
+        } else if ((std::strcmp(argv[i], "--ds4-expert-placement") == 0 ||
+                    std::strcmp(argv[i], "--ds4-router-bias") == 0 ||
+                    std::strcmp(argv[i], "--ds4-protected-experts") == 0) && i + 1 < argc) {
+            // Checked here so a wrong path fails before the model is mapped.
+            const char * flag = argv[i];
+            const char * path = argv[++i];
+            std::error_code ec;
+            if (!*path || !std::filesystem::is_regular_file(path, ec)) {
+                std::fprintf(stderr, "[server] %s: no such file '%s'\n", flag, path);
+                return 2;
+            }
+            std::string & dst = std::strcmp(flag, "--ds4-expert-placement") == 0 ? bargs.ds4_expert_placement
+                              : std::strcmp(flag, "--ds4-router-bias") == 0 ? bargs.ds4_router_bias
+                                                                            : bargs.ds4_protected_experts;
+            dst = path;
         } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             bargs.ds4_prefill_mode_set = true;
@@ -1940,6 +1950,28 @@ static int list_devices(const char * model_path) {
 // right after the model path. Tokens the block already sets are left out, so
 // explicit flags win in any order. The profile's environment is installed by
 // load_model(), so a block that is never loaded changes nothing.
+// A profile data file (share/...) as installed: next to the binary
+// (<bin>/../share, <bin>/share), else under the working directory
+// (server/share from the repository root, then share).
+static std::string resolve_profile_data_path(const std::string & rel, const char * argv0) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> roots;
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec && argv0) exe = fs::absolute(argv0, ec);
+    if (!exe.empty()) {
+        roots.push_back(exe.parent_path().parent_path());
+        roots.push_back(exe.parent_path());
+    }
+    roots.push_back(fs::current_path(ec) / "server");
+    roots.push_back(fs::current_path(ec));
+    for (const fs::path & root : roots) {
+        const fs::path p = root / rel;
+        if (fs::exists(p, ec)) return p.string();
+    }
+    return rel;  // not found: the file flag check names it
+}
+
 static bool expand_launch_profile(std::vector<char *> & block,
                                   std::vector<std::unique_ptr<std::string>> & storage,
                                   bool load_balancing,
@@ -1978,7 +2010,9 @@ static bool expand_launch_profile(std::vector<char *> & block,
     std::vector<char *> inserted;
     std::string shown;
     for (const std::string & arg : args) {
-        storage.push_back(std::make_unique<std::string>(arg));
+        const bool data = arg.rfind("share/", 0) == 0;
+        storage.push_back(std::make_unique<std::string>(
+            data ? resolve_profile_data_path(arg, kept.empty() ? nullptr : kept[0]) : arg));
         inserted.push_back(storage.back()->data());
         shown += " " + arg;
     }
