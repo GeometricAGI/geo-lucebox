@@ -1817,11 +1817,11 @@ static uint64_t ds4_host_reserve_bytes(const DeepSeek4Weights & w, int max_ctx) 
                               (uint64_t) w.n_embd * sizeof(float);
 }
 
-// The streamed expert cache the secondary keeps in its carve: LUCE_EXPERT_STREAM_CACHE_MB,
-// 4.5 GiB when unset.
+// The streamed expert cache an integrated secondary keeps in its carve when
+// its experts spill to host memory (the cache itself takes whatever the carve
+// has left; see init_streamed_expert_tier).
 static uint64_t ds4_stream_cache_request_bytes() {
-    const char * v = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
-    return v && *v ? (uint64_t) std::atoll(v) << 20 : (uint64_t) 4608 << 20;
+    return (uint64_t) 4608 << 20;
 }
 
 // Replaces the uniform hot set with an explicit three-tier ownership: the
@@ -1868,16 +1868,6 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, int secondar
         }
         const uint64_t capacity = (free_bytes > carve_reserve ? free_bytes - carve_reserve : 0) + host_bytes;
         secondary_budget = capacity;
-        if (const char * mb = std::getenv("LUCE_EXPERT_SECONDARY_BUDGET_MB")) {
-            secondary_budget = (uint64_t) std::strtoull(mb, nullptr, 10) * 1024ULL * 1024ULL;
-            if (host_bytes > 0 && secondary_budget > capacity) {
-                std::fprintf(stderr, "[deepseek4] LUCE_EXPERT_SECONDARY_BUDGET_MB=%s exceeds the %.2f GiB "
-                             "device %d can hold (carve and locked host memory)\n",
-                             mb, capacity / 1073741824.0, secondary_gpu);
-                ggml_backend_cuda_set_host_spill(secondary_gpu, 0, 0);
-                return false;
-            }
-        }
     }
 
     MoeExpertOwnership own;
@@ -2557,40 +2547,18 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     MoeHybridStorage * hybrid = moe_hybrid_.get();
     if (!hybrid || !hybrid->stream_engine || stream_cache_device_ < 0) return true;
     std::string err;
-    // LUCE_EXPERT_STREAM_DEVICE overrides the device; LUCE_EXPERT_STREAM_CACHE_MB
-    // caps the cache (0 keeps the uncached path). The cache never takes the
-    // device's headroom: a larger request is shrunk to fit.
+    // The cache takes what the device has left beyond its headroom.
     MoeExpertCacheOptions cache_opts;
     cache_opts.device = stream_cache_device_;
-    if (const char * v = std::getenv("LUCE_EXPERT_STREAM_DEVICE"); v && *v) {
-        cache_opts.device = std::atoi(v);
-    }
     cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
     cache_opts.direct_path = cfg_.model_path;
     // Once experts are locked in host memory the page cache is too small to
     // hold the streamed tier, so every load reads the drive directly.
-    // LUCE_EXPERT_STREAM_DIRECT=0/1 overrides.
-    if (const char * v = std::getenv("LUCE_EXPERT_STREAM_DIRECT"); v && *v) {
-        cache_opts.direct_all = std::atoi(v) != 0;
-    } else {
-        cache_opts.direct_all = ggml_backend_cuda_host_spill_bytes(cache_opts.device) > 0;
-    }
-    const char * cache_mb = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
-    const bool disabled = cache_mb && *cache_mb && std::atoll(cache_mb) == 0;
-    if (!disabled) {
+    cache_opts.direct_all = ggml_backend_cuda_host_spill_bytes(cache_opts.device) > 0;
+    {
         size_t free_b = 0, total_b = 0;
         ggml_backend_cuda_get_device_memory(cache_opts.device, &free_b, &total_b);
-        const size_t fits = free_b > cache_opts.reserve_bytes ? free_b - cache_opts.reserve_bytes : 0;
-        cache_opts.pool_bytes = fits;
-        if (cache_mb && *cache_mb) {
-            const size_t want = (size_t) std::atoll(cache_mb) << 20;
-            if (want > fits) {
-                std::fprintf(stderr, "[deepseek4] LUCE_EXPERT_STREAM_CACHE_MB=%s does not fit device %d "
-                             "with %.1f GiB headroom; using %.2f GiB\n", cache_mb, cache_opts.device,
-                             cache_opts.reserve_bytes / 1073741824.0, fits / 1073741824.0);
-            }
-            cache_opts.pool_bytes = std::min(want, fits);
-        }
+        cache_opts.pool_bytes = free_b > cache_opts.reserve_bytes ? free_b - cache_opts.reserve_bytes : 0;
         if (cache_opts.pool_bytes > 0 &&
             init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
             hybrid->expert_cache = &expert_cache_;
@@ -2675,8 +2643,8 @@ bool DeepSeek4Backend::check_device_headroom() const {
     }
     if (!ok) {
         std::fprintf(stderr, "[deepseek4] the configuration does not fit the devices with their "
-                     "headroom; lower LUCE_EXPERT_BUDGET_MB / LUCE_EXPERT_SECONDARY_BUDGET_MB, "
-                     "LUCE_EXPERT_PROMOTE_MB, --kv-pool-tokens or --max-ctx\n");
+                     "headroom; lower LUCE_EXPERT_BUDGET_MB, LUCE_EXPERT_PROMOTE_MB, "
+                     "--kv-pool-tokens or --max-ctx\n");
     }
     return ok;
 }

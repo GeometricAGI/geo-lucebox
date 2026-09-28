@@ -4353,14 +4353,6 @@ struct Ds4NextLayerRoutes {
     std::vector<int32_t> experts;
 };
 
-static bool ds4_stream_prefetch_enabled() {
-    static const bool enabled = [] {
-        const char * v = std::getenv("LUCE_EXPERT_STREAM_PREFETCH");
-        return !v || !*v || std::strcmp(v, "0") != 0;
-    }();
-    return enabled;
-}
-
 // Appends the next layer's router probabilities to a routing graph and
 // returns them concatenated after the current layer's `probs`
 // ([2 * n_expert, n_tokens]) so one readback serves both, or nullptr when
@@ -4376,8 +4368,7 @@ static ggml_tensor * build_ds4_next_layer_router(
     const int next = layer + 1;
     if (next >= w.n_layer || next < w.n_hash_layer ||
         !hybrid.expert_cache || !hybrid.expert_cache->ready() ||
-        (size_t) next >= hybrid.layers.size() || hybrid.layers[(size_t) next].n_streamed == 0 ||
-        !ds4_stream_prefetch_enabled()) {
+        (size_t) next >= hybrid.layers.size() || hybrid.layers[(size_t) next].n_streamed == 0) {
         return nullptr;
     }
     // The caller reads its own results back after these nodes run: keep the
