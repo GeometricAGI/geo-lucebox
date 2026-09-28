@@ -1696,8 +1696,13 @@ bool DeepSeek4Backend::load_routing_adjustments() {
                          cfg_.protected_experts_path.c_str(), ex.what());
             return false;
         }
+        if (!j.is_object()) {
+            std::fprintf(stderr, "[deepseek4] protected experts %s: expected an object of layer -> experts\n",
+                         cfg_.protected_experts_path.c_str());
+            return false;
+        }
         w_.protected_experts.assign(n, 0);
-        for (auto it = j.begin(); j.is_object() && it != j.end(); ++it) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
             int layer = -1;
             const std::string & key = it.key();
             std::from_chars(key.data(), key.data() + key.size(), layer);

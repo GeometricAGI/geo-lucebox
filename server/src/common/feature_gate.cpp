@@ -47,6 +47,11 @@ std::string check_feature_compatibility(
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
     }
 
+    // DeepSeek V4.1 has no layer-split path, which a remote target shard uses.
+    if (arch == "deepseek41" && args.remote_target_shard.enabled()) {
+        return "--target-shard-ipc-bin is not implemented for DeepSeek V4.1 (see server/docs/DS41.md)";
+    }
+
     // ── vision projector × architecture / placement
     if (args.mmproj_path.has_value()) {
         if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
@@ -411,7 +416,7 @@ std::vector<std::string> collect_feature_warnings(
     // remote target shard on one local device; that adapter drops the same
     // options as an explicit split.
     const bool split = args.device.is_layer_split() ||
-        (arch == "deepseek4" && args.remote_target_shard.enabled());
+        (arch_is_deepseek4_family(arch) && args.remote_target_shard.enabled());
 
     // Each entry pairs a requested option with the capability predicate for
     // the field create_backend() would have to forward for it to take effect.

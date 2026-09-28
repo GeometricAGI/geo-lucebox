@@ -579,6 +579,7 @@ bool deepseek4_snapshot_bind(ggml_context * ctx,
 
     for (int j = 0; j < kDeepSeek4SnapMetaTail; ++j) {
         const int32_t token = m[(size_t) (kDeepSeek4SnapMetaBase + 2 * n_layer + j)];
+        if (token < -1) return false;  // -1 = not recorded; anything lower is corrupt
         if (token >= 0 && cur_pos - 1 - j >= 0) tmp.engram_tokens.put(cur_pos - 1 - j, token);
     }
 

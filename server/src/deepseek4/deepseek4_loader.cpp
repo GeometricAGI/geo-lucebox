@@ -1961,6 +1961,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const uint32_t n_expert_used  = get_u32_or(gctx, key("expert_used_count").c_str(), 6);
     const uint32_t n_expert_shared = get_u32_or(gctx, key("expert_shared_count").c_str(), 1);
     const uint32_t n_ff_exp       = get_u32_or(gctx, key("expert_feed_forward_length").c_str(), 2048);
+    // V4 routes its first layers by token hash and must say how many; V4.1
+    // has no hash routing.
+    if (!is_v41 && gguf_find_key(gctx, key("hash_layer_count").c_str()) < 0) {
+        return fail("missing " + key("hash_layer_count"));
+    }
     const uint32_t n_hash_layer   = get_u32_or(gctx, key("hash_layer_count").c_str(), 0);
     const uint32_t n_swa          = get_u32_or(gctx, key("attention.sliding_window").c_str(), 128);
     const uint32_t n_indexer_head = get_u32_or(gctx, key("attention.indexer.head_count").c_str(), 64);
@@ -2021,25 +2026,24 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         !get_i32_arr(gctx, key("attention.index_source_layers").c_str(), index_source_ids, &arr_err)) {
         return fail(arr_err);
     }
-    const bool sources_declared = gguf_find_key(gctx, key("attention.kv_source_layers").c_str()) >= 0;
-    if (!sources_declared) {
-        // V4 shares no compressed cache: every compressing layer is its own
-        // kv source and every ratio-4 layer its own index source. V4.1 files
-        // without the lists (llama.cpp PR #28696 writes none) are inferred
-        // from tensor presence.
-        for (uint32_t il = 0; il < n_layer; ++il) {
-            if (compress_ratios[il] == 0) continue;
-            if (!is_v41) {
-                kv_source_ids.push_back((int32_t) il);
-                if (compress_ratios[il] == 4) index_source_ids.push_back((int32_t) il);
-                continue;
-            }
+    // Each list is inferred when the file does not declare it. V4 shares no
+    // compressed cache: every compressing layer is its own kv source and
+    // every ratio-4 layer its own index source. V4.1 files without the lists
+    // (llama.cpp PR #28696 writes none) are inferred from tensor presence.
+    const bool kv_declared = gguf_find_key(gctx, key("attention.kv_source_layers").c_str()) >= 0;
+    const bool index_declared = gguf_find_key(gctx, key("attention.index_source_layers").c_str()) >= 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (compress_ratios[il] == 0) continue;
+        bool kv_source = !is_v41, index_source = !is_v41 && compress_ratios[il] == 4;
+        if (is_v41) {
             char name[96];
             std::snprintf(name, sizeof(name), "blk.%u.attn_compressor_kv.weight", il);
-            if (gguf_find_tensor(gctx, name) >= 0) kv_source_ids.push_back((int32_t) il);
+            kv_source = gguf_find_tensor(gctx, name) >= 0;
             std::snprintf(name, sizeof(name), "blk.%u.indexer.attn_q_b.weight", il);
-            if (gguf_find_tensor(gctx, name) >= 0) index_source_ids.push_back((int32_t) il);
+            index_source = gguf_find_tensor(gctx, name) >= 0;
         }
+        if (!kv_declared && kv_source) kv_source_ids.push_back((int32_t) il);
+        if (!index_declared && index_source) index_source_ids.push_back((int32_t) il);
     }
     const int32_t candidate_source_layer = get_i32_or(gctx, key("attention.candidate_source_layer").c_str(), -1);
     const uint32_t candidate_topk_blocks = get_u32_or(gctx, key("attention.candidate_topk_blocks").c_str(), 0);
@@ -2131,7 +2135,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     if (out.shared_comp_cache) {
         std::fprintf(stderr, "[deepseek4] compress_ratios=%s kv_sources=%s (%s) index_sources=%s\n",
                      join_ints(compress_ratios).c_str(), join_ints(out.kv_source_layer_ids).c_str(),
-                     sources_declared ? "declared" : "inferred from tensors",
+                     kv_declared && index_declared ? "declared"
+                         : kv_declared || index_declared ? "partly inferred from tensors"
+                                                         : "inferred from tensors",
                      join_ints(out.index_source_layer_ids).c_str());
     }
     if (out.candidate_source_layer >= 0) {

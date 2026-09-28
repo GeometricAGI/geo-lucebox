@@ -414,7 +414,8 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         }
         dst.decode_hot_local_by_global = dst.hot_local_by_global;
         if (!no_cold_owner &&
-            !assign_cold_experts(cfg, il, is_hot, duplicate_hot_on_cold, true, dst, err)) {
+            !assign_cold_experts(cfg, il, is_hot, duplicate_hot_on_cold,
+                                 cfg.materializes_cold_experts(), dst, err)) {
             return false;
         }
         dst.decode_cold_local_by_global = dst.cold_local_by_global;

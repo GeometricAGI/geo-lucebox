@@ -40,6 +40,7 @@ bool run_device(int device) {
     Mailbox * box = nullptr;
     if (hipHostMalloc((void **) &box, sizeof(Mailbox),
                       hipHostMallocMapped | hipHostMallocPortable | hipHostMallocCoherent) != hipSuccess) {
+        ggml_backend_free(backend);
         return false;
     }
     std::memset(box, 0, sizeof(Mailbox));
@@ -65,7 +66,11 @@ bool run_device(int device) {
         // The resolver: wait for the post, check it, answer (late on launch 3).
         std::atomic<bool> post_ok{false};
         std::thread host([&] {
+            // Bounded: a post that never runs fails the launch instead of
+            // hanging the test.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
             while (__atomic_load_n(&box->posted, __ATOMIC_ACQUIRE) != (uint32_t) launch) {
+                if (std::chrono::steady_clock::now() > deadline) return;
                 std::this_thread::yield();
             }
             post_ok = std::memcmp(box->ids, in.data(), in.size() * sizeof(int32_t)) == 0;

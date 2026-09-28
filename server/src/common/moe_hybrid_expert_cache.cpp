@@ -62,6 +62,17 @@ void advise_willneed(const void * map, size_t map_size, const ExpertRanges & ran
 
 constexpr size_t kDirectAlign = ReadOnlyFile::kDirectAlign;
 
+// Claims `flag` for the life of one call; false when another call holds it.
+class SingleCaller {
+public:
+    explicit SingleCaller(std::atomic<bool> & flag) : flag_(flag), owned_(!flag.exchange(true)) {}
+    ~SingleCaller() { if (owned_) flag_.store(false); }
+    explicit operator bool() const { return owned_; }
+private:
+    std::atomic<bool> & flag_;
+    bool owned_;
+};
+
 // Reads [off, off + size) of the directly opened `file` into page-aligned
 // `buf` (capacity for size + 2 pages), returning where the bytes start.
 static const uint8_t * direct_read(const ReadOnlyFile & file, uint8_t * buf, uint64_t off, size_t size) {
@@ -244,6 +255,8 @@ void MoeStreamedExpertCache::destroy() {
     }
     loaders_.clear();
     direct_file_.close();
+    bulk_ = false;
+    direct_all_ = false;
     for (auto & kv : graphs_) kv.second.free();
     graphs_.clear();
     views_.clear();
@@ -680,6 +693,11 @@ bool MoeStreamedExpertCache::acquire(int layer, const int32_t * selected, int n_
         if (err) *err = "streamed expert cache not ready for this layer";
         return false;
     }
+    const SingleCaller caller(in_call_);
+    if (!caller) {
+        if (err) *err = "streamed expert cache used by two threads at once";
+        return false;
+    }
     const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
     std::vector<int32_t> uniq;
     std::vector<uint8_t> seen((size_t) cfg_.n_expert, 0);
@@ -751,6 +769,11 @@ bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
     if (!ready() || layer < 0 || (size_t) layer >= storage_->layers.size() ||
         view_of_layer_[(size_t) layer] < 0) {
         if (err) *err = "streamed expert cache not ready for this layer";
+        return false;
+    }
+    const SingleCaller caller(in_call_);
+    if (!caller) {
+        if (err) *err = "streamed expert cache used by two threads at once";
         return false;
     }
     const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];

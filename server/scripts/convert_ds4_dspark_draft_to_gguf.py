@@ -307,7 +307,9 @@ def main():
         if len(srcs) > 1:
             ne.append(len(srcs))
         tensors.append((gname, srcs, ttype, ne))
-    tensors.append(("dflash.dspark.confidence.bias", [], T_F32, [1]))
+    # The checkpoint may carry no bias (V4.1 has none): then it is zero.
+    conf_bias = f"mtp.{last}.confidence_head.proj.bias"
+    tensors.append(("dflash.dspark.confidence.bias", [conf_bias] if st.has(conf_bias) else [], T_F32, [1]))
 
     kv = [
         ("general.architecture", ARCH),

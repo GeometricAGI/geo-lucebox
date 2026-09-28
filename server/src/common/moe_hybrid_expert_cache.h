@@ -36,6 +36,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -139,6 +140,12 @@ private:
     std::function<void(int, const int32_t *, int)> observer_;
 };
 
+// One compute thread drives the cache at a time (stage, prefetch, eval,
+// acquire / release_acquired): a backend steps its model on one thread, and
+// paged serving puts every sequence into that one step. The loaders, the
+// warm start and the mailbox resolver run in the background under mu_. A
+// second concurrent eval or acquire fails instead of sharing the staging,
+// pins and graphs of the first.
 class MoeStreamedExpertCache {
 public:
     MoeStreamedExpertCache() = default;
@@ -317,6 +324,7 @@ private:
     std::vector<uint64_t> warm_;       // warm start keys, most used first
     size_t warm_next_ = 0;
     size_t refill_from_ = SIZE_MAX;    // warm_ entries from here reload evicted decode slots
+    std::atomic<bool> in_call_{false}; // an eval or acquire is running
     bool bulk_ = false;
     bool direct_all_ = false;          // every load reads with O_DIRECT
     ReadOnlyFile direct_file_;         // the model file opened for direct reads, if supported

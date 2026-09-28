@@ -28,7 +28,8 @@ MoeHybridStreamEngine::MoeHybridStreamEngine(MoeHybridStreamEngine && o) noexcep
       scratch_gate_(o.scratch_gate_), scratch_up_(o.scratch_up_),
       scratch_down_(o.scratch_down_),
       last_gate_bytes_(o.last_gate_bytes_), last_up_bytes_(o.last_up_bytes_),
-      last_down_bytes_(o.last_down_bytes_) {
+      last_down_bytes_(o.last_down_bytes_), stats_(o.stats_) {
+    o.stats_ = {};
     o.pinned_buf_ = nullptr; o.pinned_size_ = 0;
     o.gpu_scratch_ = nullptr; o.scratch_size_ = 0;
     o.backend_ = nullptr;
@@ -46,6 +47,7 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
         scratch_down_ = o.scratch_down_;
         last_gate_bytes_ = o.last_gate_bytes_; last_up_bytes_ = o.last_up_bytes_;
         last_down_bytes_ = o.last_down_bytes_;
+        stats_ = o.stats_; o.stats_ = {};
         o.pinned_buf_ = nullptr; o.pinned_size_ = 0;
         o.gpu_scratch_ = nullptr; o.scratch_size_ = 0;
         o.backend_ = nullptr;

@@ -432,7 +432,11 @@ bool deepseek4_cuda_hc_pre_mix_batch(const float * hc_states_host,
                                      int           n_hc,
                                      float         eps,
                                      float *       mix_host) {
-    if (!hc_states_host || !fn_device || !mix_host || n_tokens <= 0 || n_embd <= 0 || n_hc <= 0) {
+    // The kernels are built for the mix of n_hc = 4 copies (kMixDim values:
+    // pre, post and the 4 x 4 combination); the caller falls back to the
+    // host path otherwise.
+    if (!hc_states_host || !fn_device || !mix_host || n_tokens <= 0 || n_embd <= 0 ||
+        n_hc * (n_hc + 2) != kMixDim) {
         return false;
     }
     const int hc_dim = n_embd * n_hc;

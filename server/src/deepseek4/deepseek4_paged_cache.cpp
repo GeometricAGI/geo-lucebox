@@ -281,6 +281,8 @@ void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot) {
         ggml_backend_tensor_set(tensor, zeros.data(), (size_t) slot * bytes,
                                 bytes);
     };
+    // A new sequence starts with no n-gram context.
+    if (slot < c.engram_tokens.size()) c.engram_tokens[slot].reset();
     for (DeepSeek4PagedLayerCache & layer : c.layers) {
         clear_slot(layer.attn_compressor.state_kv);
         clear_slot(layer.attn_compressor.state_score);
@@ -343,7 +345,8 @@ bool import_deepseek4_paged_slot(const DeepSeek4Cache & src, int n_tokens,
         if (!same_rows(s.raw_kv, d.raw_kv) || s.raw_kv->ne[1] != int64_t(DS4_PAGE_TOKENS) ||
             ggml_nbytes(s.raw_kv) != d.raw_kv->nb[2]) return fail("raw ring layouts differ");
         if (!copy_plane(s.raw_kv, d.raw_kv)) return fail("raw ring copy failed");
-        if (!d.ratio) continue;
+        // A layer reading another layer's compressed rows (V4.1) owns none.
+        if (!d.ratio || !d.comp_kv) continue;
         const int groups = n_tokens / int(d.ratio);
         if (s.n_comp != groups) return fail("compressed row count does not match the prefix");
         if (!copy_groups(s.comp_kv, d.comp_kv, d.ratio, groups)) return fail("compressed row copy failed");
@@ -358,6 +361,8 @@ bool import_deepseek4_paged_slot(const DeepSeek4Cache & src, int n_tokens,
                 return fail("indexer copy failed");
         }
     }
+    if (dst.engram_tokens.size() < dst.plan.slots) dst.engram_tokens.resize(dst.plan.slots);
+    dst.engram_tokens[slot] = src.engram_tokens;
     return true;
 }
 

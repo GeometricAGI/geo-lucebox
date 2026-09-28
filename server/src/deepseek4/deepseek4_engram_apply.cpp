@@ -84,9 +84,11 @@ ggml_tensor * deepseek4_build_engram_apply(ggml_context * ctx,
     ggml_tensor * dot = ggml_scale(ctx, ggml_sum_rows(ctx, prod),
                                    1.0f / std::sqrt((float) n_embd));       // [1, n_hc, n_tokens]
 
-    // gate = sigmoid(sign(dot) * sqrt(max(|dot|, 1e-6)))
+    // gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)): a zero dot takes
+    // the positive branch, as copysign does (sign = 1 - 2 * (dot < 0)).
     ggml_tensor * mag = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, dot), 1e-6f, INFINITY));
-    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul(ctx, ggml_sgn(ctx, dot), mag));
+    ggml_tensor * sign = ggml_scale_bias(ctx, ggml_step(ctx, ggml_neg(ctx, dot)), -2.0f, 1.0f);
+    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul(ctx, sign, mag));
     if (gate_out) *gate_out = gate;
 
     // h_c += gate_c * value
