@@ -36,8 +36,8 @@ hf download Lucebox/Qwen3.8-27B-DFlash2-GGUF \
   --port 8216
 ```
 
-About 21 GiB of VRAM at the peak of an image request. Text requests keep the
-DFlash2 drafter; image requests decode without it.
+About 21 GiB of VRAM at the peak of an image request. Text and image requests
+both decode with the DFlash2 drafter.
 
 ### DeepSeek V4 Flash Vision on a Strix Halo
 
@@ -48,23 +48,41 @@ hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
 hf download Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF \
   DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf --local-dir models
 
-LUCE_DS4_SPEC=1 \
-LUCE_DS4_DRAFT=models/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf \
 LUCE_DS4_SPARSE_DECODE_FLASH=1 \
 ./server/build-hip/luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
-  --target-device hip:0 --max-ctx 131072 --chunk 8192 \
-  --cache-type-k q4_0 --cache-type-v q4_0 \
-  --ds4-fused-decode --ds4-fused-verify-f16-kv \
-  --ds4-expert-top-k 6 --ds4-prefill sparse \
+  --draft models/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf \
+  --target-device auto --profile ds4-strix \
   --mmproj models/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf \
   --port 8216
 ```
 
-`hip:0` must be the Strix Halo; on a host with a discrete GPU too, expose the
-Strix Halo alone with `HIP_VISIBLE_DEVICES`. This is the text model's published
-launch plus `--mmproj`: the Vision file replaces
+The model must run on the Strix Halo. `--target-device auto` picks it when the
+discrete GPU cannot hold the model, as with an R9700 (32 GB); with a larger
+discrete GPU, name the Strix Halo with `--target-device hip:N` instead
+(`luce_server --list-devices` shows the choice).
+This is the text model's published launch (`--profile ds4-strix`) plus `--mmproj`: the Vision file replaces
 `DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` for text as well and decodes
 at least as fast (numbers below). For R9700 + Strix Halo see [DS4V](#ds4v) below.
+
+With an R9700 in the same box, run the image encoder there while the model
+stays on the Strix Halo: expose both GPUs and add `--mmproj-device` with the
+R9700. `--target-device auto` already puts the model on the Strix Halo (on
+lucebox6, without `HIP_VISIBLE_DEVICES`, that is `hip:1`, so add
+`--mmproj-device hip:0`).
+The encoder then runs about twice as fast and streams each image into prefill
+as soon as it is encoded, so the Strix Halo never waits for the next one:
+
+| Images | Prompt tokens | Encoder on the Strix Halo | Encoder on the R9700 |
+| --- | --- | --- | --- |
+| 1 | 126 | 2.97 s | 2.94 s |
+| 4 | 942 | 11.2 s | 9.1 s |
+| 8 | 2,262 | 27.7 s | 19.2 s |
+| 16 | 4,358 | 51.8 s | 34.6 s |
+
+Time to the first token, with the published launch above and ChartQA charts.
+Answers are identical in both layouts. `--mmproj-device` applies to this one-GPU
+layout; with the experts split across both GPUs the encoder already runs on the
+R9700.
 
 ### Send an image
 
@@ -101,20 +119,60 @@ Use `POST /v1/chat/completions` with user-message content parts in display order
 
 Only base64 JPEG/PNG data URLs are supported. Remote URLs, images outside user
 content arrays, and image parts through other API formats are rejected. A
-request carries at most four images, 16 MiB encoded each and 32 MiB combined.
+request carries at most 16 images, 16 MiB encoded each and 32 MiB combined.
 Decoder pixel and aspect limits also apply. A model's image marker cannot be supplied
 as ordinary text.
 
 The server expands image markers after final rendering and tokenization, and
-the expanded image tokens count toward context and usage. Image requests use
-plain autoregressive decoding and bypass the token-keyed prefix, disk and
-agent-turn caches and prompt compression: tokens alone do not identify an
-image. Text requests on the same server keep speculative decoding and caching.
+the expanded image tokens count toward context and usage. Image requests
+bypass the token-keyed prefix, disk and agent-turn caches and prompt
+compression: tokens alone do not identify an image. Image requests decode
+with the model's drafter like text requests.
 
-Layer or tensor splitting across GPUs, remote target shards, concurrent
-sequence scheduling (`--max-concurrency`) and upstream forwarding do not
-support images. `/props` reports the effective capability in
-`capabilities.image_input_supported` after backend initialization.
+Layer or tensor splitting across GPUs, remote target shards and upstream
+forwarding do not support images. Qwen3.5 / Qwen3.8 serve images with
+concurrent sequence scheduling (`--paged-attention --max-concurrency N`): each
+image request is encoded when it is admitted and then prefills and decodes in
+the shared batch like text, with the drafter. On one R9700, four concurrent
+256-token image answers finish in 6.9 s (149 tok/s in total) against 13.3 s
+(77 tok/s) one at a time.
+
+DeepSeek V4 Flash Vision batches too, with the batched launch from the DeepSeek
+guide plus `--mmproj` (and `--mmproj-device` for an R9700 encoder):
+
+```
+luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
+  --target-device hip:1 --mmproj-device hip:0 \
+  --paged-attention --max-concurrency 4 --kv-pool-tokens 24576 --max-ctx 8192 \
+  --ds4-prefill exact --prefix-cache-slots 0 --ds4-expert-top-k 6 \
+  --mmproj models/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf
+```
+
+Its image blocks need whole-block bidirectional prefill, which the batched
+engine's 16-row step cannot run. An image request is therefore prefilled up to
+its last token into its slot's staging cache on the layer-major sparse path,
+then copied into its paged slot, and the last token prefills in the batch, so
+the answer decodes alongside everyone else. Every layer must see a whole image
+block at once, so the block cannot be split by rows; it is split by layers
+instead. While other requests are decoding, a staged pass takes about 256 rows
+(a whole image block, which may be more) shared by the pending image requests
+and runs 6 of its 43 layers per batched step, so live streams decode after
+every slice. The result is identical to running the pass in one go. With
+nothing decoding, a pass takes up to 1,024 rows and all its layers at once, so
+the requests share each layer's expert reads. With `--mmproj-device`, the
+encoder works through admitted requests on its own GPU and never stalls the
+batch. Measured on the Strix Halo with the encoder on the R9700: two text
+streams decoding while three one-image requests and one eight-image request
+arrive pause at most 0.67 s between tokens; four concurrent image answers of
+256 tokens finish in 37.5 s (27 tok/s in total).
+
+The staging caches, one per slot, are allocated at startup and logged
+(`staging caches 286 MB` for 4 slots at `--max-ctx 8192`). Image requests
+beyond the free slots wait in the queue. Under KV pressure the scheduler never
+parks an image request for recompute (token ids cannot rebuild image rows); it
+suspends or parks a text request instead. `/props` reports the effective
+capability in `capabilities.image_input_supported` after backend
+initialization.
 
 ## Qwen3.5 / Qwen3.8
 
@@ -144,15 +202,21 @@ Lucebox `Qwen3.8-27B-IQ4_XS-pure` file and a Q8_0 projector:
   lmms-eval prompts: AI2D 90/100, ChartQA relaxed accuracy 56/60 (augmented)
   and 42/60 (human). Image prompts prefill in 0.56 s on average; one to four
   images per request all answer correctly (four images, 2,495 tokens: 3.2 s).
-- Text decodes at 56 to 117 tok/s on 256-token answers (84 on average); image
-  requests decode without the drafter at about 36 tok/s.
+- Text decodes at 56 to 117 tok/s on 256-token answers (84 on average).
+- Image requests decode with the drafter. On 12 images with 256-token
+  answers: 4.0 s per answer (76 tok/s after the first token), against 5.5 s
+  for llama.cpp with the same drafter (`--spec-type draft-dflash`) and 8.4 s
+  without one; faster than llama.cpp with the drafter on every image, 1.21x
+  to 1.58x. The 220-question score
+  is unchanged (188, 218 answers identical to plain decode).
 
 With unsloth's UD-IQ4_XS file and the published BF16 projector:
 
 - 220 seeded questions from `lmms-lab/ai2d` and `lmms-lab/ChartQA` with
   lmms-eval prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented)
   and 43/60 (human), no errors. Image prompts average 448 tokens and prefill in
-  0.71 s (largest 1,068 tokens, 1.8 s); decode runs at 31 to 35 tok/s.
+  0.71 s (largest 1,068 tokens, 1.8 s); decode runs at 31 to 35 tok/s (plain
+  decode, measured before image requests used the drafter).
 - A projector with its weight matrices in Q8_0 (rows that are not a multiple
   of 32 stay F16) encodes a 975-token image in 443 ms instead of 677 ms with
   the BF16 file, with the same scores on the 220 questions and 216 identical
@@ -167,7 +231,8 @@ With unsloth's UD-IQ4_XS file and the published BF16 projector:
   tokens). The projector adds 0.9 GiB of VRAM; the peak during image requests
   was 21.6 GiB against 20.8 GiB for text.
 - The same requests answer correctly on a Strix Halo alone, where a
-  1,012-token image prompt prefills in 4.6 s and decodes at 14 tok/s.
+  1,012-token image prompt prefills in 4.6 s and decodes at 14 tok/s (plain
+  decode).
 
 Not yet established: a comparison against the reference implementation on the
 same questions, and CUDA. The tower uses only standard ggml
@@ -207,10 +272,11 @@ per-expert layout is used expert by expert; the community publishes one for
 this model) or `--absmax-only`. The converter uses every core: about 40 minutes
 for this checkpoint on 32 cores.
 
-One image request may be outstanding per backend. Its admission lease remains
-with the immutable payload through queueing and generation; another image
-request is rejected until that payload is released. This bounds simultaneous
-preprocessing and prepared-image memory. Text requests retain the normal queue.
+Image requests wait in the same queue as text requests. A waiting request
+holds only its preprocessed patches, a few MB per image; its encoded rows
+exist only while it runs, so the number of slots bounds them. When host
+memory is too short to prepare another image request, the server answers
+HTTP 503 and the client should retry.
 
 The server expands image markers after final rendering and tokenization.
 Expanded image tokens count toward context and usage. Image blocks remain
@@ -246,7 +312,8 @@ the exported projector, on a Strix Halo alone and on R9700 + Strix Halo, 220
 seeded questions from `lmms-lab/ai2d` and `lmms-lab/ChartQA` with lmms-eval
 prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented) and 43/60
 (human). Both layouts score the same and give word-identical answers on 213 of
-220 questions. An image request prefills in about 4 s and decodes at about
+220 questions. An image request prefills in about 4 s and, without the
+drafter, decodes at about
 23 tok/s.
 
 With our own ROCMFP MIX conversion of the same checkpoint (per-expert
@@ -260,7 +327,14 @@ importance matrix, the shipped recipe above), on a Strix Halo alone at top-k 6:
   and one-to-four-image sets are all correct.
 - With the published DSpark drafter and fused decode and verify, text decodes
   at 25 to 37 tok/s on 256-token answers (30 mean), as fast as the shipped
-  text model; image requests decode without the drafter at about 22 tok/s.
+  text model.
+- Image requests decode with the DSpark drafter too: on 12 images with
+  256-token answers, 13.3 s per answer (30 tok/s after the first token)
+  against 15.7 s (22 tok/s) without it. Capturing the drafter's features
+  during prefill adds about 0.7 s before the first token, so one-word answers
+  come back slightly later. The 220 questions score AI2D 86, ChartQA 55 and
+  40 with the drafter (209 answers identical to plain decode); one to four
+  images all correct.
 
 Not yet established:
 

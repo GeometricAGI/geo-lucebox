@@ -151,6 +151,22 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
 // Accepts 0 (the default of five) or 1..16; returns the previous ceiling.
 GGML_BACKEND_API int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens);
 
+// One stream-ordered copy per descriptor, all in one kernel launch per 48
+// descriptors instead of one blit per copy. src and dst are device pointers
+// (or host memory the device can address) on the backend's device; ranges of
+// different descriptors must not overlap. Asynchronous on the backend stream.
+struct ggml_cuda_copy_desc {
+    const void * src;
+    void       * dst;
+    size_t       nbytes;
+};
+GGML_BACKEND_API void ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
+                                                         const struct ggml_cuda_copy_desc * descs,
+                                                         int n);
+// Graph copy runs issued as one batched launch on the calling thread (see
+// GGML_CUDA_DISABLE_COPY_BATCH); for tests and profiling.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_copy_batch_run_count(void);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

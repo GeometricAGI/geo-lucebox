@@ -21,6 +21,7 @@
 #include "server/api_types.h"
 #include "server/http_server.h"
 #include "server/image_input.h"
+#include "qwen35/qwen35_backend.h"
 #include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
@@ -38,6 +39,7 @@
 #include "common/layer_split_kvflash.h"
 #include "common/layer_split_utils.h"
 #include "common/kvflash_pager.h"
+#include "placement/device_select.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
 #include "common/gguf_inspect.h"
@@ -152,6 +154,18 @@ struct SchedulerTestHarness {
             const HttpServer & server, int slot) {
         return server.slot_tokens_.at(slot);
     }
+
+    static void publish_memory_report(HttpServer & server) {
+        server.publish_memory_report();
+    }
+
+    static json memory_json(const HttpServer & server) {
+        return server.memory_json();
+    }
+
+    static void mark_agent_turn(HttpServer & server, int slot) {
+        server.agent_turn_cache_slots_.insert(slot);
+    }
 };
 }
 
@@ -186,6 +200,41 @@ TEST_CASE(ServerUnitFixture, test_placement_device_rejects_gpu_index_overflow) {
         TEST_ASSERT(!parse_placement_device(value, device));
     }
     TEST_ASSERT(!parse_placement_device_list("hip:0,hip:4294967296", device));
+}
+
+// --target-device auto sizes the KV cache from the GGUF header for the
+// Qwen3.5/3.6 hybrids: only full-attention layers, excluding NextN blocks.
+TEST_CASE(ServerUnitFixture, test_gguf_kv_cache_bytes_counts_full_attention_layers) {
+    auto write = [](const char * arch, const char * name) {
+        gguf_context * g = gguf_init_empty();
+        const std::string pre = std::string(arch) + ".";
+        gguf_set_val_str(g, "general.architecture", arch);
+        gguf_set_val_u32(g, (pre + "block_count").c_str(), 9);
+        gguf_set_val_u32(g, (pre + "nextn_predict_layers").c_str(), 1);
+        gguf_set_val_u32(g, (pre + "full_attention_interval").c_str(), 4);
+        gguf_set_val_u32(g, (pre + "attention.head_count_kv").c_str(), 2);
+        gguf_set_val_u32(g, (pre + "attention.key_length").c_str(), 128);
+        gguf_set_val_u32(g, (pre + "attention.value_length").c_str(), 128);
+        const std::string path = test_tmp_path(name).string();
+        gguf_write_to_file(g, path.c_str(), /*only_meta=*/true);
+        gguf_free(g);
+        return path;
+    };
+    const std::string qwen = write("qwen35", "luce_test_kv_qwen35.gguf");
+    // 8 target layers / interval 4 = 2 full-attention layers, 2 KV heads.
+    const uint64_t q4_row = ggml_row_size(GGML_TYPE_Q4_0, 128);
+    TEST_ASSERT(gguf_kv_cache_bytes(qwen, 1000, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0) ==
+                2ull * 2 * (q4_row + q4_row) * 1000);
+    const uint64_t f16_row = ggml_row_size(GGML_TYPE_F16, 128);
+    TEST_ASSERT(gguf_kv_cache_bytes(qwen, 1000, GGML_TYPE_F16, GGML_TYPE_F16) ==
+                2ull * 2 * (f16_row + f16_row) * 1000);
+    TEST_ASSERT(gguf_kv_cache_bytes(qwen, 0, GGML_TYPE_F16, GGML_TYPE_F16) == 0);
+
+    // Families that size their own caches are not estimated.
+    TEST_ASSERT(gguf_kv_cache_bytes(write("deepseek4", "luce_test_kv_ds4.gguf"), 1000,
+                                    GGML_TYPE_F16, GGML_TYPE_F16) == 0);
+    TEST_ASSERT(gguf_kv_cache_bytes(test_tmp_path("luce_test_kv_missing.gguf").string(),
+                                    1000) == 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
@@ -3532,6 +3581,110 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 0) == 100);
 }
 
+TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_includes_trailing_tool_result) {
+    const std::vector<int> boundaries = {100, 240, 380, 520};
+    // A prompt ending in tool results is snapshotted through them, up to
+    // the generation prompt, because the next agent turn only appends.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, false, true) == 520);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380, false, true) == 520);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 520, false, true) == 0);
+    // The cold tools head still comes first.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, true, true) == 100);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true, true) == 520);
+}
+
+// The last-marker cut is only safe if every native template renders the
+// prompt through its final role marker identically once the next agent turn
+// is appended after the tool results.
+TEST_CASE(ServerUnitFixture, test_tool_result_prompt_prefix_survives_next_agent_turn) {
+    struct Family { ChatFormat format; const char * marker; };
+    const Family families[] = {
+        {ChatFormat::QWEN3, "<|im_start|>"},
+        {ChatFormat::DEEPSEEK4, "<｜Assistant｜>"},
+        {ChatFormat::GEMMA4, "<|turn>"},
+        {ChatFormat::LAGUNA, "<assistant>"},
+    };
+    std::vector<ChatMessage> turn = {
+        {"system", "You are a coding agent."},
+        {"user", "Read main.cpp and fix the bug."},
+        {"assistant", "<tool_call>read main.cpp</tool_call>"},
+        {"tool", "int main() { return 1; }", "call_1"},
+        {"tool", "second parallel result", "call_2"},
+    };
+    std::vector<ChatMessage> next = turn;
+    next.push_back({"assistant", "<tool_call>edit main.cpp</tool_call>"});
+    next.push_back({"tool", "edited", "call_3"});
+    for (const bool thinking : {false, true}) {
+        for (const auto & family : families) {
+            const std::string now = render_chat_template(
+                turn, family.format, true, thinking, "[]");
+            const std::string later = render_chat_template(
+                next, family.format, true, thinking, "[]");
+            const size_t marker = now.rfind(family.marker);
+            TEST_ASSERT(marker != std::string::npos);
+            const size_t cut = marker + std::strlen(family.marker);
+            // The cut covers both tool results and stops before the
+            // generation prompt's role text.
+            TEST_ASSERT(now.substr(0, cut).find("second parallel result") !=
+                        std::string::npos);
+            TEST_ASSERT_MSG(later.compare(0, cut, now, 0, cut) == 0,
+                            now.substr(0, cut));
+        }
+    }
+}
+
+// Qwen saves only at prefill chunk starts past the restore point. Cuts it
+// cannot reach are skipped: a short system/tools head is not pinned (it would
+// never be saved and the cache would never deepen), and the next reachable
+// boundary is taken instead.
+TEST_CASE(ServerUnitFixture, test_inline_snapshot_skips_unreachable_cuts) {
+    const std::vector<int> boundaries = {266, 700, 1300, 1800};
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    boundaries, 0, true, false, /*reachable_from=*/512) == 1300);
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    boundaries, 0, true, true, 512) == 1800);
+    // A reachable head is still pinned first.
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    boundaries, 0, true, false, 1) == 266);
+    // Nothing reachable yet: no reservation, prefill stays cold.
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    {100, 300}, 0, true, true, 512) == 0);
+    // Restored at 1024 with 512-token chunks: 1300 lies in the first chunk.
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    boundaries, 1024, false, false, 1024 + 512) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    boundaries, 1024, false, true, 1024 + 512) == 1800);
+    // A PPP pin the backend cannot save is not forced.
+    TEST_ASSERT(!should_force_inline_snapshot_boundary(
+                    boundaries, 2000, 0, true, 266, 512));
+    TEST_ASSERT(should_force_inline_snapshot_boundary(
+                    boundaries, 2000, 0, true, 700, 512));
+
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+    // Boundaries at 2, 4 and 6; the backend can save from position 3 on.
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3};
+    auto capture = cache.reserve_inline_snap(
+        prompt, 0, /*prefer_tools_boundary=*/true, /*forced_cut=*/2, -1, {},
+        /*include_last_message=*/false, /*reachable_from=*/3);
+    TEST_ASSERT(capture.active());
+    TEST_ASSERT(capture.target_cut() > 2);
+    capture.cancel();
+
+    // An agent-turn replay saves at the end of its prefill, which any backend
+    // can do, so it reserves without a reachability floor even when it is
+    // shorter than one chunk.
+    auto replay = cache.reserve_inline_snap(
+        prompt, /*restored_prefix_len=*/5, false,
+        /*forced_cut=*/(int) prompt.size(), /*restore_source_slot=*/-1);
+    TEST_ASSERT(replay.active());
+    TEST_ASSERT(replay.target_cut() == (int) prompt.size());
+    replay.cancel();
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_prefers_tools_boundary_until_restored) {
     const std::vector<int> boundaries = {100, 240, 380, 520};
     // Cold tool-heavy: pin system+tools head (first marker), not deepen cut.
@@ -3977,6 +4130,164 @@ TEST_CASE(ServerUnitFixture, test_slide_free_slot_skips_restore_source) {
     TEST_ASSERT(snap.active());
     TEST_ASSERT(snap.slot() != hit.first);
     snap.cancel();
+    unlink(path.c_str());
+}
+
+// (f) Below capacity, a free slot is taken before a live one. Round-robin
+// alone wraps onto committed snapshots once a slot in the middle is freed.
+TEST_CASE(ServerUnitFixture, test_free_slot_taken_before_live_slot) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+
+    std::vector<std::vector<int32_t>> prompts = {
+        {1, 100}, {1, 200}, {1, 300}, {1, 400},
+    };
+    for (int i = 0; i < 4; ++i) {
+        auto prepared = cache.reserve_inline_snap(
+            prompts[(size_t)i], 0, false, 2);
+        TEST_ASSERT(prepared.slot() == i);
+        TEST_ASSERT(prepared.commit(prompts[(size_t)i]));
+    }
+    cache.invalidate_inline_snap(2);
+
+    const std::vector<int32_t> next = {1, 500};
+    auto prepared = cache.reserve_inline_snap(next, 0, false, 2);
+    TEST_ASSERT(prepared.slot() == 2);
+    TEST_ASSERT(prepared.commit(next));
+    TEST_ASSERT(cache.stats().in_use == 4);
+    TEST_ASSERT(cache.lookup(prompts[0]).first == 0);
+    unlink(path.c_str());
+}
+
+// (g) A new turn supersedes the intermediate turns of its conversation. The
+// shallowest ancestor (shared head), protected pins and sibling branches stay.
+TEST_CASE(ServerUnitFixture, test_prune_superseded_ancestors) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(8, tokenizer);
+
+    const std::vector<int32_t> head = {1, 100};
+    std::vector<int32_t> t1 = head;
+    t1.insert(t1.end(), {3, 101});
+    std::vector<int32_t> t2 = t1;
+    t2.insert(t2.end(), {4, 102});
+    std::vector<int32_t> t3 = t2;
+    t3.insert(t3.end(), {3, 103});
+    std::vector<int32_t> sibling = head;
+    sibling.insert(sibling.end(), {3, 900});
+
+    cache.confirm_inline_snap(0, (int)head.size(), head, false, 10);
+    cache.confirm_inline_snap(1, (int)t1.size(), t1, false, 20);
+    cache.confirm_inline_snap(2, (int)t2.size(), t2, false, 30);
+    cache.confirm_inline_snap(3, (int)sibling.size(), sibling, false, 20);
+    cache.confirm_inline_snap(4, (int)t3.size(), t3, false, 40);
+
+    auto pruned = cache.prune_superseded_ancestors(4);
+    std::sort(pruned.begin(), pruned.end());
+    TEST_ASSERT(pruned == std::vector<int>({1, 2}));
+    TEST_ASSERT(cache.stats().in_use == 3);
+    TEST_ASSERT(cache.stats().resident_bytes == 70);
+    TEST_ASSERT(cache.lookup(t3).first == 4);
+    TEST_ASSERT(cache.lookup(sibling).first == 3);
+    // Pruning again finds nothing left to drop.
+    TEST_ASSERT(cache.prune_superseded_ancestors(4).empty());
+    // A slot without an entry prunes nothing.
+    TEST_ASSERT(cache.prune_superseded_ancestors(7).empty());
+
+    // A protected pin that is not the shallowest ancestor also survives.
+    PrefixCache pinned(8, tokenizer);
+    pinned.confirm_inline_snap(0, (int)head.size(), head);
+    pinned.confirm_inline_snap(1, (int)t1.size(), t1, /*protect=*/true);
+    pinned.confirm_inline_snap(2, (int)t2.size(), t2);
+    pinned.confirm_inline_snap(3, (int)t3.size(), t3);
+    TEST_ASSERT(pinned.prune_superseded_ancestors(3) == std::vector<int>({2}));
+    unlink(path.c_str());
+}
+
+// (h) With pruning on, the budget counts what a capture supersedes (its
+// restore source included) as freed. Otherwise a deep capture has to evict
+// the shared system/tools head to fit.
+TEST_CASE(ServerUnitFixture, test_budget_counts_superseded_snapshots_as_freed) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    const std::vector<int32_t> head = {1, 100};
+    std::vector<int32_t> turn1 = head;
+    turn1.insert(turn1.end(), {3, 101});
+    std::vector<int32_t> turn2 = turn1;
+    turn2.insert(turn2.end(), {4, 102});
+    std::vector<int32_t> turn3 = turn2;
+    turn3.insert(turn3.end(), {3, 103});
+    // Budget 300: head 20 + turn2 150 resident, turn3 needs 150 more.
+    const auto sized = [](int cut) { return cut <= 2 ? (size_t) 20 : (size_t) 150; };
+    for (const bool prunes : {false, true}) {
+        PrefixCache cache(8, tokenizer, /*max_resident_bytes=*/300);
+        cache.set_prunes_superseded(prunes);
+        cache.confirm_inline_snap(0, (int) head.size(), head, false, 20);
+        cache.confirm_inline_snap(1, (int) turn1.size(), turn1, false, 150);
+        cache.confirm_inline_snap(2, (int) turn2.size(), turn2, false, 150);
+        TEST_ASSERT(cache.prune_superseded_ancestors(2) == std::vector<int>({1}));
+        TEST_ASSERT(cache.stats().resident_bytes == 170);
+
+        auto capture = cache.reserve_inline_snap(
+            turn3, (int) turn2.size(), false, (int) turn3.size(),
+            /*restore_source_slot=*/2, sized);
+        TEST_ASSERT(capture.active());
+        if (!prunes) {
+            // The restore source cannot make room, so the head is replaced.
+            TEST_ASSERT(capture.slot() == 0);
+            capture.cancel();
+            continue;
+        }
+        const int slot = capture.slot();
+        TEST_ASSERT(slot != 0 && slot != 2);
+        TEST_ASSERT(capture.commit(turn3, 150));
+        TEST_ASSERT(cache.prune_superseded_ancestors(slot) == std::vector<int>({2}));
+        TEST_ASSERT(cache.stats().resident_bytes == 170);
+        TEST_ASSERT(cache.lookup(turn3).first == slot);
+        std::vector<int32_t> other = head;
+        other.insert(other.end(), {3, 999});
+        TEST_ASSERT(cache.lookup(other).first == 0);  // head kept
+    }
+    unlink(path.c_str());
+}
+
+// (i) A capture can commit shorter than it reserved (agent-turn replay saves
+// at the backend's position), so an ancestor credited as freed may stay
+// resident. Enforcing the budget after the commit restores the invariant.
+TEST_CASE(ServerUnitFixture, test_budget_enforced_after_shorter_commit) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(8, tokenizer, /*max_resident_bytes=*/300);
+    cache.set_prunes_superseded(true);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102};
+    const std::vector<int32_t> head(prompt.begin(), prompt.begin() + 2);
+    const std::vector<int32_t> middle(prompt.begin(), prompt.begin() + 4);
+    cache.confirm_inline_snap(0, 2, head, false, 20);
+    cache.confirm_inline_snap(1, 4, middle, false, 150);
+
+    // The reservation credits `middle` (an ancestor of the 6-token cut).
+    auto capture = cache.reserve_inline_snap(
+        prompt, 2, false, (int) prompt.size(), /*restore_source_slot=*/0,
+        [](int) { return (size_t) 150; });
+    TEST_ASSERT(capture.active());
+    const int slot = capture.slot();
+    // It lands at 3 tokens, so `middle` is its descendant, not its ancestor.
+    TEST_ASSERT(capture.commit_at(prompt, 3, 150));
+    TEST_ASSERT(cache.prune_superseded_ancestors(slot).empty());
+    TEST_ASSERT(cache.stats().resident_bytes == 320);
+
+    TEST_ASSERT(cache.enforce_resident_budget(slot) == std::vector<int>({1}));
+    TEST_ASSERT(cache.stats().resident_bytes == 170);
+    TEST_ASSERT(cache.lookup(prompt).first == slot);
+    // Within budget there is nothing to evict.
+    TEST_ASSERT(cache.enforce_resident_budget(slot).empty());
     unlink(path.c_str());
 }
 
@@ -4826,6 +5137,111 @@ TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {
     ggml_free(ctx);
 }
 
+// The prefix cache budgets captures before they exist, so the Qwen estimate
+// must equal the buffer snapshot_target_cache() allocates at each length.
+TEST_CASE(ServerUnitFixture, test_qwen_snapshot_estimate_matches_saved_snapshot) {
+    TargetWeights w;
+    w.n_layer = 4;
+    w.full_attention_interval = 4;
+    w.n_embd = 64;
+    w.n_embd_head_k = 32;
+    w.n_embd_head_v = 32;
+    w.n_head = 2;
+    w.n_head_kv = 1;
+    w.ssm_d_conv = 4;
+    w.ssm_d_inner = 64;
+    w.ssm_d_state = 16;
+    w.ssm_dt_rank = 4;
+    w.ssm_n_group = 2;
+    w.n_capture_layers = 5;
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    TEST_ASSERT(cpu != nullptr);
+    TargetCache cache;
+    TEST_ASSERT(create_target_cache(w, 64, 0, cpu, cache, /*prefill_only=*/true));
+    // Every snapshot part is present: K/V, recurrent state, target features.
+    TEST_ASSERT(!cache.attn_k.empty() && cache.attn_k[0] != nullptr);
+    TEST_ASSERT(!cache.ssm_state.empty() && cache.ssm_state[0] != nullptr);
+    TEST_ASSERT(cache.target_feat != nullptr);
+
+    const auto buft = ggml_backend_get_default_buffer_type(cpu);
+    for (const int tokens : {1, 17, 64}) {
+        cache.cur_pos = tokens;
+        PrefixSnapshot snap;
+        TEST_ASSERT(snapshot_target_cache(w, cache, cpu, snap));
+        TEST_ASSERT(ggml_backend_buffer_get_size(snap.buf) ==
+                    estimate_target_cache_snapshot_bytes(w, cache, tokens, buft));
+        free_prefix_snapshot(snap);
+    }
+    // Lengths past the cache capacity cost what a full cache costs.
+    TEST_ASSERT(estimate_target_cache_snapshot_bytes(w, cache, 1 << 30, buft) ==
+                estimate_target_cache_snapshot_bytes(w, cache, 64, buft));
+    TEST_ASSERT(estimate_target_cache_snapshot_bytes(w, cache, 0, buft) == 0);
+
+    free_target_cache(cache);
+    ggml_backend_free(cpu);
+}
+
+// The Qwen report adds up the live cache and each snapshot from the buffers
+// snapshot_target_cache() actually allocates.
+TEST_CASE(ServerUnitFixture, test_qwen_memory_report_matches_buffers) {
+    TargetWeights w;
+    w.n_layer = 4;
+    w.full_attention_interval = 4;
+    w.n_embd = 64;
+    w.n_embd_head_k = 32;
+    w.n_embd_head_v = 32;
+    w.n_head = 2;
+    w.n_head_kv = 1;
+    w.ssm_d_conv = 4;
+    w.ssm_d_inner = 64;
+    w.ssm_d_state = 16;
+    w.ssm_dt_rank = 4;
+    w.ssm_n_group = 2;
+    w.n_capture_layers = 5;
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    TEST_ASSERT(cpu != nullptr);
+    TargetCache cache;
+    TEST_ASSERT(create_target_cache(w, 64, 0, cpu, cache, /*prefill_only=*/true));
+    PrefixSnapshot snapshots[3];
+    cache.cur_pos = 17;
+    TEST_ASSERT(snapshot_target_cache(w, cache, cpu, snapshots[1]));
+    cache.cur_pos = 40;
+
+    const auto report = Qwen35Backend::memory_report_for(cache, snapshots, 3);
+    TEST_ASSERT(report.available);
+    TEST_ASSERT(report.cache.host);
+    TEST_ASSERT(report.cache.capacity_tokens == 64);
+    TEST_ASSERT(report.cache.live_tokens == 40);
+    uint64_t kv = 0, recurrent = 0;
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        kv += ggml_nbytes(cache.attn_k[i]) + ggml_nbytes(cache.attn_v[i]);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        recurrent += ggml_nbytes(cache.ssm_state[i]) + ggml_nbytes(cache.conv_state[i]);
+    }
+    TEST_ASSERT(kv > 0 && recurrent > 0);
+    TEST_ASSERT(report.cache.kv_bytes == kv);
+    TEST_ASSERT(report.cache.recurrent_bytes == recurrent);
+    TEST_ASSERT(report.cache.draft_feature_bytes == ggml_nbytes(cache.target_feat));
+    uint64_t allocated = ggml_backend_buffer_get_size(cache.base_buf);
+    if (cache.rollback_buf) allocated += ggml_backend_buffer_get_size(cache.rollback_buf);
+    TEST_ASSERT(report.cache.kv_bytes + report.cache.recurrent_bytes +
+                    report.cache.draft_feature_bytes + report.cache.other_bytes ==
+                allocated);
+    TEST_ASSERT(report.snapshots.size() == 1);
+    TEST_ASSERT(report.snapshots[0].slot == 1);
+    TEST_ASSERT(report.snapshots[0].tokens == 17);
+    TEST_ASSERT(report.snapshots[0].host);
+    TEST_ASSERT(report.snapshots[0].bytes ==
+                ggml_backend_buffer_get_size(snapshots[1].buf));
+
+    free_prefix_snapshot(snapshots[1]);
+    free_target_cache(cache);
+    ggml_backend_free(cpu);
+}
+
 TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
     std::vector<ChatMessage> msgs = {
         {"system", "you are helpful", ""},
@@ -5515,8 +5931,11 @@ struct ShortInlineSnapshotBackend : MockBackend {
     }
 };
 
+// Qwen saves at the chunk boundary at or before the requested cut. The entry
+// stays keyed at the requested cut so the next request treats that cut as
+// covered and deepens past it; only the disk/shutdown key uses the saved rows.
 TEST_CASE(ServerUnitFixture,
-          test_inline_snapshot_finalization_uses_actual_saved_position) {
+          test_inline_snapshot_finalization_keys_requested_cut) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -5543,11 +5962,212 @@ TEST_CASE(ServerUnitFixture,
 
     const auto hit = cache.lookup(prompt);
     TEST_ASSERT(hit.first == backend.saved_slot);
-    TEST_ASSERT(hit.second == backend.saved_position);
+    TEST_ASSERT(hit.second == 4);
     TEST_ASSERT(SchedulerTestHarness::slot_tokens(
                     server, backend.saved_slot) ==
                 std::vector<int32_t>(prompt.begin(), prompt.begin() + 3));
 
+    unlink(path.c_str());
+}
+
+struct PruningSnapshotBackend : ShortInlineSnapshotBackend {
+    std::vector<int> freed;
+    int max_tokens = 1000;
+
+    void snapshot_free(int slot) override { freed.push_back(slot); }
+    size_t snapshot_bytes_estimate(int tokens) const override {
+        return (size_t)std::min(tokens, max_tokens) * 100 + 1000;
+    }
+};
+
+// A new turn's snapshot supersedes the intermediate turns before it: the
+// server frees their payloads and keeps only the conversation head.
+TEST_CASE(ServerUnitFixture, test_inline_snapshot_finalization_prunes_chain) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<PruningSnapshotBackend>();
+    PruningSnapshotBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 4;
+    config.prefix_cache_max_bytes = 0;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+
+    const std::vector<int32_t> head = {1, 100};
+    std::vector<int32_t> turn1 = head;
+    turn1.insert(turn1.end(), {3, 101});
+    std::vector<int32_t> turn2 = turn1;
+    turn2.insert(turn2.end(), {4, 102});
+    cache.confirm_inline_snap(0, (int)head.size(), head);
+    cache.confirm_inline_snap(1, (int)turn1.size(), turn1);
+
+    auto reservation = cache.reserve_inline_snap(
+        turn2, (int)turn1.size(), /*prefer_tools_boundary=*/false,
+        /*forced_cut=*/(int)turn2.size(), /*restore_source_slot=*/1);
+    TEST_ASSERT(reservation.active());
+    const int slot = reservation.slot();
+    TEST_ASSERT(slot != 0 && slot != 1);
+    backend.saved_slot = slot;
+    backend.saved_position = (int)turn2.size();
+    SchedulerTestHarness::finalize_inline_snapshot(
+        server, turn2, std::move(reservation), slot,
+        /*requested_cut=*/(int)turn2.size());
+
+    TEST_ASSERT(backend.freed == std::vector<int>({1}));
+    TEST_ASSERT(cache.stats().in_use == 2);
+    TEST_ASSERT(cache.lookup(turn2).first == slot);
+    std::vector<int32_t> other = head;
+    other.insert(other.end(), {3, 999});
+    TEST_ASSERT(cache.lookup(other).first == 0);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_resolution) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    const auto budget_for = [&](std::unique_ptr<ModelBackend> backend,
+                                size_t configured) {
+        LuceEngine engine(std::move(backend));
+        ServerConfig config;
+        config.prefix_cache_cap = 2;
+        config.prefix_cache_max_bytes = configured;
+        HttpServer server(engine, tokenizer, config);
+        return SchedulerTestHarness::prefix_cache(server)
+            .stats().max_resident_bytes;
+    };
+    // Auto: three snapshots at the backend's full context (1000 tokens).
+    TEST_ASSERT(budget_for(std::make_unique<PruningSnapshotBackend>(),
+                           ServerConfig::kPrefixCacheBudgetAuto) ==
+                3 * (1000 * 100 + 1000));
+    TEST_ASSERT(budget_for(std::make_unique<PruningSnapshotBackend>(),
+                           5000) == 5000);
+    TEST_ASSERT(budget_for(std::make_unique<PruningSnapshotBackend>(),
+                           0) == 0);
+    // A backend that cannot size snapshots keeps the cache unbounded rather
+    // than refusing every capture.
+    TEST_ASSERT(budget_for(std::make_unique<MockBackend>(),
+                           ServerConfig::kPrefixCacheBudgetAuto) == 0);
+
+    // Startup rejects an explicit limit the backend cannot enforce, instead
+    // of silently running without it; auto and 0 stay accepted.
+    MockBackend unsized;
+    PruningSnapshotBackend sized;
+    ServerConfig config;
+    config.prefix_cache_max_bytes = 5000;
+    PrefixCacheBudget budget = resolve_prefix_cache_budget(config, unsized);
+    TEST_ASSERT(budget.bytes == 0 && !budget.sized && !budget.error.empty());
+    budget = resolve_prefix_cache_budget(config, sized);
+    TEST_ASSERT(budget.bytes == 5000 && !budget.automatic && budget.error.empty());
+    config.prefix_cache_max_bytes = 0;
+    budget = resolve_prefix_cache_budget(config, unsized);
+    TEST_ASSERT(budget.bytes == 0 && budget.error.empty());
+    config.prefix_cache_max_bytes = ServerConfig::kPrefixCacheBudgetAuto;
+    budget = resolve_prefix_cache_budget(config, unsized);
+    TEST_ASSERT(budget.bytes == 0 && budget.automatic && budget.error.empty());
+    budget = resolve_prefix_cache_budget(config, sized);
+    TEST_ASSERT(budget.bytes == 3 * (1000 * 100 + 1000) && budget.automatic);
+    // With the prefix cache off there is nothing to bound or reject.
+    config.prefix_cache_cap = 0;
+    config.prefix_cache_max_bytes = 5000;
+    budget = resolve_prefix_cache_budget(config, unsized);
+    TEST_ASSERT(budget.bytes == 0 && budget.error.empty());
+    config.prefix_cache_cap = 32;
+    // Concurrent paged serving keeps its own limit, whatever the backend.
+    config.concurrent_paged_prefix_cache = true;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    budget = resolve_prefix_cache_budget(config, unsized);
+    TEST_ASSERT(budget.bytes == 4096 && budget.error.empty());
+    unlink(path.c_str());
+}
+
+struct MemoryReportBackend : MockBackend {
+    MemoryReport memory_report() const override {
+        MemoryReport report;
+        report.available = true;
+        report.cache.capacity_tokens = 4096;
+        report.cache.live_tokens = 1200;
+        report.cache.kv_bytes = 1000;
+        report.cache.recurrent_bytes = 200;
+        report.cache.draft_feature_bytes = 30;
+        report.cache.other_bytes = 4;
+        report.cache.host_state_bytes = 5;
+        report.snapshots = {
+            {0, 1024, 100, true},
+            {1, 2048, 150, true},
+            {3, 512, 60, true},
+            {ModelBackend::kMaxSlots - 1, 256, 40, false, 8},
+        };
+        return report;
+    }
+};
+
+// /props reports where memory goes: the live cache, each saved snapshot
+// labelled by its cache role, and the process's resident set.
+TEST_CASE(ServerUnitFixture, test_props_memory_report) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    LuceEngine engine(std::make_unique<MemoryReportBackend>());
+    ServerConfig config;
+    config.prefix_cache_cap = 2;
+    config.prefill_cache_cap = 2;
+    HttpServer server(engine, tokenizer, config);
+
+    // Before the first report there is nothing to show but the process.
+    json memory = SchedulerTestHarness::memory_json(server);
+    TEST_ASSERT(memory["cache"].is_null());
+    TEST_ASSERT(memory["reports_published"] == 0);
+    TEST_ASSERT(memory["snapshots"]["count"] == 0);
+    TEST_ASSERT(memory["snapshots"]["slots"].is_array());
+    TEST_ASSERT(memory["snapshots"]["slots"].empty());
+
+    SchedulerTestHarness::mark_agent_turn(server, 1);
+    SchedulerTestHarness::publish_memory_report(server);
+    memory = SchedulerTestHarness::memory_json(server);
+    TEST_ASSERT(memory["reports_published"] == 1);
+    const json & cache = memory["cache"];
+    TEST_ASSERT(cache["location"] == "device");
+    TEST_ASSERT(cache["capacity_tokens"] == 4096);
+    TEST_ASSERT(cache["live_tokens"] == 1200);
+    TEST_ASSERT(cache["kv_bytes"] == 1000);
+    TEST_ASSERT(cache["recurrent_bytes"] == 200);
+    TEST_ASSERT(cache["draft_feature_bytes"] == 30);
+    TEST_ASSERT(cache["other_bytes"] == 4);
+    TEST_ASSERT(cache["host_state_bytes"] == 5);
+
+    const json & snapshots = memory["snapshots"];
+    TEST_ASSERT(snapshots["count"] == 4);
+    // The device snapshot's host-side copies count as host memory.
+    TEST_ASSERT(snapshots["host_bytes"] == 310 + 8);
+    TEST_ASSERT(snapshots["device_bytes"] == 40);
+    const json & slots = snapshots["slots"];
+    TEST_ASSERT(slots.size() == 4);
+    TEST_ASSERT(slots[0]["kind"] == "prefix");
+    TEST_ASSERT(slots[0]["tokens"] == 1024);
+    TEST_ASSERT(slots[1]["kind"] == "agent_turn");
+    TEST_ASSERT(slots[2]["kind"] == "prefill_cache");
+    TEST_ASSERT(slots[3]["kind"] == "disk_staging");
+    TEST_ASSERT(slots[3]["location"] == "device");
+    TEST_ASSERT(slots[3]["bytes"] == 48);
+#if defined(__linux__)
+    TEST_ASSERT(memory["process"]["rss_bytes"].get<uint64_t>() > 0);
+    TEST_ASSERT(memory["process"]["peak_rss_bytes"].get<uint64_t>() >=
+                memory["process"]["rss_bytes"].get<uint64_t>());
+#endif
+
+    // A backend without a report still yields a well-formed section.
+    LuceEngine plain_engine(std::make_unique<MockBackend>());
+    HttpServer plain(plain_engine, tokenizer, config);
+    SchedulerTestHarness::publish_memory_report(plain);
+    memory = SchedulerTestHarness::memory_json(plain);
+    TEST_ASSERT(memory["cache"].is_null());
+    TEST_ASSERT(memory["snapshots"]["count"] == 0);
     unlink(path.c_str());
 }
 
@@ -9445,11 +10065,12 @@ TEST_CASE(ServerUnitFixture, test_default_backend_rejects_encoded_images_without
     ImagePromptHandle payload;
     std::string error;
     TEST_ASSERT(!backend.supports_images());
-    TEST_ASSERT(!backend.prepare_images(tokens, {{"image/png", {137, 80, 78, 71}}},
-                                        8192, 32, payload, error));
+    TEST_ASSERT(backend.prepare_images(tokens, {{"image/png", {137, 80, 78, 71}}},
+                                       8192, 32, payload, error) == ImagePrepareStatus::invalid);
     TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
     TEST_ASSERT(!payload && !error.empty());
-    TEST_ASSERT(backend.prepare_images(tokens, {}, 8192, 32, payload, error));
+    TEST_ASSERT(backend.prepare_images(tokens, {}, 8192, 32, payload, error) ==
+                ImagePrepareStatus::ok);
     TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
 }
 

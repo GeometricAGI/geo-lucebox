@@ -135,6 +135,13 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    size_t snapshot_bytes_estimate(int tokens) const override;
+    int snapshot_granularity() const override;
+    MemoryReport memory_report() const override;
+    // memory_report() for an explicit cache and snapshot array.
+    static MemoryReport memory_report_for(const TargetCache & cache,
+                                          const PrefixSnapshot * snapshots,
+                                          int n_snapshots);
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
@@ -163,12 +170,12 @@ public:
     // decode one token at a time.
     bool supports_images() const override { return image_input_; }
     std::string image_placeholder() const override;
-    bool prepare_images(std::vector<int32_t> & tokens,
-                        std::vector<EncodedImage> images,
-                        uint64_t context_capacity,
-                        uint64_t output_reserve,
-                        ImagePromptHandle & payload,
-                        std::string & error) const override;
+    ImagePrepareStatus prepare_images(std::vector<int32_t> & tokens,
+                                      std::vector<EncodedImage> images,
+                                      uint64_t context_capacity,
+                                      uint64_t output_reserve,
+                                      ImagePromptHandle & payload,
+                                      std::string & error) const override;
     bool supports_remote_draft() const override { return true; }
 
     // ── Concurrent slot serving (paged AR decode over N sequences) ────

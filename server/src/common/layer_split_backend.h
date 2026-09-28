@@ -65,6 +65,12 @@ public:
     virtual void snapshot_free(int slot) { (void)slot; }
     virtual bool snapshot_used(int slot) const { (void)slot; return false; }
     virtual int snapshot_cur_pos(int slot) const { (void)slot; return 0; }
+    // See ModelBackend::snapshot_bytes_estimate; 0 when the adapter cannot
+    // size its snapshots.
+    virtual size_t snapshot_bytes_estimate(int tokens) const {
+        (void)tokens;
+        return 0;
+    }
     virtual bool snapshot_restore(int slot) { (void)slot; return false; }
     virtual ModelBackend::SnapshotRef snapshot_ref(int slot) const {
         (void)slot;
@@ -103,6 +109,7 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    size_t snapshot_bytes_estimate(int tokens) const override;
     SnapshotRef snapshot_ref(int slot) const override;
     bool snapshot_adopt(int slot, ggml_context * ctx,
                         ggml_backend_buffer_t buf, int cur_pos,

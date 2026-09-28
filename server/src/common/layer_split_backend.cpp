@@ -160,6 +160,10 @@ int LayerSplitBackend::snapshot_cur_pos(int slot) const {
     return adapter_ ? adapter_->snapshot_cur_pos(slot) : 0;
 }
 
+size_t LayerSplitBackend::snapshot_bytes_estimate(int tokens) const {
+    return adapter_ ? adapter_->snapshot_bytes_estimate(tokens) : 0;
+}
+
 ModelBackend::SnapshotRef LayerSplitBackend::snapshot_ref(int slot) const {
     return adapter_ ? adapter_->snapshot_ref(slot) : SnapshotRef{};
 }

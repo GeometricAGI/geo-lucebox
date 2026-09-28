@@ -58,31 +58,61 @@ bool cross_device_peer_memcpy_ok(int src_device, int dst_device) {
     return ok;
 }
 
+namespace {
+// Destroys a thread's copy streams when the thread exits.
+struct ThreadCopyStreams {
+    static constexpr int kMaxDevices = 16;
+    cudaStream_t streams[kMaxDevices] = {};
+    ~ThreadCopyStreams() {
+        for (int device = 0; device < kMaxDevices; ++device) {
+            if (streams[device] && cudaSetDevice(device) == cudaSuccess) {
+                (void) cudaStreamDestroy(streams[device]);
+            }
+        }
+    }
+};
+}  // namespace
+
+cudaStream_t luce_copy_stream(int device) {
+    thread_local ThreadCopyStreams local;
+    if (device < 0 || device >= ThreadCopyStreams::kMaxDevices) return nullptr;
+    cudaStream_t & stream = local.streams[device];
+    if (!stream) {
+        if (cudaSetDevice(device) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+            stream = nullptr;
+        }
+    }
+    return stream;
+}
+
+bool luce_copy_stream_sync(int device) {
+    cudaStream_t stream = luce_copy_stream(device);
+    if (!stream || cudaSetDevice(device) != cudaSuccess) return false;
+    return cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
 bool copy_peer_async(void * dst, int dst_device,
                      const void * src, int src_device,
                      size_t bytes,
                      cudaStream_t stream) {
     if (bytes == 0) return true;
+    if (!stream) stream = luce_copy_stream(dst_device);
+    if (!stream) return false;
     cudaError_t err = cudaSuccess;
     if (dst_device == src_device) {
         err = cudaSetDevice(dst_device);
         if (err != cudaSuccess) return false;
         err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
         if (err != cudaSuccess) return false;
-        if (stream) {
-            return cudaStreamSynchronize(stream) == cudaSuccess;
-        }
-        return cudaDeviceSynchronize() == cudaSuccess;
+        return cudaStreamSynchronize(stream) == cudaSuccess;
     }
     if (cross_device_peer_memcpy_ok(src_device, dst_device)) {
         err = cudaSetDevice(dst_device);
         if (err != cudaSuccess) return false;
         err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
         if (err != cudaSuccess) return false;
-        if (stream) {
-            return cudaStreamSynchronize(stream) == cudaSuccess;
-        }
-        return cudaDeviceSynchronize() == cudaSuccess;
+        return cudaStreamSynchronize(stream) == cudaSuccess;
     }
     log_staged_cross_gpu_once();
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
@@ -90,13 +120,14 @@ bool copy_peer_async(void * dst, int dst_device,
     if (err != cudaSuccess) return false;
     err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
     if (err != cudaSuccess) return false;
-    if (stream) {
-        return cudaStreamSynchronize(stream) == cudaSuccess;
-    }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return cudaStreamSynchronize(stream) == cudaSuccess;
 #else
+    // A null source stream would make the staging helper use the legacy
+    // default stream and a device-wide sync.
+    cudaStream_t src_stream = luce_copy_stream(src_device);
+    if (!src_stream) return false;
     return dflash_cuda_copy_between_devices(src_device, src, dst_device, dst, bytes,
-                                            nullptr, stream);
+                                            src_stream, stream);
 #endif
 }
 

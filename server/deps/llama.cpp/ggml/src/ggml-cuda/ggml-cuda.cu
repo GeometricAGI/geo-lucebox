@@ -64,6 +64,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/copy-batch.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -4128,6 +4129,14 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// View-like and empty nodes: the evaluation loops launch nothing for them.
+// Used by graph capture and by the copy-run batching, so it must stay outside
+// USE_CUDA_GRAPH.
+static bool ggml_cuda_node_launches_nothing(const ggml_tensor * node) {
+    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+        node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+}
+
 #ifdef USE_CUDA_GRAPH
 
 // GGML_CUDA_COLLECTIVE_GRAPH_CAPTURE=1: allow graph capture of a graph that
@@ -4157,7 +4166,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_BIAS_BF16 || node->op == GGML_OP_RMS_NORM_VISION_F32 ||
             node->op == GGML_OP_SOFT_MAX_VISION_F32 || node->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;
 
-        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+        if (ggml_cuda_node_launches_nothing(node)) {
             continue;
         }
 
@@ -4849,6 +4858,88 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// A CPY node that ggml_cuda_cpy lowers to one device memcpy: same type and
+// both ends contiguous.
+// The batched kernel treats both operands as one contiguous range in this
+// device's memory, so split and host buffers keep the per-node path.
+static bool ggml_cuda_tensor_on_device_buffer(const ggml_tensor * t, int device) {
+    return t->buffer && t->buffer->buft == ggml_backend_cuda_buffer_type(device);
+}
+
+static bool ggml_cuda_cpy_is_plain_copy(const ggml_tensor * node, int device) {
+    if (node->op != GGML_OP_CPY) {
+        return false;
+    }
+    const ggml_tensor * src = node->src[0];
+    const ggml_tensor * dst = node->src[1];
+    return src && dst && src->type == dst->type &&
+        ggml_cuda_tensor_on_device_buffer(src, device) &&
+        ggml_cuda_tensor_on_device_buffer(dst, device) &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+        ggml_nbytes(src) == ggml_nbytes(dst) && ggml_nbytes(src) > 0;
+}
+
+// Integer addresses: relational comparison of pointers into different
+// allocations is unspecified in C++.
+static bool ggml_cuda_byte_ranges_overlap(const void * a, size_t an, const void * b, size_t bn) {
+    const uintptr_t pa = (uintptr_t) a;
+    const uintptr_t pb = (uintptr_t) b;
+    return pa < pb + bn && pb < pa + an;
+}
+
+// Nodes the evaluation loops skip; a copy run may step over them.
+static bool ggml_cuda_node_is_noop(const ggml_tensor * node) {
+    return ggml_cuda_node_launches_nothing(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+}
+
+static thread_local size_t g_copy_batch_run_count = 0;
+
+size_t ggml_backend_cuda_get_copy_batch_run_count(void) {
+    return g_copy_batch_run_count;
+}
+
+// Starting at plain copy node i, gather the following plain copies whose byte
+// ranges are independent of every copy already gathered (no destination
+// overlaps another destination or any source), and issue them as one batched
+// launch. Returns the index of the last node consumed, or -1 when the run has
+// a single copy and the normal path should handle it.
+static int ggml_cuda_try_batch_copies(ggml_cgraph * cgraph, int i, int device, cudaStream_t stream) {
+    constexpr int kMaxRun = ggml_cuda_copy_batch_max;  // one run, one launch
+    ggml_cuda_copy_desc descs[kMaxRun];
+    int n = 0;
+    int last = -1;
+    for (int j = i; j < cgraph->n_nodes && n < kMaxRun; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (j > i && ggml_cuda_node_is_noop(node)) {
+            continue;
+        }
+        if (!ggml_cuda_cpy_is_plain_copy(node, device)) {
+            break;
+        }
+        const void * src = node->src[0]->data;
+        void * dst = node->src[1]->data;
+        const size_t nbytes = ggml_nbytes(node->src[0]);
+        bool independent = !ggml_cuda_byte_ranges_overlap(src, nbytes, dst, nbytes);
+        for (int k = 0; k < n && independent; ++k) {
+            independent =
+                !ggml_cuda_byte_ranges_overlap(dst, nbytes, descs[k].dst, descs[k].nbytes) &&
+                !ggml_cuda_byte_ranges_overlap(dst, nbytes, descs[k].src, descs[k].nbytes) &&
+                !ggml_cuda_byte_ranges_overlap(src, nbytes, descs[k].dst, descs[k].nbytes);
+        }
+        if (!independent) {
+            break;
+        }
+        descs[n++] = {src, dst, nbytes};
+        last = j;
+    }
+    if (n < 2) {
+        return -1;
+    }
+    ggml_cuda_copy_batch(descs, n, stream);
+    ++g_copy_batch_run_count;
+    return last;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4987,13 +5078,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif
                 prev_i = i;
 
-                if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                // Same predicate the copy-run gather uses to step over nodes.
+                if (ggml_cuda_node_is_noop(node)) {
                     continue;
                 }
 
-                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-                    continue;
+#if !defined(GGML_USE_MUSA)
+                // Consecutive plain device copies (each otherwise one memcpy
+                // blit with its own dispatch) become one batched launch.
+                // GGML_CUDA_DISABLE_COPY_BATCH restores one memcpy per node.
+                static const bool batch_copies = getenv("GGML_CUDA_DISABLE_COPY_BATCH") == nullptr;
+                if (batch_copies && !should_launch_concurrent_events && ggml_cuda_cpy_is_plain_copy(node, cuda_ctx->device)) {
+                    const int last = ggml_cuda_try_batch_copies(cgraph, i, cuda_ctx->device, cuda_ctx->stream());
+                    if (last >= 0) {
+#ifdef GGML_CUDA_DEBUG
+                        GGML_LOG_INFO("copy run batched: nodes %d-%d\n", i, last);
+#endif
+                        // A batched run is not a fused region: keep the
+                        // fusion accounting from counting its nodes.
+                        i = last;
+                        prev_i = last;
+                        continue;
+                    }
                 }
+#endif // !defined(GGML_USE_MUSA)
 
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);

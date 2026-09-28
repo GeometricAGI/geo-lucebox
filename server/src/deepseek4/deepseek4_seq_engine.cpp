@@ -33,7 +33,8 @@ DeepSeek4SeqEngine::DeepSeek4SeqEngine(
       offload_(slots_, pool, backend.backend_, ds4_paged_kv_planes(backend.paged_cache_)),
       stride_(table_stride),
       host_tables_((size_t)pool.max_sequences() * table_stride, -1),
-      reserve_growth_((size_t)pool.max_sequences(), 0) {}
+      reserve_growth_((size_t)pool.max_sequences(), 0),
+      slot_has_images_((size_t)pool.max_sequences(), 0) {}
 
 bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
     return deepseek4_is_eos_tok(token, b_.w_);
@@ -78,6 +79,150 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
                 stride_, -1);
     reset_deepseek4_paged_slot(b_.paged_cache_, (uint32_t)result.slot);
     return result;
+}
+
+bool DeepSeek4SeqEngine::supports_images() const {
+    return b_.image_capable_ && b_.vision_ && b_.cache_.buf;
+}
+
+SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
+        uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler, const ImagePromptHandle & images) {
+    AdmitResult refused;
+    refused.status = AdmitResult::Status::failed;
+    // DS4V image blocks need whole-block bidirectional prefill, which the
+    // 16-row gathered graph cannot run. Admission claims a slot, starts the
+    // image encode and seeds the slot with every prompt token but the last;
+    // later steps prefill that prefix into the slot's staging cache one shared
+    // layer-major pass at a time, copy it into the paged slot, and the last
+    // (text) token then prefills in the batch, yielding the first sampled
+    // token as usual.
+    const int prefix = int(prompt.size()) - 1;
+    if (!supports_images() || prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
+        prompt.size() > size_t(b_.cache_.max_ctx)) {
+        refused.error = "image support or prompt length is invalid";
+        return refused;
+    }
+    // Claim the slot before encoding: a busy pool defers the request and
+    // retries it, and encoding first would rerun the encoder on every retry.
+    AdmitResult result = admit(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
+    if (staging_in_flight(result.slot)) {
+        // The slot's staging cache still belongs to a pass in flight (its
+        // previous request retired mid-pass): retry after the pass.
+        retire(result.slot);
+        result.status = AdmitResult::Status::busy;
+        result.slot = -1;
+        result.error = "image staging cache is still in use";
+        return result;
+    }
+    PendingImage pending;
+    pending.slot = result.slot;
+    pending.staged.images = images;
+    pending.staged.prompt = prompt;
+    pending.staged.prefix = prefix;
+    pending.staged.staging = b_.image_staging_cache(result.slot);
+    std::string error;
+    bool ok = pending.staged.staging && b_.encode_image_request(prompt, images, error) &&
+              b_.begin_staged_prefill(pending.staged);
+    SeqSlotManager::PrefillChunk seeded;
+    if (ok) {
+        seeded = slots_.seed_restored_prefix(result.slot, prefix);
+        ok = seeded.ok && seeded.rows.size() == size_t(prefix);
+    }
+    for (size_t i = 0; ok && i < seeded.new_blocks.size(); ++i) {
+        ok = set_block(result.slot, seeded.first_new_block + int(i), seeded.new_blocks[i]);
+    }
+    if (!ok) {
+        retire(result.slot);
+        refused.error = !error.empty() ? error : !pending.staged.error.empty() ? pending.staged.error
+            : "image request could not be staged";
+        return refused;
+    }
+    slot_has_images_[size_t(result.slot)] = 1;
+    pending_images_.push_back(std::move(pending));
+    return result;
+}
+
+DeepSeek4SeqEngine::PendingImage * DeepSeek4SeqEngine::pending_image(int slot) {
+    for (auto & pending : pending_images_) {
+        if (pending.slot == slot) return &pending;
+    }
+    return nullptr;
+}
+
+bool DeepSeek4SeqEngine::staging_in_flight(int slot) const {
+    if (!staged_pass_) return false;
+    for (const auto & member : staged_pass_->members) {
+        if (member.slot == slot) return true;
+    }
+    return false;
+}
+
+void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
+    if (!staged_pass_) {
+        std::vector<DeepSeek4StagedPrefill *> items;
+        std::vector<int> slots;
+        for (auto & pending : pending_images_) {
+            if (pending.staged.finished()) continue;
+            items.push_back(&pending.staged);
+            slots.push_back(pending.slot);
+        }
+        if (items.empty()) return;
+        auto staged = std::make_unique<StagedPass>();
+        std::vector<int> rows;
+        if (b_.begin_staged_pass(items, decoding ? DS4_STAGED_PREFILL_ROWS_PER_STEP
+                                                 : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE,
+                                 staged->pass, rows)) {
+            for (size_t k = 0; k < items.size(); ++k) {
+                if (rows[k] > 0) staged->members.push_back({slots[k], items[k]->images, rows[k]});
+            }
+            staged->started = std::chrono::steady_clock::now();
+            staged_pass_ = std::move(staged);
+        } else if (idle) {
+            // Nothing ready and nothing else to run: wait briefly for the
+            // encoder instead of spinning the scheduler.
+            b_.wait_staged_ready(*items.front(), DS4_STAGED_PREFILL_ROWS_PER_STEP, 20);
+        }
+    }
+    if (staged_pass_) {
+        // With live decoders, only a slice of the pass's layers: they then
+        // decode after each slice instead of waiting for the whole pass.
+        StagedPass & staged = *staged_pass_;
+        std::string error;
+        const bool ok = staged.pass.run_layers(
+            decoding ? DS4_STAGED_PREFILL_LAYERS_PER_STEP : b_.w_.n_layer, error);
+        ++staged.slices;
+        if (!ok || staged.pass.done()) {
+            int rows = 0;
+            for (const auto & member : staged.members) {
+                rows += member.rows;
+                PendingImage * pending = pending_image(member.slot);
+                // A member that retired (or whose slot now holds another
+                // request) is skipped.
+                if (!pending || pending->staged.images != member.images) continue;
+                if (ok) pending->staged.done += member.rows;
+                else pending->staged.error = error.empty() ? "staged prefill failed" : error;
+            }
+            std::fprintf(stderr, "[deepseek4] staged prefill pass: %zu requests, %d rows, %d slices, %.0f ms\n",
+                         staged.members.size(), rows, staged.slices,
+                         std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - staged.started).count());
+            staged_pass_.reset();
+        }
+    }
+    for (auto & pending : pending_images_) {
+        DeepSeek4StagedPrefill & staged = pending.staged;
+        if (!staged.error.empty() || staged.done < staged.prefix || !staged.staging) continue;
+        if (!import_deepseek4_paged_slot(
+                *staged.staging, staged.prefix, b_.paged_cache_, uint32_t(pending.slot),
+                host_tables_.data() + size_t(pending.slot) * stride_, stride_, staged.error) &&
+            staged.error.empty()) {
+            staged.error = "staged image prefill could not be copied into the paged slot";
+        }
+        // Copied (or failed): the staging cache is free for the next request.
+        staged.staging = nullptr;
+    }
 }
 
 bool DeepSeek4SeqEngine::set_block(int slot, int logical, int32_t physical) {
@@ -150,6 +295,12 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
+    if (!pending_images_.empty()) {
+        bool idle = inputs.empty();
+        for (const PrefillSlice & slice : plan.prefills) idle = idle && pending_image(slice.slot);
+        advance_pending_images(!inputs.empty(), idle);
+    }
+
     std::vector<int32_t> lane_tokens;
     std::vector<int64_t> lane_positions;
     std::vector<int32_t> lane_slots;
@@ -200,6 +351,30 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     std::vector<PrefillLane> prefill_lanes;
     prefill_lanes.reserve(plan.prefills.size());
     for (const PrefillSlice & slice : plan.prefills) {
+        if (PendingImage * pending = pending_image(slice.slot)) {
+            // A staged image request reports its failure here, where its
+            // slot is planned; until its prefix is copied in, it sits out.
+            const DeepSeek4StagedPrefill & staged = pending->staged;
+            const bool failed = !staged.error.empty();
+            const bool copied = !failed && staged.done >= staged.prefix && !staged.staging;
+            if (failed) {
+                fail_prefill(slice.slot, result.prefills, staged.error);
+                // Its queued encode must not keep the encoder from others.
+                if (staged.images) b_.cancel_image_encode(*staged.images);
+            }
+            if (failed || copied) {
+                pending_images_.erase(pending_images_.begin() + (pending - pending_images_.data()));
+            }
+            if (!copied) {
+                // Still staging: report the slot as advanced, with no row run.
+                if (!failed) {
+                    PrefillOutput waiting;
+                    waiting.slot = slice.slot;
+                    result.prefills.push_back(std::move(waiting));
+                }
+                continue;
+            }
+        }
         const SeqSlot & before = slots_.slot(slice.slot);
         const int remaining = before.prompt_len - before.cur_pos;
         const int n_rows = std::min(slice.max_tokens, remaining);
@@ -362,8 +537,28 @@ bool DeepSeek4SeqEngine::restore_kv(int slot, std::string & error) {
     return true;
 }
 
+bool DeepSeek4SeqEngine::kv_recomputable(int slot) const {
+    return slot >= 0 && size_t(slot) < slot_has_images_.size() && !slot_has_images_[size_t(slot)];
+}
+
+bool DeepSeek4SeqEngine::offload_kv(int slot, size_t bytes, std::string & error) {
+    // A slot still staging its image prefix has no paged KV to save yet.
+    for (const auto & pending : pending_images_) {
+        if (pending.slot == slot) {
+            error = "image request is still prefilling";
+            return false;
+        }
+    }
+    return offload_.suspend(slot, bytes, error);
+}
+
 bool DeepSeek4SeqEngine::evict_kv(int slot, int32_t pending_token,
                                   std::string & error) {
+    if (!kv_recomputable(slot)) {
+        // Recompute replays token ids; image rows would come back as text.
+        error = "image request KV cannot be rebuilt from its tokens";
+        return false;
+    }
     if (slot < 0 || slot >= slots_.slot_count() ||
         !slots_.evict_for_recompute(slot, pending_token)) {
         error = "slot history cannot be re-prefilled within the paged KV pool";
@@ -374,6 +569,15 @@ bool DeepSeek4SeqEngine::evict_kv(int slot, int32_t pending_token,
 }
 
 void DeepSeek4SeqEngine::retire(int slot) {
+    for (auto & pending : pending_images_) {
+        if (pending.slot != slot) continue;
+        // Stop its encode before its payload may go away.
+        if (const auto * images = pending.staged.images.get()) b_.cancel_image_encode(*images);
+    }
+    pending_images_.erase(std::remove_if(pending_images_.begin(), pending_images_.end(),
+                                         [slot](const PendingImage & p) { return p.slot == slot; }),
+                          pending_images_.end());
+    if (slot >= 0 && size_t(slot) < slot_has_images_.size()) slot_has_images_[size_t(slot)] = 0;
     offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
     slots_.retire(slot);

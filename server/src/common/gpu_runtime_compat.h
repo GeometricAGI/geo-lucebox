@@ -65,6 +65,11 @@
 #define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaStreamDefault hipStreamDefault
 #define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+#define cudaGraph_t hipGraph_t
+#define cudaGraphDestroy hipGraphDestroy
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaErrorInvalidValue hipErrorInvalidValue
 

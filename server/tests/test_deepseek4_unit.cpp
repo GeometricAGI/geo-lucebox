@@ -2800,6 +2800,8 @@ static bool init_snapshot_test_shard(DeepSeek4LayerSplitAdapter & adapter) {
     auto & shard = adapter.shards_[0];
     shard.backend = ggml_backend_cpu_init();
     if (!shard.backend) return false;
+    shard.layer_begin = 0;
+    shard.layer_end = 1;
     shard.weights.n_layer = 1;
     shard.weights.n_embd = 4;
     shard.weights.n_hc = 1;
@@ -3461,7 +3463,15 @@ static void test_hybrid_prefill_chunk_tokens() {
     std::fprintf(stderr, "  test_hybrid_prefill_chunk_tokens ...");
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 0) == 2048);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4096) == 2048);
+    // Unqualified placements keep the 1K long-context guard.
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4097) == 1024);
+    // The qualified R9700 + Strix Halo placement caps long contexts at 2K.
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 4097, 0, kDs4QualifiedLongContextChunk) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    8192, 18432, 0, kDs4QualifiedLongContextChunk) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 4096, 0, kDs4QualifiedLongContextChunk) == 2048);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(1024, 8192) == 1024);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(512, 8192) == 512);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(0, 8192) == 1);
@@ -3832,12 +3842,32 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
                 for (int accepted = 0; accepted <= q; ++accepted) {
                     load(initial, copy_backend != nullptr);
                     deepseek4_spec_rollback_save(cache, rollback, pos, q, copy_backend, pinned);
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+                    {
+                        // Mirrors device_rollback_enabled(): only an exact
+                        // "0" turns device staging off.
+                        const char * device_env = std::getenv("LUCE_DS4_DEVICE_ROLLBACK");
+                        const bool device_off = device_env && std::strcmp(device_env, "0") == 0;
+                        if (copy_backend && ggml_backend_is_cuda(copy_backend) && !device_off &&
+                            pos == 0 && q == 1 && accepted == 0) {
+                            TEST_ASSERT(rollback.uses_device_copy);
+                        }
+                    }
+#endif
                     if (pinned && pos == 0 && q == 1 && accepted == 0) {
-                        const auto host_type = ggml_backend_dev_host_buffer_type(
-                            ggml_backend_get_device(backend));
-                        TEST_ASSERT(rollback.pinned_buf && rollback.pinned_base);
-                        TEST_ASSERT(rollback.pinned_buf &&
-                            ggml_backend_buffer_get_type(rollback.pinned_buf) == host_type);
+                        // Device staging takes precedence on a GPU backend
+                        // that holds every rollback tensor; pinned host
+                        // staging is the fallback.
+                        if (rollback.uses_device_copy) {
+                            // Device staging never creates the pinned buffer.
+                            TEST_ASSERT(!rollback.pinned_buf);
+                        } else {
+                            const auto host_type = ggml_backend_dev_host_buffer_type(
+                                ggml_backend_get_device(backend));
+                            TEST_ASSERT(rollback.pinned_buf && rollback.pinned_base);
+                            TEST_ASSERT(rollback.pinned_buf &&
+                                ggml_backend_buffer_get_type(rollback.pinned_buf) == host_type);
+                        }
                     }
                     auto verified = initial;
                     advance(verified, pos, q);
@@ -4093,6 +4123,261 @@ static bool init_monolithic_snapshot_test_backend(DeepSeek4Backend & backend) {
     backend.w_.compress_ratios = {4};
     return create_deepseek4_cache(backend.backend_, backend.w_, 16,
                                   backend.cache_);
+}
+
+// The prefix cache budgets captures before they exist, so the estimate must
+// equal what snapshot_save() retains: the snapshot buffer plus the host
+// copies kept beside it.
+// Two shards, each owning one of two layers. Like the real split, every
+// shard's cache spans both layers but only its own layer gains rows.
+static bool init_two_shard_split(DeepSeek4LayerSplitAdapter & adapter) {
+    adapter.shards_.resize(2);
+    for (int i = 0; i < 2; ++i) {
+        auto & shard = adapter.shards_[(size_t) i];
+        shard.backend = ggml_backend_cpu_init();
+        if (!shard.backend) return false;
+        shard.layer_begin = i;
+        shard.layer_end = i + 1;
+        // Rows wide enough that a miscounted row outweighs tensor alignment.
+        shard.weights.n_layer = 2;
+        shard.weights.n_embd = 64;
+        shard.weights.n_hc = 1;
+        shard.weights.head_dim = 64;
+        shard.weights.n_swa = 8;
+        shard.weights.n_indexer_head_dim = 32;
+        shard.weights.compress_ratios = {4, 4};
+        if (!create_deepseek4_cache(shard.backend, shard.weights, 64, shard.cache)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void test_snapshot_bytes_estimate_matches_saved_snapshot() {
+    std::fprintf(stderr, "  test_snapshot_bytes_estimate_matches_saved_snapshot ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    TEST_ASSERT(init_monolithic_snapshot_test_backend(backend));
+    if (!backend.cache_.buf || backend.cache_.layers.empty()) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+    for (const int tokens : {4, 7, 16}) {
+        backend.cache_.cur_pos = tokens;
+        backend.cache_.layers[0].n_comp = tokens / 4;
+        backend.cache_.layers[0].n_index_comp = tokens / 4;
+        backend.last_logits_ = {1.0f, 4.0f, 2.0f};
+        backend.last_logits_pos_ = tokens;
+        backend.spec_feat_window_.clear();
+        TEST_ASSERT(backend.snapshot_save(0));
+        const auto & aux = backend.snapshot_aux_[0];
+        const size_t retained =
+            ggml_backend_buffer_get_size(backend.snapshots_[0].buf) +
+            (aux.last_logits.size() + aux.spec_feat_window.size()) * sizeof(float);
+        TEST_ASSERT(backend.snapshot_bytes_estimate(tokens) == retained);
+        backend.snapshot_free(0);
+    }
+    // The cache capacity bounds the compressed rows.
+    TEST_ASSERT(backend.snapshot_bytes_estimate(1 << 30) ==
+                backend.snapshot_bytes_estimate(16));
+    TEST_ASSERT(backend.snapshot_bytes_estimate(0) == 0);
+    backend.cfg_.paged_attention = true;
+    TEST_ASSERT(backend.snapshot_bytes_estimate(16) == 0);
+    backend.cfg_.paged_attention = false;
+
+    auto adapter = make_test_adapter();
+    TEST_ASSERT(init_snapshot_test_shard(adapter));
+    if (!adapter.shards_.empty() && adapter.shards_[0].cache.buf) {
+        auto & cache = adapter.shards_[0].cache;
+        adapter.shards_[0].weights.n_vocab = 3;
+        adapter.hc_state_ = {1.0f, 2.0f, 3.0f, 4.0f};
+        adapter.prefill_last_logits_ = {9.0f, 8.0f, 7.0f};
+        adapter.last_tok_ = 4242;
+        size_t at_twelve = 0;
+        for (const int tokens : {4, 12}) {
+            cache.cur_pos = tokens;
+            cache.layers[0].n_comp = tokens / 4;
+            cache.layers[0].n_index_comp = tokens / 4;
+            adapter.cur_pos_ = tokens;
+            TEST_ASSERT(adapter.snapshot_save(0));
+            const auto & snap = adapter.snapshots_[0];
+            const size_t retained = ggml_backend_buffer_get_size(snap.buf) +
+                (snap.hc_state.size() + snap.prefill_last_logits.size()) *
+                    sizeof(float);
+            TEST_ASSERT(adapter.snapshot_bytes_estimate(tokens) == retained);
+            at_twelve = retained;
+            adapter.snapshot_free(0);
+        }
+        // At startup no logits exist yet; the estimate assumes a vocabulary row.
+        adapter.prefill_last_logits_.clear();
+        TEST_ASSERT(adapter.snapshot_bytes_estimate(12) == at_twelve);
+        // A mixed split keeps part of each snapshot in another process.
+        adapter.remote_target_shard_.active_ = true;
+        TEST_ASSERT(adapter.snapshot_bytes_estimate(12) == 0);
+        adapter.remote_target_shard_.active_ = false;
+    }
+
+    // A real split: each shard advances only its own layer's rows.
+    auto split = make_test_adapter();
+    TEST_ASSERT(init_two_shard_split(split));
+    if (split.shards_.size() == 2 && split.shards_[1].cache.buf) {
+        split.hc_state_ = {1.0f, 2.0f, 3.0f, 4.0f};
+        split.prefill_last_logits_ = {9.0f, 8.0f, 7.0f};
+        split.last_tok_ = 7;
+        for (const int tokens : {16, 48}) {
+            for (int i = 0; i < 2; ++i) {
+                auto & cache = split.shards_[(size_t) i].cache;
+                cache.cur_pos = tokens;
+                for (int il = 0; il < 2; ++il) {
+                    const int rows = il == i ? tokens / 4 : 0;
+                    cache.layers[(size_t) il].n_comp = rows;
+                    cache.layers[(size_t) il].n_index_comp = rows;
+                }
+            }
+            split.cur_pos_ = tokens;
+            TEST_ASSERT(split.snapshot_save(0));
+            const auto & snap = split.snapshots_[0];
+            const size_t retained = ggml_backend_buffer_get_size(snap.buf) +
+                (snap.hc_state.size() + snap.prefill_last_logits.size()) *
+                    sizeof(float);
+            TEST_ASSERT(split.snapshot_bytes_estimate(tokens) == retained);
+            split.snapshot_free(0);
+        }
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+// K/V and recurrent-state bytes of a cache's layers, computed from the
+// tensors so the report's buckets are checked independently.
+template <typename Layers>
+static void deepseek4_cache_buckets(const Layers & layers, const ggml_tensor * hc,
+                                    uint64_t & kv, uint64_t & recurrent) {
+    const auto bytes = [](const ggml_tensor * t) {
+        return t ? (uint64_t) ggml_nbytes(t) : (uint64_t) 0;
+    };
+    recurrent += bytes(hc);
+    for (const auto & layer : layers) {
+        kv += bytes(layer.raw_kv) + bytes(layer.comp_kv) + bytes(layer.index_comp_kv);
+        recurrent += bytes(layer.attn_compressor.state_kv) +
+                     bytes(layer.attn_compressor.state_score) +
+                     bytes(layer.indexer_compressor.state_kv) +
+                     bytes(layer.indexer_compressor.state_score);
+    }
+}
+
+// /props adds up the live cache and each snapshot from the real buffers.
+static void test_memory_report_matches_buffers() {
+    std::fprintf(stderr, "  test_memory_report_matches_buffers ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    TEST_ASSERT(init_monolithic_snapshot_test_backend(backend));
+    if (!backend.cache_.buf || backend.cache_.layers.empty()) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+    backend.cache_.cur_pos = 8;
+    backend.cache_.layers[0].n_comp = 2;
+    backend.cache_.layers[0].n_index_comp = 2;
+    backend.last_logits_ = {1.0f, 4.0f, 2.0f};
+    backend.last_logits_pos_ = 8;
+    backend.spec_feat_window_ = {9.0f, 8.0f};
+    TEST_ASSERT(backend.snapshot_save(2));
+
+    const auto report = backend.memory_report();
+    TEST_ASSERT(report.available);
+    TEST_ASSERT(report.cache.capacity_tokens == backend.cache_.max_ctx);
+    TEST_ASSERT(report.cache.live_tokens == 8);
+    uint64_t kv = 0, recurrent = 0;
+    deepseek4_cache_buckets(backend.cache_.layers, backend.cache_.hc_state, kv, recurrent);
+    TEST_ASSERT(kv > 0 && recurrent > 0);
+    TEST_ASSERT(report.cache.kv_bytes == kv);
+    TEST_ASSERT(report.cache.recurrent_bytes == recurrent);
+    TEST_ASSERT(kv + recurrent + report.cache.other_bytes ==
+                ggml_backend_buffer_get_size(backend.cache_.buf));
+    TEST_ASSERT(report.cache.host_state_bytes ==
+                (backend.last_logits_.capacity() +
+                 backend.spec_feat_window_.capacity()) * sizeof(float));
+    TEST_ASSERT(report.snapshots.size() == 1);
+    const auto & aux = backend.snapshot_aux_[2];
+    TEST_ASSERT(report.snapshots[0].slot == 2);
+    TEST_ASSERT(report.snapshots[0].tokens == 8);
+    TEST_ASSERT(report.snapshots[0].host);
+    TEST_ASSERT(report.snapshots[0].bytes ==
+                ggml_backend_buffer_get_size(backend.snapshots_[2].buf));
+    TEST_ASSERT(report.snapshots[0].host_copy_bytes ==
+                (aux.last_logits.capacity() + aux.spec_feat_window.capacity()) *
+                    sizeof(float));
+    backend.snapshot_free(2);
+    TEST_ASSERT(backend.memory_report().snapshots.empty());
+
+    // A trimmed vector keeps its allocation; the report counts what is held.
+    backend.spec_feat_window_.reserve(256);
+    backend.spec_feat_window_.resize(2);
+    TEST_ASSERT(backend.memory_report().cache.host_state_bytes ==
+                (backend.last_logits_.capacity() + 256) * sizeof(float));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+// Paged serving keeps its KV in paged_cache_; with vision, each image slot
+// also owns a single-request staging cache. The report counts all of them.
+static void test_memory_report_counts_paged_and_staging_caches() {
+    std::fprintf(stderr, "  test_memory_report_counts_paged_and_staging_caches ...");
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    TEST_ASSERT(cpu != nullptr);
+    if (!cpu) return;
+    DeepSeek4BackendConfig cfg;
+    cfg.paged_attention = true;
+    DeepSeek4Backend backend(cfg);
+    // Text-only paged serving leaves cache_ unallocated.
+    TEST_ASSERT(!backend.memory_report().available);
+
+    DeepSeek4Weights paged_weights;
+    paged_weights.n_layer = 3;
+    paged_weights.head_dim = 16;
+    paged_weights.n_indexer_head_dim = 8;
+    paged_weights.compress_ratios = {0, 4, 128};
+    TEST_ASSERT(create_deepseek4_paged_cache(cpu, paged_weights, 2, 257, 5,
+                                             backend.paged_cache_));
+    auto report = backend.memory_report();
+    TEST_ASSERT(report.available);
+    TEST_ASSERT(report.cache.live_tokens == -1);
+    TEST_ASSERT(report.cache.capacity_tokens == backend.paged_cache_.plan.max_ctx);
+    uint64_t kv = 0, recurrent = 0;
+    deepseek4_cache_buckets(backend.paged_cache_.layers, nullptr, kv, recurrent);
+    TEST_ASSERT(kv > 0);
+    TEST_ASSERT(report.cache.kv_bytes == kv);
+    TEST_ASSERT(report.cache.recurrent_bytes == recurrent);
+    const uint64_t paged_bytes = ggml_backend_buffer_get_size(backend.paged_cache_.buf);
+    TEST_ASSERT(kv + recurrent + report.cache.other_bytes == paged_bytes);
+
+    DeepSeek4Weights staging_weights;
+    staging_weights.n_layer = 1;
+    staging_weights.n_embd = 4;
+    staging_weights.n_hc = 1;
+    staging_weights.head_dim = 4;
+    staging_weights.n_swa = 8;
+    staging_weights.n_indexer_head_dim = 2;
+    staging_weights.compress_ratios = {4};
+    auto staging = std::make_unique<DeepSeek4Cache>();
+    TEST_ASSERT(create_deepseek4_cache(cpu, staging_weights, 16, *staging));
+    const uint64_t staging_bytes =
+        staging->buf ? ggml_backend_buffer_get_size(staging->buf) : 0;
+    deepseek4_cache_buckets(staging->layers, staging->hc_state, kv, recurrent);
+    backend.image_staging_caches_.push_back(std::move(staging));
+    report = backend.memory_report();
+    TEST_ASSERT(report.cache.kv_bytes == kv);
+    TEST_ASSERT(report.cache.recurrent_bytes == recurrent);
+    TEST_ASSERT(kv + recurrent + report.cache.other_bytes ==
+                paged_bytes + staging_bytes);
+
+    backend.shutdown();
+    ggml_backend_free(cpu);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static void test_monolithic_snapshot_preserves_decode_state() {
@@ -8751,6 +9036,9 @@ int main(int argc, char ** argv) {
     test_dspark_chain_graph_cache_generation(backend);
     test_snapshot_save_restore();
     test_monolithic_snapshot_preserves_decode_state();
+    test_memory_report_matches_buffers();
+    test_memory_report_counts_paged_and_staging_caches();
+    test_snapshot_bytes_estimate_matches_saved_snapshot();
     test_monolithic_snapshot_disk_roundtrip();
     test_layer_split_snapshot_disk_roundtrip();
     test_spec_feature_tail_is_bounded();

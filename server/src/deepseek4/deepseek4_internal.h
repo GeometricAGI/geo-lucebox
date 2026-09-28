@@ -46,6 +46,17 @@ namespace luce::common {
 // the raw-cache rounding boundary between them.
 inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
 inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 10240;
+// Chunks of four rows or fewer take the decode-shaped path, not layer-major.
+inline constexpr int DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS = 5;
+// Staged image prefill rows per batched step, shared by the pending requests.
+// With live decoders the budget bounds how long they wait between tokens;
+// with none, a larger pass shares each layer's expert reads across requests.
+inline constexpr int DS4_STAGED_PREFILL_ROWS_PER_STEP = 256;
+inline constexpr int DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE = 1024;
+// With live decoders, a staged pass also runs only this many of its layers
+// per step: an image block must go through each layer whole, but its layers
+// can be spread over steps, so decoders wait for a slice, not the whole pass.
+inline constexpr int DS4_STAGED_PREFILL_LAYERS_PER_STEP = 6;
 // Normal verification stays within one ratio-4 compressor window. Q5 is an
 // explicit opt-in whose fused graph models a second boundary.
 inline constexpr int DS4_CONSERVATIVE_VERIFY_MAX_TOKENS = 4;
@@ -519,7 +530,10 @@ struct DeepSeek4Head4Tail2Routes {
 struct DeepSeek4BackendConfig {
     std::string  model_path;
     std::string  mmproj_path;
+    int          mmproj_gpu   = -1;    // vision encoder GPU; -1 = the target's
+    std::string  draft_path;   // DSpark drafter; empty falls back to LUCE_DS4_DRAFT
     DevicePlacement device;
+    DevicePlacement draft_device;  // auto backend: LUCE_DS4_DRAFT_GPU/_BACKEND, else the target
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
     PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
@@ -642,6 +656,15 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   uint32_t slots, uint32_t max_ctx,
                                   uint32_t physical_blocks,
                                   DeepSeek4PagedCache & out);
+// Copies the first n_tokens of a single-request cache (prefilled from position
+// 0) into one paged slot: the raw SWA ring, the completed compressed and
+// indexer rows through the slot's block table, and the compressor states.
+// Both caches must come from the same weights. The slot's first n_tokens
+// blocks must already be in block_table.
+bool import_deepseek4_paged_slot(const DeepSeek4Cache & src, int n_tokens,
+                                 DeepSeek4PagedCache & dst, uint32_t slot,
+                                 const int32_t * block_table, uint32_t block_table_len,
+                                 std::string & error);
 void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot);
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
 // Exact gathered-reference decode for up to six independent lanes. Inputs are
@@ -796,6 +819,64 @@ bool deepseek4_prefill_layer_major(
     const std::vector<int> & bands, DeepSeek4StepTelemetry * telemetry,
     MoeHybridStorage * moe_hybrid, MoeExpertComputeRuntime * expert_runtime,
     MoeHybridRoutingStats * routing_stats);
+
+// One sequence of a shared prefill pass: `n_tokens` rows of `embed` starting
+// at `kv_start` of `cache`, with the sequence's image spans in its own prompt
+// positions.
+struct DeepSeek4PrefillSeq {
+    DeepSeek4Cache *      cache = nullptr;
+    const float *         embed = nullptr;       // [n_tokens, n_embd]
+    const int32_t *       token_ids = nullptr;   // n_tokens ids (image rows use their marker ids)
+    int                   n_tokens = 0;
+    int                   kv_start = 0;
+    vision::ImageSpanView image_spans;
+};
+
+// Prefills several independent sequences in one layer-major pass on a full
+// (non-hybrid) GPU model with sparse attention. Attention runs per sequence
+// against its own cache; the HC mixing and the MoE FFN run once over all the
+// sequences' rows, so every layer's expert weights are read once for all of
+// them. Produces no logits and no feature capture.
+//
+// The pass can run a few layers at a time, so a caller can interleave other
+// work (batched decode) between slices: the hidden state stays on the GPU in
+// between, and every layer still sees all rows of the pass, so whole-block
+// image attention is unchanged. A pass cannot be abandoned half-way without
+// leaving its caches' compressor state partly advanced.
+class DeepSeek4PrefillPass {
+public:
+    DeepSeek4PrefillPass() = default;
+    DeepSeek4PrefillPass(const DeepSeek4PrefillPass &) = delete;
+    DeepSeek4PrefillPass & operator=(const DeepSeek4PrefillPass &) = delete;
+    ~DeepSeek4PrefillPass();
+
+    // Validates the sequences and loads their embeddings; `embed` is read
+    // here only, `token_ids`, `image_spans` and `cache` until done().
+    bool begin(ggml_backend_t backend, int device, const DeepSeek4Weights & w,
+               const std::vector<DeepSeek4PrefillSeq> & seqs, std::string & error);
+    // Runs up to `count` more layers; after the last one the caches' cur_pos
+    // is advanced and done() is true.
+    bool run_layers(int count, std::string & error);
+    bool done() const { return w_ && next_layer_ >= w_->n_layer; }
+
+private:
+    void release();
+
+    ggml_backend_t backend_ = nullptr;
+    const DeepSeek4Weights * w_ = nullptr;
+    std::vector<DeepSeek4PrefillSeq> seqs_;
+    std::vector<int> offset_;
+    std::vector<int32_t> ids_;
+    std::vector<uint8_t> image_row_;
+    bool any_image_ = false;
+    int total_ = 0;
+    int next_layer_ = 0;
+    ggml_context * state_ctx_ = nullptr;
+    ggml_backend_buffer_t state_buf_ = nullptr;
+    ggml_tensor * state_in_ = nullptr;
+    ggml_tensor * state_out_ = nullptr;
+};
+
 
 bool deepseek4_validate_image_batch(
     const DeepSeek4Weights & w, const DeepSeek4Cache & cache,

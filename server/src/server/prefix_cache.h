@@ -74,14 +74,22 @@ int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru
 
 // Pick the inline snapshot boundary for a request.
 // Default: boundary before the current user turn (second-to-last marker),
-// only when it advances past an already-restored prefix.
+// only when it advances past an already-restored prefix. A person may edit
+// or resend that turn, so the snapshot stops before it.
+// include_last_message cuts at the last marker instead, the start of the
+// generation prompt. Use it when the prompt ends with tool results: clients
+// append to them and never rewrite them, so the next request reuses them.
 // When prefer_tools_boundary is set (tool-heavy agent requests), prefer the
 // first marker (system+tools head) until that cut is already restored — this
 // is the sticky "thin pin" Python tool-split used to keep under multi-chat
 // eviction. Returns 0 when there is no useful new boundary.
+// Cuts below `reachable_from` (the first position the backend can save at,
+// see ModelBackend::snapshot_granularity) are skipped.
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     int restored_prefix_len = 0,
-                                    bool prefer_tools_boundary = false);
+                                    bool prefer_tools_boundary = false,
+                                    bool include_last_message = false,
+                                    int reachable_from = 0);
 
 // Return true when a PPP forced cut should override normal boundary
 // selection. Once the tools head is already restored, forcing the pin again
@@ -91,7 +99,8 @@ bool should_force_inline_snapshot_boundary(
     int prompt_len,
     int restored_prefix_len,
     bool prefer_tools_boundary,
-    int forced_cut);
+    int forced_cut,
+    int reachable_from = 0);
 
 // ─── Prefix cache entry ─────────────────────────────────────────────────
 
@@ -189,14 +198,18 @@ public:
     // the slot this request restores from; it is never chosen as the
     // eviction or budget victim and the free-slot path skips it, so the new
     // snapshot lands in a different slot and the restore point can slide
-    // forward past the deepest slot.
+    // forward past the deepest slot. `include_last_message` and
+    // `reachable_from` are forwarded to select_inline_snapshot_boundary; a
+    // forced cut below `reachable_from` is not forced.
     InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
         bool prefer_tools_boundary = false,
         int forced_cut = 0,
         int restore_source_slot = -1,
-        InlineSnapshotSize estimate_bytes = {});
+        InlineSnapshotSize estimate_bytes = {},
+        bool include_last_message = false,
+        int reachable_from = 0);
 
     // Commit an already-materialized snapshot without a reservation. Used by
     // cache import/bootstrap paths and tests.
@@ -207,6 +220,20 @@ public:
 
     // Remove committed metadata for an engine-invalidated checkpoint.
     void invalidate_inline_snap(int slot);
+
+    // Drop the entries that the entry committed in `slot` supersedes: its
+    // strict-prefix ancestors, except the shallowest one and protected pins.
+    // Returns the dropped slots; the caller frees their snapshot payloads.
+    std::vector<int> prune_superseded_ancestors(int slot);
+
+    // Evicts committed entries, never `keep_slot` or protected pins, until the
+    // resident bytes fit the budget again. Returns the evicted slots; the
+    // caller frees their snapshot payloads.
+    std::vector<int> enforce_resident_budget(int keep_slot);
+
+    // Declares that the caller prunes after every commit, so the budget check
+    // counts the entries a capture supersedes as freed when it lands.
+    void set_prunes_superseded(bool prunes) { prunes_superseded_ = prunes; }
 
     // Record synchronous scheduler stalls caused by copied checkpoints.
     void record_capture_attempt(uint64_t elapsed_us, bool success);
@@ -288,6 +315,7 @@ private:
     uint64_t active_inline_reservation_ = 0;
     uint64_t next_inline_reservation_ = 1;
     size_t max_resident_bytes_ = 0;
+    bool prunes_superseded_ = false;
     size_t resident_bytes_ = 0;
 
     // Full-cache state
@@ -332,6 +360,11 @@ private:
     // Helpers
     int find_entry(const PrefixHash & h) const;
     int find_slot_entry(int slot) const;
+    // Indices of entries a new entry for ids[0, len) supersedes: its strict
+    // prefixes except the shallowest and protected pins.
+    std::vector<int> superseded_entries(const int32_t * ids, size_t len) const;
+    // select_inline_evict_victim over the entries in LRU order.
+    int pick_evict_victim(int skip_index) const;
     void erase_inline_entry(int idx);
     void move_to_end(int idx);
     std::pair<int, int> lookup_impl(

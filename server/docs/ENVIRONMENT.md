@@ -1,3 +1,4 @@
+- `LUCE_EXPERT_SECONDARY_BUDGET_MB` - deepseek4_backend.cpp (secondary-device byte budget for `--ds4-expert-placement`; default: free memory minus 4 GiB)
 # Server environment variables
 
 Policy (2026-07): **new features ship as CLI flags or defaults, not env vars.**
@@ -22,10 +23,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
 | `LUCE_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
+| `LUCE_QWEN35_MASK_FULL_WIDTH` | unset | KILL SWITCH (burn-in): =1 restores the full max_ctx-wide causal-mask upload on the Qwen3.5/3.6/3.8 prefill and verify paths. By default only the columns flash attention reads (the live window rounded up to 256, plus one 256 stride) are built and copied. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `LUCE_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `LUCE_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `LUCE_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces LUCE_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
+| `GGML_CUDA_DISABLE_COPY_BATCH` | unset | KILL SWITCH (burn-in): set to issue one device memcpy per plain CPY node again. By default ggml-cuda gathers runs of consecutive same-type contiguous CPY nodes with independent byte ranges into one batched copy launch. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
@@ -33,7 +36,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
 | `LUCE_MMID_GROUPED_TYPES` | 7 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. |
 | `LUCE_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
-| `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
+| `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. Prefer the CLI: `--expert-device <backend:gpu>` sets both with the device and backend. |
 | `LUCE_DS4_MOE_TP_BACKEND` / `LUCE_MOE_TP_BACKEND` | peer runtime in a mixed build; compiled runtime otherwise | Select the in-process cold expert owner backend. |
 | `LUCE_DS4_MOE_TP_GPU` | peer backend device 0 in a mixed build; other local device otherwise | Device index within the cold DeepSeek4 expert backend. |
 | `LUCE_DS4_MOE_TP_CONCENTRATE_COLD` | unset | BURN-IN: use complete peer-owned expert layers to reduce cross-runtime joins; falls back when the placement would exceed the target budget. |
@@ -60,11 +63,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `LUCE_DS4_TP_FUSED_CACHE_SLOTS` | 8, 24 with `LUCE_DS4_Q5_VERIFY` | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
+| `LUCE_DS4_DEVICE_ROLLBACK` | 1 | KILL SWITCH (burn-in): =0 restores the per-row DS4 speculative-rollback copies (blocking host copies by default, stream-ordered with `LUCE_DS4_ASYNC_ROLLBACK=1`, pinned host staging with `LUCE_DS4_PINNED_ROLLBACK=1`). By default, when the verifier runs on a CUDA/HIP backend that holds every rollback tensor, save and apply stage in device memory with one batched copy each (`ggml_backend_cuda_copy_batch_async`), whatever the async/pinned switches say. |
 | `LUCE_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `LUCE_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
 | `LUCE_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
 | `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
-| `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset | BURN-IN: on sparse-route gfx1151 grouped MoE MMQ, choose the measured ROCmFP2/3/4 output tile from routed rows per expert; ordinary matmuls, unmeasured formats, and other devices are unchanged. |
+| `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset (MIX formats adapt) | On sparse-route gfx1151 grouped MoE MMQ, choose the measured output tile from routed rows per expert. Unset: only the shipped ROCmFP2/ROCmFP3 MIX expert formats adapt (tile 32). `=1` (BURN-IN): the plain ROCmFP2/3/4 formats adapt too. `=0`: none adapt. Ordinary matmuls and other devices are unchanged. |
 | `GGML_CUDA_MMQ_MOE_PERSISTENT` | unset | EXPERIMENTAL: on prefill-sized (at least 256-token) sparse grouped ROCmFP2/3/4 MMQ on gfx1151, build a compact device-side expert-tile queue and consume it with bounded persistent workers. Short batches, ordinary matmuls, unmeasured formats, and other devices are unchanged. |
 | `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` | 32 | DEBUG: set the compact grouped-MoE worker budget per gfx1151 CU from 1–32. Invalid values use 32. |
 | `GGML_CUDA_MLA_STREAM_TOPK` / `GGML_DS4_FA_STREAM_TOPK` | enabled for maskless ratio-4 sparse prefill; unset otherwise | Use wave32 selected-row D512 indexed attention for eligible long-prefill shapes: eight-head compact-order F32 on HIP, or the existing streaming path for F16 and CUDA. The first name takes precedence. Set `0` to restore the compact fallback, including for maskless prefill. |
@@ -78,14 +82,18 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `LUCE_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
+| `LUCE_PREFIX_CACHE_MAX_MIB` | auto | Container-entrypoint equivalent of `--prefix-cache-max-mib`; not read directly by the native binary. |
 | `LUCE_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
 | `LUCE_MMPROJ` | unset | Container-entrypoint equivalent of `--mmproj` (vision projector path, enables image input); not read directly by the native binary. |
+| `LUCE_TARGET_DEVICE` | unset (`auto` in the container) | Target device (`backend:gpu` or `auto`) used when neither `--target-device`, `--target-devices` nor a `--profile` names one. |
+| `LUCE_PROFILE` / `LUCE_ARGS` | unset | Container entrypoint only: `--profile` name, and extra `luce_server` flags split on whitespace. |
 | `LUCE_PREFILL_POOL_TRIM_TOKENS` | unset | OPT-IN: trim cached allocations from legacy CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries after each configured token interval. Intended for long, shape-changing prefills on non-VMM devices; each trim synchronizes the target backend and retires captured graphs. |
 | `LUCE_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `LUCE_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
 | `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` / `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
 | `LUCE_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 | `LUCE_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
+| `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
 
 ## Full inventory (generated)
 
@@ -101,12 +109,16 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `LUCE_LM_HEAD_FIX` - http_server.cpp
 - `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
+- `LUCE_DS4_LATE_CONTEXT_BEGIN` - deepseek4/deepseek4_backend.cpp (hybrid prefill position where chunks shrink to 1K; default 32768)
+- `LUCE_DS4_LONG_CONTEXT_CHUNK` - deepseek4/deepseek4_backend.cpp (hybrid prefill chunk cap for prompts ending above 4K; default 2048 on R9700 + Strix Halo, 1024 elsewhere)
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
+- `LUCE_QWEN35_MASK_FULL_WIDTH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `LUCE_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
 - `LUCE_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
 - `LUCE_ADAPTIVE_WIDTH_MIN` - adaptive_verify_width.h
 - `LUCE_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
+- `LUCE_ARGS` - scripts/entrypoint.sh (extra `luce_server` flags, split on whitespace)
 - `LUCE_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `LUCE_CUDA_BACKEND_PATH` - dynamic_backend.cpp
 - `LUCE_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
@@ -135,6 +147,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_DS4_HYBRID_PREFILL_GPU_HC` - deepseek4_graph.cpp
 - `LUCE_DS4_Q5_VERIFY` - deepseek4_backend.cpp, deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc, deepseek4_graph.cpp (gfx1151 DSpark default =1: five-row fused verifier and the 24-slot cache; =0 restores the q<=4 verifier)
 - `LUCE_DS4_PINNED_ROLLBACK` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned host rollback state; =0 restores pageable copies)
+- `LUCE_DS4_DEVICE_ROLLBACK` - deepseek4/deepseek4_dspark_spec.cpp
+- `LUCE_DS4_ASYNC_ROLLBACK` - deepseek4_dspark_spec.cpp (=1: stream-ordered per-row rollback copies when device staging is off)
 - `LUCE_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `LUCE_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `LUCE_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
@@ -197,7 +211,6 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_DYN_CONV_FUSED` - draft_graph.cpp (=0 expands the DFlash2 dynamic convs instead of the fused kernel)
 - `LUCE_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `LUCE_EXPERT_BUDGET_PCT` - laguna_backend.cpp
-- `LUCE_EXPERT_SECONDARY_BUDGET_MB` - deepseek4_backend.cpp (secondary-device byte budget for `--ds4-expert-placement`; default: free memory minus 4 GiB)
 - `LUCE_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `LUCE_FEATURE_DTYPE` - dflash_feature_ring.cpp
 - `LUCE_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)
@@ -290,6 +303,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp
 - `LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` - deepseek4_graph.cpp
 - `LUCE_MOE_TP_BACKEND` - deepseek4_backend.cpp
+- `LUCE_MULTI_MODEL_GRAPHS` - server_main.cpp
 - `LUCE_NO_MASK` - laguna_backend.cpp
 - `LUCE_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `LUCE_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp
@@ -300,6 +314,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_PREFILL_POOL_TRIM_TOKENS` - qwen35_backend.cpp (OPT-IN: trim legacy device pools during long prefills)
 - `LUCE_PREFILL_TIMING` - qwen35_backend.cpp (DEBUG: per-ubatch prefill build/alloc/compute timing)
 - `LUCE_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
+- `LUCE_PREFIX_CACHE_MAX_MIB` - scripts/entrypoint.sh (maps to `--prefix-cache-max-mib`)
+- `LUCE_PROFILE` - scripts/entrypoint.sh (maps to `--profile`)
 - `LUCE_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_HOTNESS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_NEXT_PLACEMENT_OUT` - qwen35moe_backend.cpp
@@ -333,6 +349,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_SPLIT_FAST_ROLLBACK` - chain_rollback_policy.h
 - `LUCE_STALL_TOOL_PREFIX` - http_server.cpp
 - `LUCE_SV_DEBUG` - qwen35_backend.cpp
+- `LUCE_TARGET_DEVICE` - server_main.cpp (default for `--target-device`)
 - `LUCE_TARGET_SHARD_IPC_SHARED_BYTES` - target_shard_ipc.cpp
 - `LUCE_TARGET_SHARD_IPC_TRANSPORT` - target_shard_ipc.cpp
 - `LUCE_TOPK_PROFILE` - geometric_draft_topk_cuda.cu
@@ -344,7 +361,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_FA256_WMMA_MAX_KV` - fattn.cu (ggml-cuda) (rocWMMA/raw-MMA crossover KV length in flag builds)
 - `GGML_HIP_ROCWMMA_FATTN` - server/CMakeLists.txt (BUILD OPTION, not an env var: compiles the rocWMMA fattn kernel; required by `LUCE_FA256_WMMA` and the sub-32K head-256 prefill route)
 - `GGML_CUDA_BATCH_PEER_COPIES` - ggml-cuda.cu (ggml-cuda), deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
+- `GGML_CUDA_DISABLE_COPY_BATCH` - ggml-cuda.cu (ggml-cuda)
 - `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
+- `GGML_CUDA_DISABLE_GRAPHS` - common.cuh (ggml-cuda), server_main.cpp (any value disables CUDA/HIP graph capture; the server sets it to 1 when one process serves more than one model block, see `LUCE_MULTI_MODEL_GRAPHS`)
 - `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)

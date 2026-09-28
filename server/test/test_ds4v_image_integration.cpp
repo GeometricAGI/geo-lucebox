@@ -69,9 +69,72 @@ void validation_and_lookup() {
     require(valid_image_spans({}, 0), "empty prompt/view is valid");
     require(!image_block_at({}, 0), "empty lookup is null");
     require(!valid_image_spans({nullptr, 1}, 100), "nonempty null view rejected");
-    std::array<TokenSpan, 5> too_many{};
-    require(!valid_image_spans({too_many.data(), too_many.size()}, 100), "more than four images rejected");
+    std::array<TokenSpan, luce::vision::DS4V_MAX_IMAGES + 1> too_many{};
+    require(!valid_image_spans({too_many.data(), too_many.size()}, 100), "too many images rejected");
     const std::vector<TokenSpan> spans{{10, 13, 18, 20}, {20, 20, 25, 25}, {30, 31, 33, 35}};
+    require(last_image_end_in(view(spans), 0, 10) == 0, "no image before the first block");
+    require(last_image_end_in(view(spans), 0, 11) == 20, "chunk reaching into the first image");
+    require(last_image_end_in(view(spans), 12, 26) == 25, "last overlapping image wins");
+    require(last_image_end_in(view(spans), 25, 30) == 0, "text between images");
+    require(last_image_end_in(view(spans), 34, 40) == 35, "chunk starting inside an image");
+    {
+        // Staged prefill chunks: 2 text rows, a 362-row image, 2 text rows
+        // (the shape of a one-image chat prompt), with a 256-row budget.
+        const std::vector<TokenSpan> chat{{2, 3, 363, 364}};
+        require(staged_prefill_chunk(view(chat), 0, 366, 256, 5) == 366,
+                "short text before an image grows to take the image and the stub tail");
+        const std::vector<TokenSpan> two{{2, 3, 99, 100}, {300, 301, 399, 400}};
+        require(staged_prefill_chunk(view(two), 0, 500, 256, 5) == 256, "text runs to the budget");
+        require(staged_prefill_chunk(view(two), 256, 244, 256, 5) == 244, "an image and the tail");
+        // Every layout of one or two images walks to the end in valid chunks.
+        const auto walk = [&](const std::vector<TokenSpan> & layout, int prefix, int budget) {
+            int done = 0;
+            while (done < prefix) {
+                const int remaining = prefix - done;
+                const int n = staged_prefill_chunk(view(layout), uint64_t(done), remaining, budget, 5);
+                const std::string at = " (images=" + std::to_string(layout.size()) +
+                    " prefix=" + std::to_string(prefix) + " budget=" + std::to_string(budget) +
+                    " done=" + std::to_string(done) + " n=" + std::to_string(n) + ")";
+                require(n >= 5, "staged chunk makes progress" + at);
+                require(remaining - n == 0 || remaining - n >= 5, "no stub tail" + at);
+                for (const TokenSpan & span : layout) {
+                    require(!(uint64_t(done) < span.block_end && uint64_t(done + n) > span.block_begin &&
+                              (uint64_t(done) > span.block_begin || uint64_t(done + n) < span.block_end)),
+                            "image block stays whole" + at);
+                }
+                // Past the budget, a chunk may only reach the first end that is
+                // valid at all: one that splits no image block and leaves no
+                // stub tail (a whole block, or the end of the prompt).
+                const int cap = std::max(budget, 5);
+                if (n > cap) {
+                    int first_valid = 0;
+                    for (int end = done + cap + 1; end <= prefix && !first_valid; ++end) {
+                        bool splits = false;
+                        for (const TokenSpan & span : layout) {
+                            splits = splits || (span.block_begin < uint64_t(end) && uint64_t(end) < span.block_end);
+                        }
+                        if (!splits && (prefix - end == 0 || prefix - end >= 5)) first_valid = end - done;
+                    }
+                    require(n == first_valid, "chunk exceeds the budget further than needed" + at +
+                            " first valid end past the budget=" + std::to_string(first_valid));
+                }
+                done += n;
+            }
+        };
+        for (uint64_t a = 0; a < 12; ++a)
+            for (uint64_t len = 5; len < 40; len += 7)
+                for (int budget : {5, 8, 16, 256}) {
+                    for (int prefix = int(a + len); prefix < int(a + len) + 12; ++prefix)
+                        walk({{a, a, a + len, a + len}}, prefix, budget);
+                    for (uint64_t gap = 0; gap < 9; gap += 2)
+                        for (uint64_t len2 = 5; len2 < 30; len2 += 8) {
+                            const uint64_t b = a + len + gap;
+                            for (int tail = 0; tail < 7; ++tail)
+                                walk({{a, a, a + len, a + len}, {b, b, b + len2, b + len2}},
+                                     int(b + len2) + tail, budget);
+                        }
+                }
+    }
     require(valid_image_spans(view(spans), 35), "adjacent and separated blocks valid");
     require(!image_block_at(view(spans), 9), "text before block excluded");
     require(image_block_at(view(spans), 10) == &spans[0], "leading padding belongs to image block");

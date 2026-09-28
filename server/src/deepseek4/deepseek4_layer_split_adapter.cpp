@@ -11,6 +11,7 @@
 #include "common/layer_split_runtime.h"
 #include "common/gguf_inspect.h"
 
+#include "ggml-alloc.h"
 #include "ggml-cuda.h"
 #if defined(GGML_USE_CUDA)
 #include <cuda_runtime.h>
@@ -671,6 +672,78 @@ void ds4_split_set_vec(ggml_tensor * t, const std::vector<float> & v) {
 // ls<shard>_) plus the adapter-level tensors. The shard snapshots alias that
 // context (owns_storage=false); the slot owns it. The same context is what
 // the ondisk prefix cache serializes, so there is no second copy.
+size_t DeepSeek4LayerSplitAdapter::split_snapshot_ctx_bytes() const {
+    size_t n_tensors = 3;
+    for (const auto & shard : shards_) {
+        n_tensors += deepseek4_snapshot_tensor_count(shard.cache.n_layer, /*with_aux=*/true);
+    }
+    return ggml_tensor_overhead() * (n_tensors + 8) + 4096;
+}
+
+bool DeepSeek4LayerSplitAdapter::declare_split_snapshot(
+        ggml_context * ctx, int tokens, size_t logits_len,
+        std::vector<DeepSeek4Snapshot> & shard_snaps,
+        ggml_tensor *& meta, ggml_tensor *& hc, ggml_tensor *& logits) const {
+    // Shard snapshots carry an (empty) aux sidecar so each one has the meta
+    // tensor deepseek4_snapshot_bind() needs after an ondisk reload.
+    const DeepSeek4SnapshotAux empty_aux;
+    shard_snaps.assign(shards_.size(), DeepSeek4Snapshot{});
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        const auto & shard = shards_[i];
+        const std::string prefix = ds4_split_prefix(i);
+        bool declared = false;
+        if (tokens < 0) {
+            declared = deepseek4_snapshot_declare(
+                ctx, shard.cache, prefix.c_str(), &empty_aux, shard_snaps[i]);
+        } else {
+            // A shard's cache spans every model layer, but only its own
+            // range gains compressed rows.
+            declared = deepseek4_snapshot_declare_at(
+                ctx, shard.cache, tokens, shard.weights.compress_ratios,
+                shard.layer_begin, shard.layer_end, prefix.c_str(), &empty_aux,
+                shard_snaps[i]);
+        }
+        if (!declared) return false;
+        shard_snaps[i].owns_storage = false;
+    }
+    meta = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kDs4SplitMetaLen);
+    hc = ds4_split_new_vec(ctx, kDs4SplitHcName, hc_state_.size());
+    logits = ds4_split_new_vec(ctx, kDs4SplitLogitsName, logits_len);
+    if (!meta || !hc || !logits) return false;
+    ggml_set_name(meta, kDs4SplitMetaName);
+    return true;
+}
+
+size_t DeepSeek4LayerSplitAdapter::snapshot_bytes_estimate(int tokens) const {
+    // A mixed split keeps part of every snapshot in the remote shard process.
+    if (shards_.empty() || tokens <= 0 || use_mixed_target_split()) return 0;
+    // Before the first request no logits exist yet; a saved snapshot holds
+    // one row of vocabulary logits.
+    size_t logits_len = prefill_last_logits_.size();
+    if (logits_len == 0) {
+        for (const auto & shard : shards_) {
+            logits_len = std::max(logits_len, (size_t) std::max(0, shard.weights.n_vocab));
+        }
+    }
+    ggml_init_params ip{};
+    ip.mem_size = split_snapshot_ctx_bytes();
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return 0;
+    std::vector<DeepSeek4Snapshot> shard_snaps;
+    ggml_tensor * meta = nullptr;
+    ggml_tensor * hc = nullptr;
+    ggml_tensor * logits = nullptr;
+    size_t bytes = 0;
+    if (declare_split_snapshot(ctx, tokens, logits_len, shard_snaps, meta, hc, logits)) {
+        bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_cpu_buffer_type());
+    }
+    ggml_free(ctx);
+    // snapshot_save() also keeps host copies of the HC state and logits.
+    return bytes ? bytes + (hc_state_.size() + logits_len) * sizeof(float) : 0;
+}
+
 bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS || shards_.empty()) return false;
     if (hc_state_.size() > (size_t) std::numeric_limits<int>::max() ||
@@ -681,12 +754,8 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     snapshot_free(slot);
     snap.shards.assign(shards_.size(), DeepSeek4Snapshot{});
 
-    size_t n_tensors = 3;
-    for (const auto & shard : shards_) {
-        n_tensors += deepseek4_snapshot_tensor_count(shard.cache.n_layer, /*with_aux=*/true);
-    }
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * (n_tensors + 8) + 4096;
+    ip.mem_size = split_snapshot_ctx_bytes();
     ip.no_alloc = true;
     ggml_context * ctx = ggml_init(ip);
     if (!ctx) return false;
@@ -697,23 +766,13 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
         return false;
     };
 
-    // Shard snapshots carry an (empty) aux sidecar so each one has the meta
-    // tensor deepseek4_snapshot_bind() needs after an ondisk reload.
-    const DeepSeek4SnapshotAux empty_aux;
-    std::vector<std::string> prefixes(shards_.size());
-    for (size_t i = 0; i < shards_.size(); ++i) {
-        prefixes[i] = ds4_split_prefix(i);
-        if (!deepseek4_snapshot_declare(ctx, shards_[i].cache, prefixes[i].c_str(),
-                                        &empty_aux, snap.shards[i])) {
-            return fail();
-        }
-        snap.shards[i].owns_storage = false;
+    ggml_tensor * meta = nullptr;
+    ggml_tensor * hc = nullptr;
+    ggml_tensor * logits = nullptr;
+    if (!declare_split_snapshot(ctx, /*tokens=*/-1, prefill_last_logits_.size(),
+                                snap.shards, meta, hc, logits)) {
+        return fail();
     }
-    ggml_tensor * meta = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kDs4SplitMetaLen);
-    ggml_tensor * hc = ds4_split_new_vec(ctx, kDs4SplitHcName, hc_state_.size());
-    ggml_tensor * logits = ds4_split_new_vec(ctx, kDs4SplitLogitsName, prefill_last_logits_.size());
-    if (!meta || !hc || !logits) return fail();
-    ggml_set_name(meta, kDs4SplitMetaName);
 
     ggml_backend_buffer_t buf =
         ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
@@ -724,6 +783,7 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     // the remote shard's slot together on every later failure path.
     snap.ctx = ctx;
     snap.buf = buf;
+    const DeepSeek4SnapshotAux empty_aux;
     for (size_t i = 0; i < shards_.size(); ++i) {
         snap.shards[i].ctx = ctx;
         snap.shards[i].buf = buf;

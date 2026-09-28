@@ -2810,6 +2810,84 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
 
 // ─── Cross-request prefix snapshot (Phase A) ─────────────────────────
 
+// Declares a dense snapshot of the first `token_count` positions in a fresh
+// no_alloc context owned by `snap`: K/V right-sized to the prefix, the full
+// recurrent state, and target features up to the ring width. Shared by
+// snapshot_target_cache() and estimate_target_cache_snapshot_bytes() so the
+// size the prefix cache budgets is the size a save allocates.
+static bool create_dense_snapshot_layout(const TargetWeights & w,
+                                         const TargetCache & cache,
+                                         int token_count,
+                                         PrefixSnapshot & snap) {
+    const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
+    const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
+    ggml_init_params ip{};
+    ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    snap.ctx = ggml_init(ip);
+    if (!snap.ctx) return false;
+
+    snap.attn_k_snap.assign(n_full_attn, nullptr);
+    snap.attn_v_snap.assign(n_full_attn, nullptr);
+    snap.ssm_state_snap.assign(n_delta, nullptr);
+    snap.conv_state_snap.assign(n_delta, nullptr);
+
+    // Right-sized KV: [head_dim, token_count, n_head_kv]
+    for (int i = 0; i < n_full_attn; i++) {
+        ggml_tensor * sk = cache.attn_k[i];
+        ggml_tensor * sv = cache.attn_v[i];
+        if (!sk || !sv) continue;
+        ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], token_count, sk->ne[2]);
+        ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], token_count, sv->ne[2]);
+        char name[64];
+        std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
+        std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
+        snap.attn_k_snap[i] = K;
+        snap.attn_v_snap[i] = V;
+    }
+
+    // SSM / conv: full-size (position-independent recurrent state).
+    for (int i = 0; i < n_delta; i++) {
+        ggml_tensor * ss = cache.ssm_state[i];
+        ggml_tensor * cs = cache.conv_state[i];
+        if (!ss || !cs) continue;
+        ggml_tensor * S = ggml_new_tensor_3d(snap.ctx, ss->type, ss->ne[0], ss->ne[1], ss->ne[2]);
+        ggml_tensor * C = ggml_new_tensor_2d(snap.ctx, cs->type, cs->ne[0], cs->ne[1]);
+        char name[64];
+        std::snprintf(name, sizeof(name), "snap_ssm_state_%d", i);  ggml_set_name(S, name);
+        std::snprintf(name, sizeof(name), "snap_conv_state_%d", i); ggml_set_name(C, name);
+        snap.ssm_state_snap[i]  = S;
+        snap.conv_state_snap[i] = C;
+    }
+
+    // Right-sized target_feat: [fc_in, min(token_count, target_feat_cap)]
+    if (cache.target_feat) {
+        ggml_tensor * tf = cache.target_feat;
+        const int feat_len = std::min(token_count, cache.target_feat_cap);
+        snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], feat_len);
+        ggml_set_name(snap.target_feat_snap, "snap_target_feat");
+    } else {
+        snap.target_feat_snap = nullptr;
+    }
+    return true;
+}
+
+size_t estimate_target_cache_snapshot_bytes(const TargetWeights & w,
+                                            const TargetCache & cache,
+                                            int token_count,
+                                            ggml_backend_buffer_type_t buft) {
+    if (!buft || cache.n_seq_slots > 1 || token_count <= 0) return 0;
+    if (cache.max_ctx > 0) token_count = std::min(token_count, cache.max_ctx);
+    PrefixSnapshot layout;
+    if (!create_dense_snapshot_layout(w, cache, token_count, layout)) return 0;
+    const size_t bytes =
+        ggml_backend_alloc_ctx_tensors_from_buft_size(layout.ctx, buft);
+    free_prefix_snapshot(layout);
+    return bytes;
+}
+
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
@@ -2836,58 +2914,10 @@ bool snapshot_target_cache(const TargetWeights & w,
         snap.cur_pos != snap_pos;
     if (needs_alloc) {
         free_prefix_snapshot(snap);
-
-        const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
-        ggml_init_params ip{};
-        ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
-        ip.mem_buffer = nullptr;
-        ip.no_alloc   = true;
-        snap.ctx = ggml_init(ip);
-        if (!snap.ctx) { set_last_error("PrefixSnapshot ggml_init failed"); return false; }
-
-        snap.attn_k_snap.assign(n_full_attn, nullptr);
-        snap.attn_v_snap.assign(n_full_attn, nullptr);
-        snap.ssm_state_snap.assign(n_delta, nullptr);
-        snap.conv_state_snap.assign(n_delta, nullptr);
-
-        // Right-sized KV: [head_dim, snap_pos, n_head_kv]
-        for (int i = 0; i < n_full_attn; i++) {
-            ggml_tensor * sk = cache.attn_k[i];
-            ggml_tensor * sv = cache.attn_v[i];
-            if (!sk || !sv) continue;
-            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], snap_pos, sk->ne[2]);
-            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], snap_pos, sv->ne[2]);
-            char name[64];
-            std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
-            std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
-            snap.attn_k_snap[i] = K;
-            snap.attn_v_snap[i] = V;
+        if (!create_dense_snapshot_layout(w, cache, snap_pos, snap)) {
+            set_last_error("PrefixSnapshot ggml_init failed");
+            return false;
         }
-
-        // SSM / conv: full-size (position-independent recurrent state).
-        for (int i = 0; i < n_delta; i++) {
-            ggml_tensor * ss = cache.ssm_state[i];
-            ggml_tensor * cs = cache.conv_state[i];
-            if (!ss || !cs) continue;
-            ggml_tensor * S = ggml_new_tensor_3d(snap.ctx, ss->type, ss->ne[0], ss->ne[1], ss->ne[2]);
-            ggml_tensor * C = ggml_new_tensor_2d(snap.ctx, cs->type, cs->ne[0], cs->ne[1]);
-            char name[64];
-            std::snprintf(name, sizeof(name), "snap_ssm_state_%d", i);  ggml_set_name(S, name);
-            std::snprintf(name, sizeof(name), "snap_conv_state_%d", i); ggml_set_name(C, name);
-            snap.ssm_state_snap[i]  = S;
-            snap.conv_state_snap[i] = C;
-        }
-
-        // Right-sized target_feat: [fc_in, min(snap_pos, target_feat_cap)]
-        if (cache.target_feat) {
-            ggml_tensor * tf = cache.target_feat;
-            const int feat_len = std::min(snap_pos, cache.target_feat_cap);
-            snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], feat_len);
-            ggml_set_name(snap.target_feat_snap, "snap_target_feat");
-        } else {
-            snap.target_feat_snap = nullptr;
-        }
-
         snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
         if (!snap.buf) {
             set_last_error("ggml_backend_alloc_ctx_tensors failed for PrefixSnapshot");

@@ -24,6 +24,7 @@
 #include "deepseek4_internal.h"
 
 #include <string>
+#include <vector>
 
 namespace luce::common {
 
@@ -80,6 +81,20 @@ bool deepseek4_snapshot_declare(ggml_context * ctx,
                                 const char * name_prefix,
                                 const DeepSeek4SnapshotAux * aux,
                                 DeepSeek4Snapshot & out);
+
+// deepseek4_snapshot_declare() for the state `cache` will have once it holds
+// `tokens` positions: layers in [layer_begin, layer_end) gain the compressed
+// and indexer rows completed by then (compress_ratios is indexed by cache
+// layer); other layers keep their live counts. Declares shapes only, so a
+// caller can size a snapshot before saving it.
+bool deepseek4_snapshot_declare_at(ggml_context * ctx,
+                                   const DeepSeek4Cache & cache,
+                                   int tokens,
+                                   const std::vector<uint32_t> & compress_ratios,
+                                   int layer_begin, int layer_end,
+                                   const char * name_prefix,
+                                   const DeepSeek4SnapshotAux * aux,
+                                   DeepSeek4Snapshot & out);
 
 // Copy the live cache (and the aux the snapshot was declared with) into the
 // allocated snapshot tensors and set `out.cur_pos`.

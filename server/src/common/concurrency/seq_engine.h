@@ -54,6 +54,7 @@
 #include <string>
 #include <vector>
 
+#include "common/image_prompt.h"
 #include "common/sampler.h"
 #include "prefix_store.h"
 
@@ -180,6 +181,22 @@ public:
     virtual AdmitResult admit(uint64_t request_id,
                               const std::vector<int32_t> & prompt,
                               const SamplerCfg & sampler) = 0;
+
+    // Image requests. The engine keeps the payload with the slot for as long
+    // as the slot lives, so a re-prefill after eviction sees the images again.
+    // Engines without image support refuse; the server only routes images to
+    // an engine that reports supports_images().
+    virtual bool supports_images() const { return false; }
+    virtual AdmitResult admit_images(uint64_t request_id,
+                                     const std::vector<int32_t> & prompt,
+                                     const SamplerCfg & sampler,
+                                     const ImagePromptHandle & images) {
+        (void) request_id; (void) prompt; (void) sampler; (void) images;
+        AdmitResult result;
+        result.status = AdmitResult::Status::failed;
+        result.error = "this engine does not serve image requests";
+        return result;
+    }
 
     // Optional prefix-checkpoint admission. Unsupported engines remain on
     // cold admission and never receive a plan from the scheduler.
@@ -316,6 +333,10 @@ public:
         error = "engine does not support KV eviction";
         return false;
     }
+    // False when the slot's KV cannot be rebuilt from its token history (for
+    // example image rows that prefill from pixels): the scheduler then picks
+    // another eviction victim.
+    virtual bool kv_recomputable(int) const { return true; }
 
     // True when a parked slot's resume reservation fits current free pool
     // capacity with headroom for the resident cohort's next step — the

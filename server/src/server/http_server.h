@@ -101,6 +101,11 @@ struct ServerConfig {
     bool        enable_cors = true;
     std::string model_name  = "luce";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    // Resident system-memory budget for single-sequence prefix snapshots.
+    // kPrefixCacheBudgetAuto sizes it from the backend's snapshot size at
+    // its full context; zero means unlimited.
+    static constexpr size_t kPrefixCacheBudgetAuto = (size_t)-1;
+    size_t      prefix_cache_max_bytes = kPrefixCacheBudgetAuto;
     // Resident system-memory budget for copied paged checkpoints. The
     // scheduler enforces it only when concurrent paged prefix storage is
     // active. Zero means unlimited.
@@ -348,7 +353,23 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
+    // The prompt ends with tool results. Clients only append after them, so
+    // the inline snapshot may cover them (see select_inline_snapshot_boundary).
+    bool                      ends_with_tool_result = false;
 };
+
+// Resident budget the PrefixCache enforces: the concurrent limit in paged
+// mode, else --prefix-cache-max-mib, with auto sized from the backend's
+// snapshot at full context.
+struct PrefixCacheBudget {
+    size_t bytes = 0;         // 0 = unlimited
+    bool automatic = false;   // sized by auto
+    bool sized = true;        // false: the backend cannot size snapshots
+    std::string error;        // set when an explicit limit cannot apply;
+                              // startup rejects that configuration
+};
+PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
+                                              const ModelBackend & backend);
 
 // Parse request sampler fields, applying model-card defaults where present.
 SamplerCfg parse_request_sampler(const json & body,
@@ -489,6 +510,9 @@ private:
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache);
     void forget_inline_slot_metadata(int slot);
+    // After a commit in `slot`: free the snapshots it supersedes, then evict
+    // until committed snapshots fit the resident budget again.
+    void trim_snapshots_after_commit(int slot);
 
     struct GenerationInputs {
         GenerateRequest request;
@@ -624,6 +648,15 @@ private:
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::unordered_set<int> agent_turn_cache_slots_;
+
+    // Memory held by the live cache and saved snapshots, rebuilt on the
+    // generation thread after each request and read by /props (see
+    // publish_memory_report and memory_json).
+    mutable std::mutex memory_report_mu_;
+    json memory_report_;
+    uint64_t memory_report_requests_ = 0;
+    void publish_memory_report();
+    json memory_json() const;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;

@@ -307,7 +307,7 @@ bool Qwen35DFlashTarget::verify_batch(
 
     // GGML M-RoPE positions are axis-major.
     std::vector<int32_t> pos(4 * n_tokens);
-    fill_qwen35_mrope_positions(pos.data(), base_pos, n_tokens);
+    fill_qwen35_mrope_positions(pos.data(), base_pos + rope_offset(), n_tokens);
     ggml_backend_tensor_set(sg_.positions, pos.data(), 0,
                             sizeof(int32_t) * pos.size());
 
@@ -343,12 +343,8 @@ bool Qwen35DFlashTarget::verify_batch(
         const int win_start = (fa_window_ > 0 && base_pos > fa_window_)
                                   ? (base_pos - fa_window_) : 0;
         const int kv_len = base_pos + n_tokens - win_start;
-        std::vector<uint16_t> mask_buf;
-        const int kv_pad_override = (int)sg_.attn_mask->ne[0];
-        build_causal_mask(mask_buf, kv_len, n_tokens, base_pos,
-                          kq_stride_pad_, win_start, kv_pad_override);
-        ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
-                                sizeof(uint16_t) * mask_buf.size());
+        upload_qwen35_causal_mask_window(sg_.attn_mask, kv_len, n_tokens,
+                                         base_pos, kq_stride_pad_, win_start);
     }
 
     auto st = ggml_backend_graph_compute(backend_, sg_.gf);
@@ -452,7 +448,7 @@ bool Qwen35DFlashTarget::verify_tree(
     // M-RoPE axis-major positions: each node sits at committed + its depth.
     std::vector<int32_t> pos4(4 * N, 0);
     for (int i = 0; i < N_actual; i++) {
-        const int p = committed + (i == 0 ? 0 : tree.depths[i - 1]);
+        const int p = committed + rope_offset() + (i == 0 ? 0 : tree.depths[i - 1]);
         pos4[0 * N + i] = p;
         pos4[1 * N + i] = p;
         pos4[2 * N + i] = p;

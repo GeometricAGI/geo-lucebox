@@ -51,12 +51,20 @@ std::string check_feature_compatibility(
     if (args.mmproj_path.has_value()) {
         if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
             args.device.is_tensor_parallel() || args.remote_target_shard.enabled() ||
-            args.max_concurrency != 1) {
-            return "--mmproj requires a local single-request DeepSeek4 or Qwen3.5 backend "
-                   "that is not split across GPUs by layer or tensor";
+            (arch == "deepseek4" && args.max_concurrency != 1 && !args.paged_attention)) {
+            return "--mmproj requires a local DeepSeek4 or Qwen3.5 backend that is not split "
+                   "across GPUs by layer or tensor (DeepSeek4 batching needs --paged-attention)";
         }
         if (arch == "deepseek4" && target_backend != PlacementBackend::Hip) {
             return "--mmproj with DeepSeek4 requires a HIP backend";
+        }
+    }
+    if (args.mmproj_device.has_value()) {
+        if (!args.mmproj_path.has_value() || arch != "deepseek4" ||
+            args.mmproj_device->backend != PlacementBackend::Hip ||
+            args.mmproj_device->gpu == args.device.gpu) {
+            return "--mmproj-device needs --mmproj, a DeepSeek4 target, and a HIP GPU "
+                   "other than the target's";
         }
     }
 
@@ -399,7 +407,11 @@ std::vector<std::string> collect_feature_warnings(
     const std::string & arch)
 {
     std::vector<std::string> out;
-    const bool split = args.device.is_layer_split();
+    // create_backend() also hands deepseek4 to its layer-split adapter for a
+    // remote target shard on one local device; that adapter drops the same
+    // options as an explicit split.
+    const bool split = args.device.is_layer_split() ||
+        (arch == "deepseek4" && args.remote_target_shard.enabled());
 
     // Each entry pairs a requested option with the capability predicate for
     // the field create_backend() would have to forward for it to take effect.

@@ -13,9 +13,11 @@
 
 #include "http_server.h"
 #include "chat_template.h"
+#include "launch_profiles.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
 #include "common/chain_rollback_policy.h"
+#include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/model_capabilities.h"
 #include "common/spark_corpus.h"
@@ -27,6 +29,7 @@
 #include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
+#include "placement/device_select.h"
 #include "kvflash_pager.h"
 #include "kv_quant.h"
 
@@ -40,6 +43,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -74,26 +78,66 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
     return !out.empty();
 }
 
+// Parses a non-negative MiB count into bytes; rejects values that do not
+// fit in addressable memory.
+static bool parse_mib(const char * value, size_t & out_bytes) {
+    const char * end = value + std::strlen(value);
+    uint64_t mib = 0;
+    const auto parsed = std::from_chars(value, end, mib);
+    constexpr uint64_t bytes_per_mib = 1024ull * 1024ull;
+    if (parsed.ec != std::errc{} || parsed.ptr != end ||
+        mib > (uint64_t)std::numeric_limits<size_t>::max() / bytes_per_mib) {
+        return false;
+    }
+    out_bytes = (size_t)(mib * bytes_per_mib);
+    return true;
+}
+
+// parse_mib, or `auto_bytes` for the literal "auto".
+static bool parse_mib_or_auto(const char * value, size_t auto_bytes,
+                              size_t & out_bytes) {
+    if (std::strcmp(value, "auto") == 0) {
+        out_bytes = auto_bytes;
+        return true;
+    }
+    return parse_mib(value, out_bytes);
+}
+
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
         "Usage: %s <model.gguf> [options]\n"
+        "       %s --list-devices [model.gguf]\n"
         "\n"
         "Options:\n"
+        "  --profile <name>    Apply a qualified launch profile (%s).\n"
+        "                      Explicit flags and already-set environment\n"
+        "                      variables take precedence over the profile.\n"
         "  --model <path>      Begin a model block; set placement with --target-device.\n"
         "  --load-balancing    Enable primary-first fallback (disabled by default).\n"
         "  --load-balancing-primary-gpu <backend:gpu> Select the primary model by its target device.\n"
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
-        "  --draft <path>       Draft model for speculative decode\n"
+        "  --draft <path>       Draft model for speculative decode (DFlash for Qwen,\n"
+        "                       Gemma and Laguna; DSpark for DeepSeek4)\n"
         "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
+        "  --mmproj-device hip:N  Run the DS4V image encoder on another GPU (one-GPU layout)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
-        "  --max-ctx <N>        Max context length (default: 131072)\n"
+        "  --max-ctx <N>        Max context length (default: 8192)\n"
         "  --max-tokens <N>     Default max output tokens (legacy alias for\n"
         "                       --default-max-tokens; loses to --default-max-tokens\n"
         "                       when both are passed)\n"
-        "  --target-device <backend:gpu>  Target device (default: auto:0)\n"
-        "  --draft-device <backend:gpu>   Draft device (default: auto:0)\n"
+        "  --target-device <backend:gpu|auto>\n"
+        "                                 Target device (default: auto:0, the first\n"
+        "                                 GPU). auto picks a GPU the model fits on,\n"
+        "                                 discrete before integrated, else the\n"
+        "                                 largest; see --list-devices. Env default:\n"
+        "                                 LUCE_TARGET_DEVICE\n"
+        "  --draft-device <backend:gpu>   Draft device (default: auto:0; DeepSeek4\n"
+        "                                 and --target-device auto: the target GPU)\n"
+        "  --expert-device <backend:gpu>  DeepSeek4: keep dense work and hot experts on\n"
+        "                                 the target and run the remaining routed\n"
+        "                                 experts on this GPU in process\n"
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
@@ -149,6 +193,13 @@ static void print_usage(const char * prog) {
         "                       memory. DeepSeek4 reserves --max-ctx per slot.\n"
         "  --model-name <name>  Model name for /v1/models (default: luce)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
+        "  --prefix-cache-max-mib <auto|MiB>\n"
+        "                       Resident RAM limit for prefix snapshots (default:\n"
+        "                       auto = three snapshots at --max-ctx, at most 1/4 of\n"
+        "                       available memory; 0 unlimited). Qwen and DeepSeek4\n"
+        "                       single-sequence only (not DeepSeek4 mixed-backend\n"
+        "                       splits): other backends stay unlimited under auto\n"
+        "                       and reject an explicit limit\n"
         "  --concurrent-prefix-cache-max-mib <MiB>\n"
         "                       Resident RAM limit for copied concurrent paged\n"
         "                       checkpoints (default: 4096; 0 unlimited)\n"
@@ -254,7 +305,7 @@ static void print_usage(const char * prog) {
         "  --freq                       Enable expert frequency tracking + print analysis at shutdown\n"
         "  --collect-routing <path>     Log binary routing data (hidden states + expert IDs)\n"
         "                               for MLP predictor training (see scripts/train_predictor.py)\n"
-        "\n", prog);
+        "\n", prog, prog, luce::server::launch_profile_names().c_str());
 }
 
 // Own everything borrowed by a model's HTTP/scheduler context. Shutdown must
@@ -298,6 +349,11 @@ struct ModelOptions {
     std::string cache_type_v;  // explicit --cache-type-v override
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
+    bool target_device_auto = false;   // --target-device auto
+    bool target_device_from_env = false;  // the device came from LUCE_TARGET_DEVICE
+    bool draft_device_set = false;     // --draft-device given explicitly
+    std::optional<DevicePlacement> expert_device;  // --expert-device
+    const luce::server::LaunchProfile * profile = nullptr;  // --profile; env installed at load
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -357,7 +413,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             std::fprintf(stderr, "[server] %s belongs in the first model block: there is one listener\n", argv[i]);
             return 2;
         }
-        if (load_balancing && (option == "--peer-access" ||
+        if (load_balancing && (option == "--peer-access" || option == "--expert-device" ||
             option == "--no-fast-rollback" || option == "--target-split-fast-rollback" ||
             option == "--adaptive-experts" || option == "--specla" ||
             option == "--specla-top-k" || option.rfind("--kvflash", 0) == 0 ||
@@ -365,7 +421,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             std::fprintf(stderr, "[server] %s changes process-wide policy and cannot be scoped to a model\n", argv[i]);
             return 2;
         }
-        if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
+        if (std::strcmp(argv[i], "--draft") == 0) {
+            // An empty path would silently start without speculation, while
+            // --draft promises a drafter or a failed start.
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                std::fprintf(stderr, "[server] --draft needs a draft model path\n");
+                return 2;
+            }
             bargs.draft_path = argv[++i];
         } else if (std::strcmp(argv[i], "--mmproj") == 0) {
             if (i + 1 >= argc) {
@@ -373,6 +435,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             bargs.mmproj_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mmproj-device") == 0 && i + 1 < argc) {
+            DevicePlacement vision_device;
+            if (!parse_placement_device(argv[++i], vision_device)) {
+                std::fprintf(stderr, "[server] bad --mmproj-device value (expected hip:gpu)\n");
+                return 2;
+            }
+            bargs.mmproj_device = vision_device;
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -394,8 +463,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             target_device_seen = true;
-            if (!parse_placement_device(argv[++i], bargs.device)) {
-                std::fprintf(stderr, "[server] bad --target-device value (expected backend:gpu)\n");
+            const char * value = argv[++i];
+            model.target_device_auto = std::strcmp(value, "auto") == 0;
+            if (!model.target_device_auto &&
+                !parse_placement_device(value, bargs.device)) {
+                std::fprintf(stderr, "[server] bad --target-device value (expected backend:gpu or auto)\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--draft-swa") == 0 && i + 1 < argc) {
@@ -418,6 +490,19 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");
                 return 2;
             }
+            model.draft_device_set = true;
+        } else if (std::strcmp(argv[i], "--expert-device") == 0 && i + 1 < argc) {
+            DevicePlacement expert;
+            if (!parse_placement_device(argv[++i], expert)) {
+                std::fprintf(stderr, "[server] bad --expert-device value (expected backend:gpu)\n");
+                return 2;
+            }
+            model.expert_device = expert;
+        } else if (std::strcmp(argv[i], "--profile") == 0) {
+            // main() expands profiles before blocks are parsed.
+            std::fprintf(stderr, "[server] --profile needs a profile name (%s)\n",
+                         luce::server::launch_profile_names().c_str());
+            return 2;
         } else if (std::strcmp(argv[i], "--draft-ipc-bin") == 0 && i + 1 < argc) {
             bargs.remote_draft.ipc_bin = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-ipc-work-dir") == 0 && i + 1 < argc) {
@@ -502,20 +587,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--decode-kv-offload-mb") == 0 && i + 1 < argc) {
-            const char * value = argv[++i];
-            if (std::strcmp(value, "auto") == 0) {
-                sconfig.decode_kv_offload_bytes = kAutoKvOffloadBytes;
-                continue;
-            }
-            const char * end = value + std::strlen(value);
-            size_t mib = 0;
-            const auto parsed = std::from_chars(value, end, mib);
-            if (parsed.ec != std::errc{} || parsed.ptr != end ||
-                mib > (std::numeric_limits<size_t>::max)() / (1024 * 1024)) {
+            if (!parse_mib_or_auto(argv[++i], kAutoKvOffloadBytes,
+                                   sconfig.decode_kv_offload_bytes)) {
                 std::fprintf(stderr, "[server] --decode-kv-offload-mb requires a nonnegative integer within byte range\n");
                 return 2;
             }
-            sconfig.decode_kv_offload_bytes = mib * 1024 * 1024;
         } else if (std::strcmp(argv[i], "--max-concurrency") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             const char * end = value + std::strlen(value);
@@ -559,28 +635,23 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(
                        argv[i], "--concurrent-prefix-cache-max-mib") == 0) {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr,
-                    "[server] --concurrent-prefix-cache-max-mib requires "
-                    "a value\n");
-                return 2;
-            }
-            const char * value = argv[++i];
-            const char * end = value + std::strlen(value);
-            uint64_t mib = 0;
-            const auto parsed = std::from_chars(value, end, mib);
-            constexpr uint64_t bytes_per_mib = 1024ull * 1024ull;
-            if (parsed.ec != std::errc{} || parsed.ptr != end ||
-                mib > (uint64_t)std::numeric_limits<size_t>::max() /
-                    bytes_per_mib) {
+            if (i + 1 >= argc ||
+                !parse_mib(argv[++i], sconfig.concurrent_prefix_cache_max_bytes)) {
                 std::fprintf(stderr,
                     "[server] --concurrent-prefix-cache-max-mib must be a "
                     "non-negative "
                     "integer that fits in addressable memory\n");
                 return 2;
             }
-            sconfig.concurrent_prefix_cache_max_bytes =
-                (size_t)(mib * bytes_per_mib);
+        } else if (std::strcmp(argv[i], "--prefix-cache-max-mib") == 0) {
+            if (i + 1 >= argc ||
+                !parse_mib_or_auto(argv[++i], ServerConfig::kPrefixCacheBudgetAuto,
+                                   sconfig.prefix_cache_max_bytes)) {
+                std::fprintf(stderr,
+                    "[server] --prefix-cache-max-mib must be auto or a "
+                    "non-negative integer that fits in addressable memory\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
             sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
@@ -822,6 +893,37 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             return 2;
         }
     }
+    // LUCE_TARGET_DEVICE supplies the device when the block names none (a
+    // profile's --target-device counts as naming one). The container sets it
+    // to auto; native launches keep auto:0 unless they export it.
+    if (!target_device_seen && !target_devices_seen && !load_balancing) {
+        const char * env_device = std::getenv("LUCE_TARGET_DEVICE");
+        if (env_device && *env_device) {
+            model.target_device_from_env = true;
+            model.target_device_auto = std::strcmp(env_device, "auto") == 0;
+            if (!model.target_device_auto &&
+                !parse_placement_device(env_device, bargs.device)) {
+                std::fprintf(stderr,
+                    "[server] bad LUCE_TARGET_DEVICE value '%s' (expected backend:gpu or auto)\n",
+                    env_device);
+                return 2;
+            }
+        }
+    }
+    if (model.target_device_auto && model.expert_device) {
+        std::fprintf(stderr,
+            "[server] --expert-device needs an explicit --target-device for the dense work%s\n",
+            model.target_device_from_env
+                ? " (LUCE_TARGET_DEVICE=auto, which the container sets, does not name one)"
+                : "");
+        return 2;
+    }
+    if (model.target_device_auto && load_balancing) {
+        std::fprintf(stderr,
+            "[server] --target-device auto is unavailable with --load-balancing; "
+            "give each model block an explicit backend:gpu\n");
+        return 2;
+    }
     if (bargs.specla_top_k_explicit && !bargs.specla_mode) {
         std::fprintf(stderr, "[server] --specla-top-k requires --specla\n");
         return 2;
@@ -864,7 +966,132 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     return 0;
 }
 
+static double bytes_to_gib(uint64_t bytes) {
+    return (double) bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+// The KV cache a model block's context needs on its GPU, with its cache-type
+// flags (already validated) as overrides; 0 when the family is not estimated.
+static uint64_t model_kv_cache_bytes(const ModelOptions & model) {
+    auto override_type = [](const std::string & name) {
+        return name.empty() ? GGML_TYPE_COUNT : luce::parse_kv_type(name.c_str());
+    };
+    return gguf_kv_cache_bytes(model.bargs.model_path, model.bargs.device.max_ctx,
+                               override_type(model.cache_type_k),
+                               override_type(model.cache_type_v));
+}
+
+// --target-device auto: bind the model block to the GPU the policy picks.
+static bool resolve_auto_target_device(ModelOptions & model) {
+    const std::vector<GpuDeviceInfo> devices = enumerate_gpu_devices();
+    const uint64_t model_bytes = gguf_model_bytes(model.bargs.model_path);
+    if (model_bytes == 0) {
+        std::fprintf(stderr, "[server] --target-device auto: cannot read model %s\n",
+                     model.bargs.model_path.c_str());
+        return false;
+    }
+    // One sequence at --max-ctx must fit; paged serving sizes its pool from
+    // whatever memory is left.
+    const uint64_t kv_bytes = model_kv_cache_bytes(model);
+    const AutoDeviceChoice choice = choose_auto_target_device(devices, model_bytes, kv_bytes);
+    if (choice.index < 0) {
+        std::fprintf(stderr, "[server] --target-device auto: %s\n", choice.reason.c_str());
+        return false;
+    }
+    DevicePlacement & target = model.bargs.device;
+    target.backend = compiled_placement_backend();
+    target.gpu = choice.index;
+    const GpuDeviceInfo & device = devices[(size_t) choice.index];
+    std::fprintf(stderr,
+        "[server] --target-device auto: %s (%s, %s, %.1f GiB) for a %.1f GiB model"
+        " + %.1f GiB KV at %d tokens: %s\n",
+        placement_device_name(target).c_str(), device.name.c_str(), device.arch.c_str(),
+        bytes_to_gib(device.total_bytes), bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes),
+        model.bargs.device.max_ctx, choice.reason.c_str());
+    return true;
+}
+
+// After a failed load on a fixed device, name the device auto would pick when
+// the fixed one is too small for the model and a different one is available.
+static void print_target_device_hint(const std::string & model_path,
+                                     const DevicePlacement & target,
+                                     uint64_t kv_bytes) {
+    if (target.is_multi_device()) return;
+    const std::vector<GpuDeviceInfo> devices = enumerate_gpu_devices();
+    const uint64_t model_bytes = gguf_model_bytes(model_path);
+    if (devices.size() < 2 || model_bytes == 0) return;
+    if (target.gpu < 0 || (size_t) target.gpu >= devices.size()) return;
+    const GpuDeviceInfo & current = devices[(size_t) target.gpu];
+    if (current.total_bytes >= auto_device_required_bytes(model_bytes, kv_bytes)) return;
+    const AutoDeviceChoice choice = choose_auto_target_device(devices, model_bytes, kv_bytes);
+    if (choice.index < 0 || choice.index == target.gpu) return;
+    const GpuDeviceInfo & better = devices[(size_t) choice.index];
+    const char * backend = placement_backend_name(compiled_placement_backend());
+    std::fprintf(stderr,
+        "[server] hint: the %.1f GiB model is too large for %s:%d (%s, %.1f GiB). "
+        "%s:%d (%s, %s, %.1f GiB) is the better fit: pass --target-device %s:%d "
+        "or --target-device auto (see --list-devices).\n",
+        bytes_to_gib(model_bytes), backend, target.gpu, current.name.c_str(),
+        bytes_to_gib(current.total_bytes), backend, choice.index, better.name.c_str(),
+        better.arch.c_str(), bytes_to_gib(better.total_bytes), backend, choice.index);
+}
+
+// --expert-device: DeepSeek4 in-process expert parallelism. The flag is the
+// command-line spelling of LUCE_DS4_MOE_TP=1 LUCE_DS4_MOE_TP_INPROC=1
+// LUCE_DS4_MOE_TP_GPU=<n> LUCE_DS4_MOE_TP_BACKEND=<backend>.
+static bool apply_expert_device(const DevicePlacement & expert,
+                                const BackendPlan & plan) {
+    const DevicePlacement & target = plan.placement().target;
+    if (plan.arch() != "deepseek4") {
+        std::fprintf(stderr,
+            "[server] --expert-device is only valid for deepseek4 models (detected '%s')\n",
+            plan.arch().c_str());
+        return false;
+    }
+    if (target.is_multi_device() || plan.placement().remote_target_shard.enabled()) {
+        std::fprintf(stderr, "[server] --expert-device requires one local --target-device\n");
+        return false;
+    }
+    const PlacementBackend compiled = compiled_placement_backend();
+    const PlacementBackend target_backend =
+        target.backend == PlacementBackend::Auto ? compiled : target.backend;
+    const PlacementBackend expert_backend =
+        expert.backend == PlacementBackend::Auto ? compiled : expert.backend;
+    if (expert_backend == target_backend && expert.gpu == target.gpu) {
+        std::fprintf(stderr, "[server] --expert-device must differ from the target device\n");
+        return false;
+    }
+    const std::string gpu = std::to_string(expert.gpu);
+    set_environment_variable("LUCE_DS4_MOE_TP", "1", true);
+    set_environment_variable("LUCE_DS4_MOE_TP_INPROC", "1", true);
+    set_environment_variable("LUCE_DS4_MOE_TP_GPU", gpu.c_str(), true);
+    set_environment_variable("LUCE_DS4_MOE_TP_BACKEND",
+                             placement_backend_name(expert_backend), true);
+    return true;
+}
+
+// Install a profile's environment defaults. Variables that are already set
+// keep their value, and the log names them.
+static void apply_launch_profile_env(const luce::server::LaunchProfile & profile) {
+    if (profile.env.empty()) return;
+    int applied = 0;
+    std::string kept_env;
+    for (const luce::server::LaunchProfileEnv & env : profile.env) {
+        if (std::getenv(env.name)) {
+            kept_env += std::string(kept_env.empty() ? "" : ", ") + env.name;
+            continue;
+        }
+        set_environment_variable(env.name, env.value, false);
+        ++applied;
+    }
+    std::fprintf(stderr, "[server] profile %s: %d environment defaults applied%s%s\n",
+                 profile.name, applied,
+                 kept_env.empty() ? "" : "; kept explicit ",
+                 kept_env.c_str());
+}
+
 static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
+    if (model.profile) apply_launch_profile_env(*model.profile);
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
     if (!model.kvflash_pool.empty())
@@ -919,6 +1146,13 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             bargs.draft_swa_window = std::atoi(e);
         }
     }
+
+    if (model.target_device_auto && !resolve_auto_target_device(model)) {
+        return 1;
+    }
+    bargs.draft_device = resolve_draft_placement(
+        bargs.draft_device, model.draft_device_set, bargs.device,
+        model.target_device_auto);
 
     // Explicit --cache-type-* overrides enter the request here; the qwen35
     // env/default resolution runs inside prepare_backend() once the model
@@ -1200,9 +1434,16 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                 arch.c_str());
         }
     }
+    if (model.expert_device && !apply_expert_device(*model.expert_device, backend_plan)) {
+        return 2;
+    }
     auto backend_owner = create_backend(backend_plan);
     if (!backend_owner) {
         std::fprintf(stderr, "[server] backend creation failed\n");
+        if (!model.expert_device) {
+            print_target_device_hint(backend_model.path, backend_placement.target,
+                                     model_kv_cache_bytes(model));
+        }
         return 1;
     }
     ModelBackend * backend = backend_owner.get();
@@ -1484,16 +1725,33 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n",
                  backend_speculation.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
-    if (sconfig.concurrent_paged_prefix_cache) {
-        if (sconfig.concurrent_prefix_cache_max_bytes == 0) {
-            std::fprintf(stderr,
-                "[server] │  prefix_cache_ram= unlimited\n");
-        } else {
-            std::fprintf(stderr,
-                "[server] │  prefix_cache_ram= %zu MiB resident limit\n",
-                sconfig.concurrent_prefix_cache_max_bytes /
-                    (1024 * 1024));
-        }
+    const PrefixCacheBudget prefix_ram =
+        resolve_prefix_cache_budget(sconfig, *backend);
+    if (!prefix_ram.error.empty()) {
+        std::fprintf(stderr, "[server] %s\n", prefix_ram.error.c_str());
+        return 2;
+    }
+    if (sconfig.concurrent_paged_prefix_cache &&
+        sconfig.prefix_cache_max_bytes != ServerConfig::kPrefixCacheBudgetAuto) {
+        std::fprintf(stderr,
+            "[server] --prefix-cache-max-mib has no effect with concurrent "
+            "serving; use --concurrent-prefix-cache-max-mib\n");
+    }
+    // Store the resolved value: auto depends on the memory available now,
+    // and the budget printed here must be the one the server enforces.
+    if (!sconfig.concurrent_paged_prefix_cache) {
+        sconfig.prefix_cache_max_bytes = prefix_ram.bytes;
+    }
+    if (sconfig.prefix_cache_cap <= 0) {
+        std::fprintf(stderr, "[server] │  prefix_cache_ram= n/a (prefix cache off)\n");
+    } else if (prefix_ram.bytes == 0) {
+        std::fprintf(stderr, "[server] │  prefix_cache_ram= unlimited%s\n",
+                     prefix_ram.sized ? "" : " (backend cannot size snapshots)");
+    } else {
+        std::fprintf(stderr,
+            "[server] │  prefix_cache_ram= %zu MiB resident limit%s\n",
+            prefix_ram.bytes / (1024 * 1024),
+            prefix_ram.automatic ? " (auto)" : "");
     }
     std::fprintf(stderr, "[server] │  agent_turn_cache= %s\n",
                  sconfig.agent_turn_cache ? "ON" : "off");
@@ -1639,7 +1897,109 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     return 0;
 }
 
+// `luce_server --list-devices [model.gguf]`: one line per GPU in the order
+// backend:N refers to, then, for a model, its size and the auto choice. Lines
+// are "<kind> key=value ...", with the free-text field last.
+static int list_devices(const char * model_path) {
+    const std::vector<GpuDeviceInfo> devices = enumerate_gpu_devices(/*query_free=*/true);
+    const char * backend = placement_backend_name(compiled_placement_backend());
+    for (const GpuDeviceInfo & device : devices) {
+        std::printf("device %s:%d arch=%s type=%s total_mib=%llu free_mib=%llu name=%s\n",
+            backend, device.index, device.arch.empty() ? "unknown" : device.arch.c_str(),
+            device.integrated ? "integrated" : "discrete",
+            (unsigned long long) (device.total_bytes >> 20),
+            (unsigned long long) (device.free_bytes >> 20), device.name.c_str());
+    }
+    if (!model_path) return devices.empty() ? 1 : 0;
+
+    const uint64_t model_bytes = gguf_model_bytes(model_path);
+    if (model_bytes == 0) {
+        std::fprintf(stderr, "[server] cannot read model %s\n", model_path);
+        return 1;
+    }
+    const GgufModelInfo info = inspect_gguf_model_info(model_path);
+    // The KV cache at the default --max-ctx, as a plain launch would size it.
+    const uint64_t kv_bytes = gguf_kv_cache_bytes(model_path, DevicePlacement{}.max_ctx);
+    std::printf("model arch=%s size_mib=%llu kv_mib=%llu path=%s\n",
+        info.arch.empty() ? "unknown" : info.arch.c_str(),
+        (unsigned long long) (model_bytes >> 20), (unsigned long long) (kv_bytes >> 20),
+        model_path);
+    const AutoDeviceChoice choice = choose_auto_target_device(devices, model_bytes, kv_bytes);
+    if (choice.index < 0) {
+        std::printf("auto none reason=%s\n", choice.reason.c_str());
+        return 1;
+    }
+    std::printf("auto %s:%d fits=%s total_mib=%llu reason=%s\n", backend, choice.index,
+        choice.fits ? "yes" : "no",
+        (unsigned long long) (devices[(size_t) choice.index].total_bytes >> 20),
+        choice.reason.c_str());
+    return 0;
+}
+
+// Replace `--profile <name>` in a model block with the profile's flags, placed
+// right after the model path. Tokens the block already sets are left out, so
+// explicit flags win in any order. The profile's environment is installed by
+// load_model(), so a block that is never loaded changes nothing.
+static bool expand_launch_profile(std::vector<char *> & block,
+                                  std::vector<std::unique_ptr<std::string>> & storage,
+                                  bool load_balancing,
+                                  const luce::server::LaunchProfile *& profile) {
+    profile = nullptr;
+    std::vector<char *> kept;
+    for (size_t i = 0; i < block.size(); ++i) {
+        if (std::strcmp(block[i], "--profile") != 0) {
+            kept.push_back(block[i]);
+            continue;
+        }
+        if (profile || i + 1 >= block.size()) {
+            std::fprintf(stderr, "[server] --profile takes one profile name per model (%s)\n",
+                         luce::server::launch_profile_names().c_str());
+            return false;
+        }
+        profile = luce::server::find_launch_profile(block[++i]);
+        if (!profile) {
+            std::fprintf(stderr, "[server] unknown --profile '%s' (available: %s)\n",
+                         block[i], luce::server::launch_profile_names().c_str());
+            return false;
+        }
+    }
+    if (!profile) return true;
+    if (load_balancing && !profile->env.empty()) {
+        std::fprintf(stderr, "[server] --profile %s sets process-wide environment and "
+                             "cannot be scoped to a model\n", profile->name);
+        return false;
+    }
+
+    const std::vector<std::string> given(kept.begin() + 1, kept.end());
+    const std::vector<std::string> args = luce::server::launch_profile_args(*profile, given);
+    std::vector<char *> expanded(kept.begin(), kept.end());
+    // kept[0] is argv[0]; the model path follows unless the block has none.
+    const size_t insert_at = expanded.size() > 1 && expanded[1][0] != '-' ? 2 : 1;
+    std::vector<char *> inserted;
+    std::string shown;
+    for (const std::string & arg : args) {
+        storage.push_back(std::make_unique<std::string>(arg));
+        inserted.push_back(storage.back()->data());
+        shown += " " + arg;
+    }
+    expanded.insert(expanded.begin() + insert_at, inserted.begin(), inserted.end());
+    block = std::move(expanded);
+
+    std::fprintf(stderr, "[server] profile %s: %s\n", profile->name, profile->summary);
+    std::fprintf(stderr, "[server] profile %s: flags%s\n", profile->name,
+                 shown.empty() ? " (all set explicitly)" : shown.c_str());
+    return true;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 2 && std::strcmp(argv[1], "--list-devices") == 0) {
+        if (argc > 3) {
+            std::fprintf(stderr, "Usage: %s --list-devices [model.gguf]\n", argv[0]);
+            return 2;
+        }
+        return list_devices(argc == 3 ? argv[2] : nullptr);
+    }
+
     // Reuse the existing per-model CLI and loader. Argument strings belong to
     // main's argv and outlive every backend, including factories borrowing paths.
     std::vector<std::vector<char *>> model_args(1, {argv[0]});
@@ -1674,6 +2034,15 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] --load-balancing requires at least two model blocks\n");
         return 2;
     }
+    // Profile tokens are referenced by model_args for the process lifetime.
+    static std::vector<std::unique_ptr<std::string>> profile_storage;
+    std::vector<const luce::server::LaunchProfile *> profiles(model_args.size());
+    for (size_t m = 0; m < model_args.size(); ++m) {
+        if (!expand_launch_profile(model_args[m], profile_storage, load_balancing,
+                                   profiles[m])) {
+            return 2;
+        }
+    }
     std::vector<ModelOptions> options(model_args.size());
     std::set<std::string> names;
     for (size_t m = 0; m < model_args.size(); ++m) {
@@ -1686,6 +2055,7 @@ int main(int argc, char ** argv) {
                 options[m].sconfig.model_name.c_str());
             return ret;
         }
+        options[m].profile = profiles[m];
         const auto & name = options[m].sconfig.model_name;
         if (load_balancing && (name.empty() || name == "auto" || !names.insert(name).second)) {
             std::fprintf(stderr, "[server] model block %zu: --model-name must be unique, nonempty and different from auto (got '%s')\n", m + 1, name.c_str());
@@ -1714,6 +2084,26 @@ int main(int argc, char ** argv) {
     // Disabled balancing loads only the selected primary, regardless of how
     // many placements were configured. No unused GPU worker is started.
     if (!load_balancing) options.resize(1);
+    // Several GPU models in one process capture HIP/CUDA graphs from different
+    // worker threads. Under relaxed capture, a blocking call from one worker
+    // (prefix-cache checkpoint copies, host reads) invalidates the capture in
+    // flight on the other, so replicas fail intermittently. Eager launches cost
+    // ~4% on one R9700 and nothing measurable on the balanced aggregate.
+    // LUCE_MULTI_MODEL_GRAPHS=1 keeps graphs on (ggml reads any value of
+    // GGML_CUDA_DISABLE_GRAPHS as disabled, so it cannot be the opt-out).
+    if (options.size() > 1) {
+        const char * keep = std::getenv("LUCE_MULTI_MODEL_GRAPHS");
+        const bool keep_graphs = keep && std::strcmp(keep, "1") == 0;
+        if (!keep_graphs && set_environment_variable("GGML_CUDA_DISABLE_GRAPHS", "1", false) != 0) {
+            std::fprintf(stderr, "[server] failed to set GGML_CUDA_DISABLE_GRAPHS for multi-model serving\n");
+            return 2;
+        }
+        const bool disabled = std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+        std::fprintf(stderr, "[server] %zu models in one process: GPU graph capture %s\n", options.size(),
+            !disabled ? "kept on (LUCE_MULTI_MODEL_GRAPHS=1)"
+                      : keep_graphs ? "disabled (GGML_CUDA_DISABLE_GRAPHS is set, overriding LUCE_MULTI_MODEL_GRAPHS=1)"
+                                    : "disabled");
+    }
     for (auto & option : options) {
         option.sconfig.host = listener_config.host;
         option.sconfig.port = listener_config.port;
@@ -1722,7 +2112,8 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] load balancing %s; primary=%s target=%s\n",
         load_balancing ? "enabled" : "disabled", options.front().sconfig.model_name.c_str(),
-        placement_device_name(options.front().bargs.device).c_str());
+        options.front().target_device_auto
+            ? "auto" : placement_device_name(options.front().bargs.device).c_str());
 
     if (load_balancing) {
         const auto & listener = options.front().sconfig;

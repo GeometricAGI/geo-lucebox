@@ -297,6 +297,32 @@ bool deepseek4_snapshot_declare(ggml_context * ctx,
     return true;
 }
 
+bool deepseek4_snapshot_declare_at(ggml_context * ctx,
+                                   const DeepSeek4Cache & cache,
+                                   int tokens,
+                                   const std::vector<uint32_t> & compress_ratios,
+                                   int layer_begin, int layer_end,
+                                   const char * name_prefix,
+                                   const DeepSeek4SnapshotAux * aux,
+                                   DeepSeek4Snapshot & out) {
+    if (tokens < 0) return false;
+    // Shallow copy: it shares the live tensors and only changes the logical
+    // row counts that deepseek4_snapshot_declare() sizes the prefix by.
+    DeepSeek4Cache at = cache;
+    at.cur_pos = std::min(tokens, cache.max_ctx);
+    const int end = std::min(layer_end, (int) at.layers.size());
+    for (int il = std::max(0, layer_begin); il < end; ++il) {
+        auto & layer = at.layers[(size_t) il];
+        const int64_t ratio = (size_t) il < compress_ratios.size()
+            ? compress_ratios[(size_t) il] : 0;
+        layer.n_comp = layer.comp_kv && ratio > 0
+            ? (int) std::min<int64_t>(at.cur_pos / ratio, layer.comp_kv->ne[1]) : 0;
+        layer.n_index_comp = layer.index_comp_kv && ratio == 4
+            ? (int) std::min<int64_t>(at.cur_pos / 4, layer.index_comp_kv->ne[1]) : 0;
+    }
+    return deepseek4_snapshot_declare(ctx, at, name_prefix, aux, out);
+}
+
 bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
                              const DeepSeek4SnapshotAux * aux,
                              DeepSeek4Snapshot & out) {

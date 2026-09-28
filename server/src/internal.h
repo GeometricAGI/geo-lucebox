@@ -648,6 +648,14 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
 
+// Bytes snapshot_target_cache() allocates in `buft` for a dense snapshot of
+// the first `token_count` positions (clamped to the cache capacity); 0 for
+// multi-slot caches.
+size_t estimate_target_cache_snapshot_bytes(const TargetWeights & w,
+                                            const TargetCache & cache,
+                                            int token_count,
+                                            ggml_backend_buffer_type_t buft);
+
 // Exact CPU-buffer allocation size for the dense checkpoint layout used by
 // snapshot_paged_target_cache(). Returns zero when the cache topology or token
 // count is invalid. This lets the scheduler enforce a resident-memory budget

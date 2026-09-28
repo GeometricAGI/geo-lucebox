@@ -136,10 +136,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
     auto finish_job = [this](ServerJob * job) {
         stop_job_stream(job);
-        std::lock_guard<std::mutex> lk(job->mu);
-        job->done = true;
-        job->cv.notify_one();
+        {
+            std::lock_guard<std::mutex> lk(job->mu);
+            job->done = true;
+            job->cv.notify_one();
+        }
+        publish_memory_report();
     };
+    publish_memory_report();
 
     // A stalled reader may buffer at most this much before being dropped.
     constexpr size_t kMaxSlotSendBuffer = 1u << 20;
@@ -451,7 +455,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         PrefixCaptureTxn prepared_capture;
         PrefixCache::InlineReservation capture_reservation;
         int restore_policy_slot = -1;
-        const bool prefix_supported =
+        // Tokens alone do not identify an image: image requests never touch
+        // the prefix cache.
+        const bool prefix_supported = !req.images &&
             engine.supports_prefix_store() && !prefix_cache_.disabled();
         if (prefix_supported) {
             const auto hit = prefix_cache_.lookup_candidate(
@@ -477,7 +483,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 restore_policy_slot,
                 [&engine](int target_cut) {
                     return engine.estimate_prefix_store_bytes(target_cut);
-                });
+                },
+                req.ends_with_tool_result);
             if (capture_reservation.active()) {
                 const uint64_t capture_id = next_prefix_capture_id++;
                 if (next_prefix_capture_id == 0)
@@ -502,7 +509,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
         const PrefixStorePlan requested_plan = prefix_plan;
-        auto ar = prefix_supported
+        auto ar = req.images
+            ? engine.admit_images(
+                  next_request_id, req.prompt_tokens, req.sampler, req.images)
+            : prefix_supported
             ? engine.admit_with_prefix(
                   next_request_id, req.prompt_tokens, req.sampler,
                   requested_plan)
@@ -908,10 +918,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 // No checkpoint fit the RAM cap: park the newest decoder for
                 // recompute. With recovery disabled, fail only that request
                 // before compute, then retry the remaining cohort.
-                int victim = -1;
+                // Prefer the newest decoder whose KV its token history can
+                // rebuild; if none can be, the newest decoder is failed below.
+                int victim = -1, fallback = -1;
                 for (int candidate : residents) {
-                    if (!slots[(size_t)candidate].prefilling) { victim = candidate; break; }
+                    if (slots[(size_t)candidate].prefilling) continue;
+                    if (fallback < 0) fallback = candidate;
+                    if (engine.kv_recomputable(candidate)) { victim = candidate; break; }
                 }
+                if (victim < 0) victim = fallback;
                 if (victim < 0) break; // engines reserve prefills at admission
                 auto & s = slots[(size_t)victim];
                 if (offload_budget && engine.evict_kv(victim, s.pending_tok, error)) {

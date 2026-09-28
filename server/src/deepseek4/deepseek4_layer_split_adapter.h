@@ -65,6 +65,7 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int snapshot_cur_pos(int slot) const override;
+    size_t snapshot_bytes_estimate(int tokens) const override;
     bool snapshot_restore(int slot) override;
     // Ondisk prefix cache: per-shard snapshots are merged into one named CPU
     // context (ls<shard>_ prefix + adapter-level meta/hc/logits tensors).
@@ -85,6 +86,15 @@ private:
     bool init_mixed_target_split_full(const DevicePlacement & device);
     bool run_mixed_forward(const std::vector<int32_t> & tokens, int base_pos,
                            int & last_tok, std::vector<float> * logits_out);
+    // Declares every tensor snapshot_save() allocates in one merged context.
+    // tokens < 0 uses the shards' live state; otherwise the state they will
+    // have at `tokens` positions, so a snapshot can be sized before saving.
+    bool declare_split_snapshot(ggml_context * ctx, int tokens,
+                                size_t logits_len,
+                                std::vector<DeepSeek4Snapshot> & shard_snaps,
+                                ggml_tensor *& meta, ggml_tensor *& hc,
+                                ggml_tensor *& logits) const;
+    size_t split_snapshot_ctx_bytes() const;
     bool use_mixed_target_split() const {
         return remote_target_shard_.active() && !shards_.empty();
     }

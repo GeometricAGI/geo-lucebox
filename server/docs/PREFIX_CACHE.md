@@ -202,6 +202,7 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 | Server flag | Default | Description |
 |-------------|---------|-------------|
 | `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
+| `--prefix-cache-max-mib auto\|N` | auto | Resident RAM limit for single-sequence prefix snapshots; `auto` keeps room for three snapshots at `--max-ctx`, capped at a quarter of the memory available at startup (a readable cgroup v2 container limit is included; otherwise total physical RAM is used); `0` is unlimited. Enforced for Qwen and DeepSeek4 (not DeepSeek4 mixed-backend splits): other backends cannot size snapshots, so `auto` stays unlimited there and an explicit limit is rejected at startup |
 | `--concurrent-prefix-cache-max-mib N` | 4096 | Resident RAM limit for copied concurrent paged checkpoints; `0` is unlimited |
 | `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
 | `--skip-park` | false | Skip parking draft model during compress |
@@ -209,8 +210,33 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 ### Choosing `--prefix-cache-slots`
 
 With right-sized, CPU-resident snapshots the limiting resource is **system RAM**,
-not VRAM. Each slot costs approximately `cur_pos × 5 KB` (for Qwen3.5-27B Q8_0 KV),
-so 32 slots with an average prefix of 2000 tokens use about 320 MB of system RAM.
+not VRAM. A snapshot of a hybrid model also copies the full recurrent state, so
+the fixed part dominates short prefixes. For Qwen3.5/3.6-27B with q8_0 KV and a
+DFlash draft, one snapshot is about 34 KiB per token plus about 350 MiB fixed:
+0.7 GiB at 10K tokens, 1.0 GiB at 20K and 3.5 GiB at 94K.
+
+Qwen saves a snapshot only at a prefill chunk start (512 tokens by default,
+`LUCE_PREFILL_UBATCH`) past the position it restored from, so the cache only
+targets cuts the backend can reach. A system/tools head shorter than one chunk
+is not pinned; the cache moves on to the next reachable conversation boundary
+instead of retrying a cut that can never be saved.
+
+Coding agents grow one conversation turn by turn, and each turn's snapshot is a
+strict prefix of the next. After committing a snapshot, the single-sequence
+path frees the ancestors it supersedes, keeping only the shallowest one (the
+shared system/tools head) and protected tool pins. A conversation therefore
+holds about two snapshots instead of one per turn. Chains that are abandoned,
+for example after a client compacts its context, are bounded by
+`--prefix-cache-max-mib`: when a new snapshot would not fit, the cache replaces
+the oldest leaf first and skips the capture if nothing can make room. Snapshots
+the new one supersedes (including the one it restored from) count as freed,
+because they are pruned as soon as it is committed; a failed capture keeps them.
+After each commit the cache also evicts, oldest leaf first, until the committed
+snapshots fit the limit again (never evicting the new snapshot or a protected
+tools pin), so a capture that lands shorter than it reserved does not leave the
+cache over budget. The limit covers committed snapshots: the
+new snapshot is allocated before the ones it replaces are freed, so while a
+request runs, process memory can exceed the limit by up to one snapshot.
 
 Concurrent paged serving measures the exact backend allocation required for
 each checkpoint before copying it. The cache keeps committed checkpoints under
