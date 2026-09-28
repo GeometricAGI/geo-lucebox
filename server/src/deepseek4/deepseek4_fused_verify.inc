@@ -1674,6 +1674,44 @@ static bool ds4_build_fused_verify_graph(
     return true;
 }
 
+// Each built slot keeps its scheduler's device buffers, and at a long
+// context those hold an attention's compressed rows as F32 (about 0.5 GiB a
+// slot at 128K, so eight slots took 4.4 GiB of the R9700). Before a miss
+// builds another slot, retire least-recently-used slots while the device
+// has less free than the largest slot plus half its load-time headroom
+// (DeepSeek4Backend's fit check): the cache shrinks with the context
+// instead of running the device out of memory.
+static void ds4_fused_cache_make_room(Ds4FusedVerifyCache & vc, size_t slot_limit,
+                                      ggml_backend_t backend) {
+    size_t largest = 0;
+    for (size_t i = 0; i < slot_limit; ++i) {
+        if (vc.slots[i].built() && vc.slots[i].sched) {
+            largest = std::max(largest, ggml_backend_sched_get_buffer_size(vc.slots[i].sched, backend));
+        }
+    }
+    ggml_backend_dev_t dev = largest ? ggml_backend_get_device(backend) : nullptr;
+    if (!dev) return;
+    ggml_backend_dev_props props{};
+    ggml_backend_dev_get_props(dev, &props);
+    const size_t keep = props.type == GGML_BACKEND_DEVICE_TYPE_IGPU
+        ? ((size_t) 4 << 30) / 2 : ((size_t) 3 << 29) / 2;
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_dev_memory(dev, &free_b, &total_b);
+    while (free_b < largest + keep) {
+        size_t lru = slot_limit;
+        for (size_t i = 0; i < slot_limit; ++i) {
+            if (vc.slots[i].built() &&
+                (lru == slot_limit || vc.slots[i].last_use < vc.slots[lru].last_use)) {
+                lru = i;
+            }
+        }
+        if (lru == slot_limit) break;
+        vc.slots[lru].destroy(vc.backend, vc.peer_backend);
+        vc.extra[lru].reset();
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+    }
+}
+
 static int ds4_try_fused_verify_step(
         Ds4FusedVerifyCache & vc,
         bool capture_cache,
@@ -1781,6 +1819,7 @@ static int ds4_try_fused_verify_step(
         }
     }
     if (!fg) {
+        ds4_fused_cache_make_room(vc, slot_limit, backend);
         size_t pick = 0;
         for (size_t i = 0; i < slot_limit; ++i) {
             if (!vc.slots[i].built()) { pick = i; break; }
