@@ -1042,9 +1042,9 @@ static void print_target_device_hint(const std::string & model_path,
 static bool apply_expert_device(const DevicePlacement & expert,
                                 const BackendPlan & plan) {
     const DevicePlacement & target = plan.placement().target;
-    if (plan.arch() != "deepseek4") {
+    if (!luce::common::arch_is_deepseek4_family(plan.arch())) {
         std::fprintf(stderr,
-            "[server] --expert-device is only valid for deepseek4 models (detected '%s')\n",
+            "[server] --expert-device is only valid for DeepSeek V4 / V4.1 models (detected '%s')\n",
             plan.arch().c_str());
         return false;
     }

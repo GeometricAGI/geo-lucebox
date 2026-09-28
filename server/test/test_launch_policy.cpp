@@ -183,6 +183,25 @@ struct LaunchPolicyFixture : CommonFixture {
         }
         CHECK(profile->env.size() == 37);
     }
+
+    void test_ds41_profile_is_the_lucebox_recipe() {
+        // The DS41.md recommended launch: three expert owners through flags,
+        // the shipped Lucebox files, no environment spelling of the owners.
+        const LaunchProfile * profile = find_launch_profile("ds41-lucebox");
+        CHECK(profile != nullptr);
+        const std::vector<std::string> args = launch_profile_args(*profile, {});
+        CHECK(contains_flag(args, "--expert-device"));
+        CHECK(contains_flag(args, "--ds4-expert-placement"));
+        CHECK(contains_flag(args, "--ds4-router-bias"));
+        CHECK(contains_flag(args, "--ds4-protected-experts"));
+        for (const LaunchProfileEnv & entry : profile->env) {
+            const std::string name = entry.name;
+            CHECK(name != "LUCE_DS4_MOE_TP");
+            CHECK(name != "LUCE_DS4_MOE_TP_INPROC");
+            CHECK(name != "LUCE_DS4_SPEC");
+            CHECK(name != "LUCE_DS4_DRAFT");
+        }
+    }
 };
 
 }  // namespace
@@ -198,4 +217,5 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_profiles_are_well_formed();
     test_profile_flags_yield_to_explicit_flags();
     test_profile_replaces_documented_recipe();
+    test_ds41_profile_is_the_lucebox_recipe();
 }
