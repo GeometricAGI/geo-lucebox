@@ -1,3 +1,4 @@
+#include <atomic>
 #include "ds4-indexer.cuh"
 #include "ds4-env.cuh"
 
@@ -1212,9 +1213,8 @@ void ggml_cuda_op_ds4_indexer_score(
 #if defined(GGML_USE_HIP) && !DS4_INDEXER_WMMA_AVAILABLE
         // Built without rocWMMA 2.x headers: every score takes the scalar
         // kernel, several times slower on long prompts. Say so once.
-        static bool warned = false;
-        if (!warned && warp_size == 32) {
-            warned = true;
+        static std::atomic<bool> warned{false};
+        if (warp_size == 32 && !warned.exchange(true)) {
             GGML_LOG_WARN("%s: built without rocWMMA 2.x headers, the DS4 indexer scores on the "
                           "scalar kernel (install rocwmma-dev and rebuild)\n", __func__);
         }

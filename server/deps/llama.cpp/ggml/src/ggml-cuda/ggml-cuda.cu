@@ -321,28 +321,46 @@ static size_t ggml_cuda_lockable_host_bytes() {
 // them for cold and swaps them out, and every swap-in evicts all GPU queues of
 // the process until the pages are back.
 static bool ggml_cuda_host_spill_malloc(void ** ptr, size_t size, int device) {
+    // The budget is reserved up front and refunded on failure, so concurrent
+    // allocations cannot overdraw it.
+    size_t carve_reserve = 0;
     {
         std::lock_guard<std::mutex> lock(g_host_spill_mutex);
         ggml_cuda_host_spill_state & st = g_host_spill[device];
         if (st.carve_reserve == 0 || st.host_left < size) return false;
+        carve_reserve = st.carve_reserve;
+        st.host_left -= size;
     }
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= size + g_host_spill[device].carve_reserve) {
+    const auto refund = [&]() {
+        std::lock_guard<std::mutex> lock(g_host_spill_mutex);
+        g_host_spill[device].host_left += size;
         return false;
+    };
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= size + carve_reserve) {
+        return refund();
     }
     if (hipHostMalloc(ptr, size, hipHostMallocNonCoherent) != hipSuccess) {
         (void) hipGetLastError();
-        return false;
+        return refund();
+    }
+    // Kernels get this pointer as a device address: take the spill only
+    // where the host mapping has the same address on the device.
+    void * dev_ptr = nullptr;
+    if (hipHostGetDevicePointer(&dev_ptr, *ptr, 0) != hipSuccess || dev_ptr != *ptr) {
+        (void) hipGetLastError();
+        (void) hipHostFree(*ptr);
+        *ptr = nullptr;
+        return refund();
     }
     if (mlock(*ptr, size) != 0) {
         GGML_LOG_WARN("ggml_cuda: cannot lock %.1f MiB of host memory for device %d (%s)\n",
                       size / 1048576.0, device, strerror(errno));
         (void) hipHostFree(*ptr);
         *ptr = nullptr;
-        return false;
+        return refund();
     }
     std::lock_guard<std::mutex> lock(g_host_spill_mutex);
-    g_host_spill[device].host_left -= size;
     g_host_spill[device].host_used += size;
     g_host_spill_ptrs[*ptr] = {device, size};
     return true;
@@ -401,8 +419,10 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
 #endif // defined(GGML_USE_HIP)
     } else {
 #if defined(GGML_USE_HIP) && defined(__linux__)
-        if (ggml_cuda_host_spill_malloc(ptr, size, device)) {
-            if (out_managed) *out_managed = true;  // CPU-addressable
+        // Only buffers spill: their context frees a spilled pointer with
+        // cudaFreeHost, the pools (no out_managed) would cudaFree it.
+        if (out_managed && ggml_cuda_host_spill_malloc(ptr, size, device)) {
+            *out_managed = true;  // CPU-addressable
             return cudaSuccess;
         }
 #endif // defined(GGML_USE_HIP) && defined(__linux__)
