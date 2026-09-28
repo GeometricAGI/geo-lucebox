@@ -1951,7 +1951,8 @@ ggml_tensor * deepseek4_build_indexer_topk(
         int ratio,
         ggml_tensor * rope_pos,
         ggml_tensor * visibility_mask,
-        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
+        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
+        DeepSeek4IndexCandidates * candidates) {
     if (!qr_norm || !cur || !L.indexer_attn_q_b || !L.indexer_proj ||
         !index_comp_source || !rope_pos || n_tokens <= 0 ||
         n_comp <= w.n_indexer_top_k) {
@@ -2038,8 +2039,26 @@ ggml_tensor * deepseek4_build_indexer_topk(
     ggml_tensor * scores = ggml_ds4_indexer_score_masked(
         ctx, index_q, head_weights, comp, visibility_mask,
         kv_start + first_scored, ratio);
+    // Candidate blocks (model.py Indexer.forward): only once a query can see
+    // more rows than the candidate blocks hold does the restriction change
+    // anything, and the source and its readers see the same rows.
+    ggml_tensor * ranked = nullptr;
+    if (candidates && n_comp > w.candidate_topk_blocks * w.candidate_block_size) {
+        // A query that sees that many rows is far past the identity prefix.
+        GGML_ASSERT(first_scored == 0);
+        if (candidates->source) {
+            candidates->blocks = deepseek4_candidate_blocks(
+                ctx, scores, rope_pos, ratio, w.candidate_topk_blocks, w.candidate_block_size);
+        } else if (candidates->blocks) {
+            GGML_ASSERT(candidates->blocks->ne[0] == w.candidate_topk_blocks &&
+                        candidates->blocks->ne[1] == n_tokens);
+            // The mask op writes a new tensor: it stands in for the copy below.
+            ranked = deepseek4_restrict_to_candidate_blocks(
+                ctx, scores, ggml_cont(ctx, candidates->blocks), w.candidate_block_size);
+        }
+    }
     ggml_tensor * selected = ggml_top_k(
-        ctx, ggml_cont(ctx, scores), top_k);
+        ctx, ranked ? ranked : ggml_cont(ctx, scores), top_k);
     if (first_scored == 0) return selected;
 
     ggml_tensor * identity = ggml_new_tensor_2d(
@@ -2053,6 +2072,53 @@ ggml_tensor * deepseek4_build_indexer_topk(
     }
     i32_array_inputs.push_back({identity, std::move(identity_values)});
     return ggml_concat(ctx, identity, selected, 1);
+}
+
+ggml_tensor * deepseek4_candidate_blocks(
+        ggml_context * ctx, ggml_tensor * scores, ggml_tensor * positions,
+        int ratio, int topk_blocks, int block_size) {
+    GGML_ASSERT(scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores));
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && positions->ne[0] == scores->ne[1]);
+    // Powers of two keep the frontier arithmetic below exact in F32.
+    GGML_ASSERT(ratio > 0 && (ratio & (ratio - 1)) == 0);
+    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
+    const int64_t n_tokens = scores->ne[1];
+    const int64_t n_full = scores->ne[0] / block_size;
+    GGML_ASSERT(n_full + 1 > topk_blocks);
+    // A full block scores as its best row; one the query cannot reach yet
+    // scores -1e30 like its rows. The partial block at the end (if any) is
+    // reachable only by the queries whose newest row it holds, and those pin
+    // it below, so its column starts at -1e30.
+    ggml_tensor * blocks = ggml_pool_2d(ctx, scores, GGML_OP_POOL_MAX,
+                                        block_size, 1, block_size, 1, 0.0f, 0.0f);
+    ggml_tensor * pos = ggml_cast(ctx, positions, GGML_TYPE_F32);
+    ggml_tensor * partial = ggml_scale_bias(ctx, pos, 0.0f, -1.0e30f);
+    blocks = ggml_concat(ctx, blocks, ggml_reshape_2d(ctx, partial, 1, n_tokens), 0);
+    // The block of the query's newest row, ((pos + 1) / ratio - 1) / block_size,
+    // is pinned in: it is only partly filled and could lose to an older block.
+    ggml_tensor * visible = ggml_floor(ctx, ggml_scale_bias(ctx, pos, 1.0f / ratio, 1.0f / ratio));
+    ggml_tensor * newest = ggml_floor(ctx, ggml_scale_bias(
+        ctx, visible, 1.0f / block_size, -1.0f / block_size));
+    ggml_tensor * pin = ggml_scale_bias(ctx, pos, 0.0f, 1.0e30f);
+    blocks = ggml_set_rows(ctx, ggml_reshape_3d(ctx, blocks, 1, n_full + 1, n_tokens),
+                           ggml_reshape_3d(ctx, pin, 1, 1, n_tokens),
+                           ggml_reshape_2d(ctx, ggml_cast(ctx, newest, GGML_TYPE_I32), 1, n_tokens));
+    return ggml_top_k(ctx, ggml_reshape_2d(ctx, blocks, n_full + 1, n_tokens), topk_blocks);
+}
+
+ggml_tensor * deepseek4_restrict_to_candidate_blocks(
+        ggml_context * ctx, ggml_tensor * scores, ggml_tensor * candidates, int block_size) {
+    GGML_ASSERT(candidates->type == GGML_TYPE_I32 && ggml_is_contiguous(candidates));
+    GGML_ASSERT(candidates->ne[1] == scores->ne[1]);
+    const int64_t n_blocks = candidates->ne[0], n_tokens = candidates->ne[1];
+    // Rows block * block_size + j of every candidate block (exact in F32);
+    // the mask keeps the scores there, rows past n_comp are ignored.
+    ggml_tensor * first = ggml_scale(ctx, ggml_cast(ctx, candidates, GGML_TYPE_F32), (float) block_size);
+    first = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, first, 1, n_blocks, n_tokens),
+                           block_size, n_blocks, n_tokens, 1);
+    ggml_tensor * rows = ggml_add(ctx, first, ggml_arange(ctx, 0.0f, (float) block_size, 1.0f));
+    rows = ggml_cast(ctx, ggml_reshape_2d(ctx, rows, block_size * n_blocks, n_tokens), GGML_TYPE_I32);
+    return ggml_ds4_indexer_mask(ctx, scores, rows, 0);
 }
 
 // ─── MLA Attention Block ────────────────────────────────────────────────
@@ -2634,12 +2700,20 @@ static ggml_tensor * build_mla_attention_lane_core(
         ? deepseek4_is_index_source(w, layer_idx)
         : attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
           ratio == 4 && f32_array_inputs;
-    if (shared_selection && !selects_topk && lane.index_selection) {
+    // After the candidate source the carrier holds its candidate blocks
+    // below the selection: [top_k + candidate_topk_blocks, n_tokens], in the
+    // graph (fused, paged) or in Ds4IndexSelectionStore (host paths).
+    const int n_candidate_rows = w.candidate_source_layer >= 0 ? w.candidate_topk_blocks : 0;
+    ggml_tensor * const carrier_in = lane.index_selection ? *lane.index_selection : nullptr;
+    if (shared_selection && !selects_topk && carrier_in) {
         // A selection exists only while a query sees more than top_k rows,
         // the same condition under which the index source built it.
-        ggml_tensor * selection = *lane.index_selection;
-        if (selection && n_comp_live > w.n_indexer_top_k && selection->ne[1] == n_tokens) {
-            indexer_topk = selection;
+        if (n_comp_live > w.n_indexer_top_k && carrier_in->ne[1] == n_tokens) {
+            GGML_ASSERT(carrier_in->ne[0] == w.n_indexer_top_k ||
+                        carrier_in->ne[0] == w.n_indexer_top_k + n_candidate_rows);
+            indexer_topk = carrier_in->ne[0] == w.n_indexer_top_k ? carrier_in
+                : ggml_cont(ctx, ggml_view_2d(ctx, carrier_in, w.n_indexer_top_k, n_tokens,
+                                              carrier_in->nb[1], 0));
         }
     }
     if (selects_topk) {
@@ -2681,12 +2755,26 @@ static ggml_tensor * build_mla_attention_lane_core(
         if (index_comp_history_source && index_comp_history_source->type != GGML_TYPE_F16) {
             index_comp_history_source = ggml_cast(ctx, index_comp_history_source, GGML_TYPE_F16);
         }
+        const bool uses_candidates = shared_selection && n_candidate_rows > 0 &&
+            layer_idx >= w.candidate_source_layer;
+        DeepSeek4IndexCandidates candidates;
+        candidates.source = uses_candidates && layer_idx == w.candidate_source_layer;
+        if (uses_candidates && !candidates.source && carrier_in &&
+            carrier_in->ne[0] == w.n_indexer_top_k + n_candidate_rows) {
+            candidates.blocks = ggml_view_2d(
+                ctx, carrier_in, n_candidate_rows, carrier_in->ne[1], carrier_in->nb[1],
+                (size_t) w.n_indexer_top_k * sizeof(int32_t));
+        }
         indexer_topk = deepseek4_build_indexer_topk(
             ctx, qr, cur, w, L, index_comp_history_source,
             n_index_comp, kv_start, n_tokens, ratio, rope_pos,
             index_visibility_mask,
-            i32_array_inputs);
-        if (shared_selection && lane.index_selection) *lane.index_selection = indexer_topk;
+            i32_array_inputs, uses_candidates ? &candidates : nullptr);
+        if (shared_selection && lane.index_selection) {
+            *lane.index_selection = indexer_topk && candidates.blocks
+                ? ggml_concat(ctx, indexer_topk, ggml_cont(ctx, candidates.blocks), 0)
+                : indexer_topk;
+        }
     }
     // Maskless indexed prefill admission. This repeats the kernel's
     // ratio4_causal support check in fattn.cu exactly (indexed-row capacity,
@@ -3460,7 +3548,9 @@ static ggml_tensor * build_mla_attention(
 // per-layer attention graphs of the host paths (w.shared_index_topk): the
 // source's graph copies its selection into this device tensor, one column per
 // token of the step, and the next layers' graphs read it back. Sized once for
-// the widest step, so cached graphs never see it move.
+// the widest step, so cached graphs never see it move. When the store can
+// hold more tokens than the candidate blocks cover, each column also carries
+// the candidate source's blocks below the selection (rows top_k..).
 struct Ds4IndexSelectionStore {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -3480,7 +3570,10 @@ struct Ds4IndexSelectionStore {
         params.no_alloc = true;
         ctx = ggml_init(params);
         if (!ctx) return false;
-        rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w.n_indexer_top_k, columns);
+        const bool candidates = w.candidate_source_layer >= 0 &&
+            columns > w.candidate_topk_blocks * w.candidate_block_size;
+        rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,
+                                  w.n_indexer_top_k + (candidates ? w.candidate_topk_blocks : 0), columns);
         buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         if (!buf) { free(); return false; }
         return true;
@@ -3506,8 +3599,10 @@ static void ds4_publish_index_selection(ggml_context * ctx, ggml_cgraph * gf,
         !selection || selection == store_view) {
         return;
     }
-    GGML_ASSERT(ggml_are_same_shape(selection, store_view));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, selection, store_view));
+    GGML_ASSERT(selection->ne[0] <= store_view->ne[0] && selection->ne[1] == store_view->ne[1]);
+    ggml_tensor * dst = selection->ne[0] == store_view->ne[0] ? store_view
+        : ggml_view_2d(ctx, store_view, selection->ne[0], selection->ne[1], store_view->nb[1], 0);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, selection, dst));
 }
 
 struct DeepSeek4CachedDecodeHcPreGraph {
@@ -3578,6 +3673,9 @@ struct DeepSeek4PrefillHcPreGraph {
     bool ffn = false;
     StepGraph sg;
     ggml_tensor * split = nullptr;
+    // Staggered pre-mix (V4.1): the previous sub-block's pre coefficients
+    // [n_hc, n_tokens] that collapse this sub-block's input.
+    ggml_tensor * prev_pre = nullptr;
 
     bool valid() const {
         return owner_ctx && backend && n_tokens > 0 && layer_idx >= 0 &&
@@ -3594,6 +3692,7 @@ struct DeepSeek4PrefillHcPreGraph {
         layer_idx = -1;
         ffn = false;
         split = nullptr;
+        prev_pre = nullptr;
     }
 
     void free() {
@@ -3605,6 +3704,7 @@ struct DeepSeek4PrefillHcPreGraph {
         layer_idx = -1;
         ffn = false;
         split = nullptr;
+        prev_pre = nullptr;
     }
 };
 
@@ -6793,7 +6893,8 @@ static bool build_prefill_hc_pre_graph(
         const float * scale_data,
         int layer_idx,
         bool ffn,
-        int n_tokens) {
+        int n_tokens,
+        bool staggered_pre = false) {
     if (!backend || !fn_f16 || !base || !scale_data || n_tokens <= 0) {
         return false;
     }
@@ -6831,8 +6932,17 @@ static bool build_prefill_hc_pre_graph(
     // The HC op packs working+split in one row.  Materialize both views on
     // device so subsequent graph-to-graph copies have identical contiguous
     // layouts; ggml_backend_tensor_copy deliberately rejects strided copies.
-    out.sg.hidden_states = ggml_cont(out.sg.ctx, ggml_view_2d(
-        out.sg.ctx, pre, w.n_embd, n_tokens, pre->nb[1], 0));
+    // With the staggered pre-mix the input collapses with the previous
+    // sub-block's coefficients instead (see ds4_hc_collapse).
+    if (staggered_pre) {
+        out.prev_pre = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_hc, n_tokens);
+        ggml_set_input(out.prev_pre);
+        out.sg.hidden_states = ggml_cont(out.sg.ctx, ds4_build_hc_collapse(
+            out.sg.ctx, out.sg.inp_embed, out.prev_pre, w.n_embd, w.n_hc));
+    } else {
+        out.sg.hidden_states = ggml_cont(out.sg.ctx, ggml_view_2d(
+            out.sg.ctx, pre, w.n_embd, n_tokens, pre->nb[1], 0));
+    }
     out.split = ggml_cont(out.sg.ctx, ggml_view_2d(
         out.sg.ctx, pre, mix_dim, n_tokens, pre->nb[1],
         (size_t)w.n_embd * sizeof(float)));
@@ -9026,6 +9136,7 @@ bool deepseek4_paged_gathered_step(
         }
     }
     if (!fg) {
+        ds4_fused_cache_make_room(vc, slot_limit, backend);
         size_t pick = 0;
         for (size_t i = 0; i < slot_limit; ++i) {
             if (!vc.slots[i].built()) { pick = i; break; }
@@ -9821,8 +9932,8 @@ bool deepseek4_step_layer_range(
             break;
         }
     }
-    // The staggered pre-mix (see ds4_hc_collapse) runs on the host HC path
-    // only, and carries the previous sub-block's coefficients from layer 0.
+    // The staggered pre-mix (see ds4_hc_collapse) carries the previous
+    // sub-block's coefficients from layer 0 (host-side: [n_hc] per token).
     const bool staggered_pre = w.hc_staggered_pre;
     std::vector<float> * carried_pre = layer_major_band ? layer_major_band->staggered_pre : nullptr;
     if (staggered_pre &&
@@ -9846,9 +9957,30 @@ bool deepseek4_step_layer_range(
     const bool use_backend_decode_hc_direct = use_backend_decode_hc && ds4_backend_is_hip(backend);
     const bool use_backend_decode_hc_graph =
         use_backend_decode_hc && !use_backend_decode_hc_direct;
+    // Batched prefill mixes the hyper-connections on the device: by default
+    // with the staggered pre-mix (V4.1), opt-in for V4.
+    // LUCE_DS4_HYBRID_PREFILL_GPU_HC=0|1 overrides.
+    const char * prefill_gpu_hc_env = std::getenv("LUCE_DS4_HYBRID_PREFILL_GPU_HC");
     const bool use_backend_prefill_hc =
-        heterogeneous_batched_prefill && !staggered_pre &&
-        ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_GPU_HC");
+        heterogeneous_batched_prefill &&
+        (prefill_gpu_hc_env ? ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_GPU_HC") : staggered_pre);
+    // The device pre graph takes the previous coefficients and hands its own
+    // back ([pre | post | comb] split rows) for the next sub-block.
+    const auto set_prev_hc_pre = [&](DeepSeek4PrefillHcPreGraph & g) {
+        if (staggered_pre) {
+            ggml_backend_tensor_set(g.prev_pre, hc_prev_pre.data(), 0, sizeof(float) * hc_prev_pre.size());
+        }
+    };
+    const auto take_own_hc_pre = [&](DeepSeek4PrefillHcPreGraph & g) {
+        if (!staggered_pre) return;
+        const int64_t mix_dim = g.split->ne[0];
+        std::vector<float> split((size_t) mix_dim * (size_t) n_tokens);
+        ggml_backend_tensor_get(g.split, split.data(), 0, sizeof(float) * split.size());
+        for (int t = 0; t < n_tokens; ++t) {
+            std::memcpy(hc_prev_pre.data() + (size_t) t * n_hc, split.data() + (size_t) t * mix_dim,
+                        sizeof(float) * (size_t) n_hc);
+        }
+    };
     ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_prefill_hc) {
         if (!ds4_fused_ensure_fn_mirrors(
@@ -9933,14 +10065,23 @@ bool deepseek4_step_layer_range(
         }
         // The residual copies stay in host memory on the staggered pre-mix
         // paths, the only ones a model with Engram layers takes.
+        if (!engram_keys.empty() && use_backend_prefill_hc && hc_state_backend) {
+            // Engram adds to the residual on the host: bring it over and back.
+            ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
+        }
         if (!engram_keys.empty() &&
-            (hc_state_backend ||
+            ((hc_state_backend && !use_backend_prefill_hc) ||
              !ds4_engram_apply_host(backend, w, il, engram_keys, hc_state.data(), n_tokens,
                                     layer_range_cache.engram_apply, telemetry))) {
             if (hc_state_backend) {
                 std::fprintf(stderr, "[deepseek4] engram needs the host hyper-connection path\n");
             }
             return false;
+        }
+        if (!engram_keys.empty() && use_backend_prefill_hc && hc_state_backend) {
+            ggml_backend_tensor_set(prefill_hc_post_graph.residual_hc, hc_state.data(), 0,
+                                    sizeof(float) * hc_state.size());
+            hc_state_backend = prefill_hc_post_graph.residual_hc;
         }
 
         // ── HC pre (attention) ──────────────────────────────────────
@@ -9951,7 +10092,7 @@ bool deepseek4_step_layer_range(
                     prefill_hc_pre_graph, backend, w,
                     fused_decode_graph_cache.fn_attn_f16[(size_t)il],
                     L.hc_attn_base, hc_lw.attn.scale_data.data(),
-                    il, /*ffn=*/false, n_tokens)) {
+                    il, /*ffn=*/false, n_tokens, staggered_pre)) {
                 std::fprintf(stderr,
                              "[deepseek4-prefill] batched HC-pre build failed "
                              "layer %d attn\n", il);
@@ -9961,6 +10102,7 @@ bool deepseek4_step_layer_range(
                 hc_pre_attn_build_t0, Ds4TimingClock::now());
             ggml_backend_tensor_copy(hc_state_backend,
                                      prefill_hc_pre_graph.sg.inp_embed);
+            set_prev_hc_pre(prefill_hc_pre_graph);
             const auto hc_pre_attn_compute_t0 = Ds4TimingClock::now();
             if (ggml_backend_graph_compute(
                     backend, prefill_hc_pre_graph.sg.gf) !=
@@ -9970,6 +10112,7 @@ bool deepseek4_step_layer_range(
                              "layer %d attn\n", il);
                 return false;
             }
+            take_own_hc_pre(prefill_hc_pre_graph);
             if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(
                 hc_pre_attn_compute_t0, Ds4TimingClock::now());
             attn_in_backend = prefill_hc_pre_graph.sg.hidden_states;
@@ -10577,7 +10720,7 @@ bool deepseek4_step_layer_range(
                     prefill_hc_pre_graph, backend, w,
                     fused_decode_graph_cache.fn_ffn_f16[(size_t)il],
                     L.hc_ffn_base, hc_lw.ffn.scale_data.data(),
-                    il, /*ffn=*/true, n_tokens)) {
+                    il, /*ffn=*/true, n_tokens, staggered_pre)) {
                 std::fprintf(stderr,
                              "[deepseek4-prefill] batched HC-pre build failed "
                              "layer %d ffn\n", il);
@@ -10587,6 +10730,7 @@ bool deepseek4_step_layer_range(
                 hc_pre_ffn_build_t0, Ds4TimingClock::now());
             ggml_backend_tensor_copy(hc_state_backend,
                                      prefill_hc_pre_graph.sg.inp_embed);
+            set_prev_hc_pre(prefill_hc_pre_graph);
             const auto hc_pre_ffn_compute_t0 = Ds4TimingClock::now();
             if (ggml_backend_graph_compute(
                     backend, prefill_hc_pre_graph.sg.gf) !=
@@ -10596,6 +10740,7 @@ bool deepseek4_step_layer_range(
                              "layer %d ffn\n", il);
                 return false;
             }
+            take_own_hc_pre(prefill_hc_pre_graph);
             if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(
                 hc_pre_ffn_compute_t0, Ds4TimingClock::now());
             ffn_in_backend = prefill_hc_pre_graph.sg.hidden_states;

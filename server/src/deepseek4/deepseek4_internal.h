@@ -284,8 +284,8 @@ struct DeepSeek4Weights {
 
     // Candidate block pre-selection (V4.1): the index sources after
     // candidate_source_layer restrict their top-k to the candidate blocks
-    // that layer selected. -1 = off. TODO(deepseek41): an exact no-op until
-    // more than candidate_topk_blocks * candidate_block_size compressed rows.
+    // that layer selected. -1 = off. An exact no-op until more than
+    // candidate_topk_blocks * candidate_block_size compressed rows.
     int candidate_source_layer = -1;
     int candidate_topk_blocks  = 0;
     int candidate_block_size   = 0;
@@ -559,12 +559,37 @@ struct DeepSeek4I32ArrayBinding {
 // n_tokens] I32, indices into index_comp), or null when no token sees more
 // than top_k rows (attention over every visible row is then the same). Tokens
 // that see at most top_k rows get [0, top_k) and rely on the causal mask.
+//
+// With `candidates` (V4.1, w.candidate_source_layer) and more than
+// candidate_topk_blocks * candidate_block_size rows, the candidate source
+// layer also picks its candidate blocks (candidates->blocks, I32
+// [candidate_topk_blocks, n_tokens]) and an index source after it given
+// those blocks selects only inside them.
+struct DeepSeek4IndexCandidates {
+    ggml_tensor * blocks = nullptr;  // in (a later index source) or out (the source)
+    bool source = false;
+};
+
 ggml_tensor * deepseek4_build_indexer_topk(
     ggml_context * ctx, ggml_tensor * qr_norm, ggml_tensor * cur,
     const DeepSeek4Weights & w, const DeepSeek4Layer & L,
     ggml_tensor * index_comp, int n_comp, int kv_start, int n_tokens, int ratio,
     ggml_tensor * rope_pos, ggml_tensor * visibility_mask,
-    std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs);
+    std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
+    DeepSeek4IndexCandidates * candidates = nullptr);
+
+// model.py select_candidate_blocks: from indexer scores [n_comp, n_tokens]
+// (rows a query cannot see at -1e30) and the queries' positions (I32), the
+// `topk_blocks` blocks of `block_size` rows with the best row, the block
+// holding each query's newest row always among them. I32 [topk_blocks,
+// n_tokens]; a partial last block has index n_comp / block_size.
+ggml_tensor * deepseek4_candidate_blocks(
+    ggml_context * ctx, ggml_tensor * scores, ggml_tensor * positions,
+    int ratio, int topk_blocks, int block_size);
+
+// The scores with every row outside the given candidate blocks at -1e30.
+ggml_tensor * deepseek4_restrict_to_candidate_blocks(
+    ggml_context * ctx, ggml_tensor * scores, ggml_tensor * candidates, int block_size);
 
 // Keep a per-token indexer visibility mask aligned with the scored suffix.
 ggml_tensor * deepseek4_indexer_visibility_suffix(

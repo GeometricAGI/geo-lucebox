@@ -1768,20 +1768,20 @@ static void reference_tail_rope(float * x, int width, int n_rot, int pos, const 
     }
 }
 
-// model.py Indexer.forward for `n_tokens` queries at kv_start.. over `n_comp`
-// index keys: fp4 queries (after RoPE) against the stored keys, ReLU, head
-// weights weights_proj(x) * (128^-0.5 * n_heads^-0.5), rows past the query's
-// compress_len masked, top-k. Returns the selected rows per token, sorted.
-static std::vector<std::vector<int>> reference_indexer_topk(
+// model.py Indexer.forward scores for `n_tokens` queries at kv_start.. over
+// `n_comp` index keys: fp4 queries (after RoPE) against the stored keys, ReLU,
+// head weights weights_proj(x) * (128^-0.5 * n_heads^-0.5), rows past the
+// query's compress_len at -1e300.
+static std::vector<std::vector<double>> reference_indexer_scores(
         const DeepSeek4Weights & w, const std::vector<float> & wq_b, const std::vector<float> & proj,
         const std::vector<float> & qr, const std::vector<float> & x, const std::vector<float> & keys,
-        int q_lora, int n_embd, int n_comp, int kv_start, int n_tokens, int ratio,
-        std::vector<double> * margins) {
-    const int H = w.n_indexer_head, D = w.n_indexer_head_dim, K = w.n_indexer_top_k;
-    std::vector<std::vector<int>> out((size_t) n_tokens);
+        int q_lora, int n_embd, int n_comp, int kv_start, int n_tokens, int ratio) {
+    const int H = w.n_indexer_head, D = w.n_indexer_head_dim;
+    std::vector<std::vector<double>> out((size_t) n_tokens);
     for (int t = 0; t < n_tokens; ++t) {
         const int visible = std::min(n_comp, (kv_start + t + 1) / ratio);
-        std::vector<double> score((size_t) n_comp, -1e300);
+        std::vector<double> & score = out[(size_t) t];
+        score.assign((size_t) n_comp, -1e300);
         std::vector<float> q((size_t) H * D);
         for (int o = 0; o < H * D; ++o) {
             double acc = 0.0;
@@ -1807,20 +1807,77 @@ static std::vector<std::vector<int>> reference_indexer_topk(
             }
             score[(size_t) c] = sc;
         }
-        std::vector<int> order((size_t) n_comp);
-        std::iota(order.begin(), order.end(), 0);
-        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });
-        const int k = std::min(K, visible);
-        out[(size_t) t].assign(order.begin(), order.begin() + k);
-        std::sort(out[(size_t) t].begin(), out[(size_t) t].end());
-        if (margins) {
-            // Relative gap between the last selected and the first dropped row.
-            const double s1 = score[(size_t) order[(size_t) k - 1]];
-            margins->push_back(k < visible
-                ? (s1 - score[(size_t) order[(size_t) k]]) / std::max(std::fabs(s1), 1e-30) : 1e300);
-        }
     }
     return out;
+}
+
+// The top `k` of `score` among the rows `allowed` keeps (all when null),
+// sorted by row; `margin` is the relative gap between the last selected and
+// the first dropped score (1e300 when nothing competes).
+static std::vector<int> reference_topk_rows(const std::vector<double> & score, int k,
+                                            const std::vector<bool> * allowed, double * margin) {
+    std::vector<int> order;
+    for (int r = 0; r < (int) score.size(); ++r) {
+        if (score[(size_t) r] > -1e299 && (!allowed || (*allowed)[(size_t) r])) order.push_back(r);
+    }
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });
+    k = std::min(k, (int) order.size());
+    std::vector<int> out(order.begin(), order.begin() + k);
+    std::sort(out.begin(), out.end());
+    if (margin) {
+        const double s1 = score[(size_t) order[(size_t) k - 1]];
+        *margin = k < (int) order.size()
+            ? (s1 - score[(size_t) order[(size_t) k]]) / std::max(std::fabs(s1), 1e-30) : 1e300;
+    }
+    return out;
+}
+
+static std::vector<std::vector<int>> reference_indexer_topk(
+        const DeepSeek4Weights & w, const std::vector<float> & wq_b, const std::vector<float> & proj,
+        const std::vector<float> & qr, const std::vector<float> & x, const std::vector<float> & keys,
+        int q_lora, int n_embd, int n_comp, int kv_start, int n_tokens, int ratio,
+        std::vector<double> * margins) {
+    const auto scores = reference_indexer_scores(w, wq_b, proj, qr, x, keys, q_lora, n_embd,
+                                                 n_comp, kv_start, n_tokens, ratio);
+    std::vector<std::vector<int>> out((size_t) n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        double margin = 0.0;
+        out[(size_t) t] = reference_topk_rows(scores[(size_t) t], w.n_indexer_top_k, nullptr, &margin);
+        if (margins) margins->push_back(margin);
+    }
+    return out;
+}
+
+// model.py select_candidate_blocks for one query that sees `visible` rows of
+// `score`: blocks score as their best visible row, the block of the newest
+// row is pinned, the top `topk_blocks` are kept unless unreachable. Returns
+// the kept rows as a mask; `blocks` gets the kept block ids (sorted) and
+// `margin` the relative gap at the block cut (1e300 when nothing competes).
+static std::vector<bool> reference_candidate_rows(const std::vector<double> & score, int visible,
+                                                  int topk_blocks, int block_size,
+                                                  std::vector<int> & blocks, double * margin) {
+    const int n = (int) score.size(), nb = (n + block_size - 1) / block_size;
+    std::vector<double> best((size_t) nb, -INFINITY);
+    for (int r = 0; r < std::min(n, visible); ++r) {
+        best[(size_t) (r / block_size)] = std::max(best[(size_t) (r / block_size)], score[(size_t) r]);
+    }
+    best[(size_t) ((visible - 1) / block_size)] = INFINITY;
+    std::vector<int> order((size_t) nb);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return best[(size_t) a] > best[(size_t) b]; });
+    const int k = std::min(topk_blocks, nb);
+    blocks.clear();
+    for (int i = 0; i < k; ++i) if (best[(size_t) order[(size_t) i]] > -INFINITY) blocks.push_back(order[(size_t) i]);
+    std::sort(blocks.begin(), blocks.end());
+    if (margin) {
+        const double s1 = best[(size_t) order[(size_t) k - 1]], s2 = k < nb ? best[(size_t) order[(size_t) k]] : -INFINITY;
+        *margin = (std::isinf(s1) || std::isinf(s2)) ? 1e300 : (s1 - s2) / std::max(std::fabs(s1), 1e-30);
+    }
+    std::vector<bool> rows((size_t) n, false);
+    for (int b : blocks) {
+        for (int r = b * block_size; r < std::min(n, (b + 1) * block_size); ++r) rows[(size_t) r] = true;
+    }
+    return rows;
 }
 
 // deepseek4_build_indexer_topk with the V4.1 geometry (32 heads x 128, top
@@ -2023,6 +2080,213 @@ static void test_long_concat(ggml_backend_t backend, const char * name) {
         ggml_free(ctx);
     }
     std::fprintf(stderr, " %s\n", g_failures ? "done" : "ok");
+}
+
+// Candidate block pre-selection against model.py on synthetic indexer
+// scores: deepseek4_candidate_blocks (block max, the newest block pinned, top
+// blocks) on the source's scores, then deepseek4_restrict_to_candidate_blocks
+// and top-k on a reader's. Queries see fewer and more rows than the blocks
+// hold; a partial last block is covered; ratio 2 checks the frontier formula.
+static void test_v41_candidate_blocks(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_v41_candidate_blocks (%s) ...", name);
+    struct Case { int ratio, n_comp, kv_start, n_tokens, topk_blocks, block_size, top_k; };
+    const Case cases[] = {
+        {1, 83, 39, 44, 6, 8, 12},    // 40..83 visible rows, partial last block of 3
+        {2, 70, 80, 60, 5, 8, 10},    // (pos + 1) / 2 = 40..70 visible
+        {1, 4100, 4000, 100, 256, 8, 512},
+        {1, 40000, 39997, 3, 2048, 8, 512},   // V4.1 geometry past 32K rows
+    };
+    TestLcg rng(4141u);
+    int checked = 0;
+    for (const Case & cs : cases) {
+        const int n = cs.n_comp, T = cs.n_tokens;
+        std::vector<float> src((size_t) n * T), rd((size_t) n * T);
+        std::vector<int32_t> pos((size_t) T);
+        for (int t = 0; t < T; ++t) {
+            pos[(size_t) t] = cs.kv_start + t;
+            const int visible = (cs.kv_start + t + 1) / cs.ratio;
+            for (int r = 0; r < n; ++r) {
+                src[(size_t) t * n + r] = r < visible ? rng.next() : -1.0e30f;
+                rd[(size_t) t * n + r] = r < visible ? rng.next() : -1.0e30f;
+            }
+        }
+        ggml_init_params params{};
+        params.mem_size = 128 * ggml_tensor_overhead() + ggml_graph_overhead_custom(128, false);
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * src_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        ggml_tensor * rd_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+        for (ggml_tensor * t : {src_t, rd_t, pos_t}) ggml_set_input(t);
+        ggml_tensor * cand = deepseek4_candidate_blocks(ctx, src_t, pos_t, cs.ratio, cs.topk_blocks, cs.block_size);
+        ggml_tensor * sel = ggml_top_k(ctx, deepseek4_restrict_to_candidate_blocks(ctx, rd_t, cand, cs.block_size),
+                                       cs.top_k);
+        ggml_set_output(cand);
+        ggml_set_output(sel);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
+        ggml_build_forward_expand(gf, cand);
+        ggml_build_forward_expand(gf, sel);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+        ggml_backend_tensor_set(src_t, src.data(), 0, src.size() * 4);
+        ggml_backend_tensor_set(rd_t, rd.data(), 0, rd.size() * 4);
+        ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * 4);
+        TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        std::vector<int32_t> got_cand((size_t) ggml_nelements(cand)), got_sel((size_t) ggml_nelements(sel));
+        ggml_backend_tensor_get(cand, got_cand.data(), 0, got_cand.size() * 4);
+        ggml_backend_tensor_get(sel, got_sel.data(), 0, got_sel.size() * 4);
+        for (int t = 0; t < T; ++t) {
+            const int visible = (cs.kv_start + t + 1) / cs.ratio;
+            std::vector<double> s_src((size_t) n), s_rd((size_t) n);
+            for (int r = 0; r < n; ++r) {
+                s_src[(size_t) r] = r < visible ? src[(size_t) t * n + r] : -1e300;
+                s_rd[(size_t) r] = r < visible ? rd[(size_t) t * n + r] : -1e300;
+            }
+            std::vector<int> want_blocks;
+            const std::vector<bool> allowed = reference_candidate_rows(
+                s_src, visible, cs.topk_blocks, cs.block_size, want_blocks, nullptr);
+            const std::vector<int> want = reference_topk_rows(s_rd, cs.top_k, &allowed, nullptr);
+            std::vector<int> blocks;
+            for (int i = 0; i < cs.topk_blocks; ++i) {
+                const int b = got_cand[(size_t) t * cs.topk_blocks + i];
+                if (b * cs.block_size < visible) blocks.push_back(b);
+            }
+            std::sort(blocks.begin(), blocks.end());
+            std::vector<int> mine(got_sel.begin() + (ptrdiff_t) t * cs.top_k,
+                                  got_sel.begin() + (ptrdiff_t) (t + 1) * cs.top_k);
+            std::sort(mine.begin(), mine.end());
+            TEST_ASSERT_MSG(blocks == want_blocks, "candidate blocks differ from the reference");
+            TEST_ASSERT_MSG(mine == want, "selection inside the candidate blocks differs from the reference");
+            ++checked;
+        }
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, " %d queries match %s\n", checked, g_failures ? "done" : "ok");
+}
+
+// The same through deepseek4_build_indexer_topk with real indexer math (V4.1
+// geometry, small top-k and blocks): the candidate source picks its blocks,
+// a later index source with other weights selects inside them. Checked
+// against reference_indexer_scores + model.py's two levels.
+static void test_v41_indexer_candidates(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_v41_indexer_candidates (%s) ...", name);
+    DeepSeek4Weights w;
+    w.n_indexer_head = 32;
+    w.n_indexer_head_dim = 128;
+    w.n_indexer_top_k = 16;
+    w.n_rot = 64;
+    w.indexer_rotate = false;
+    w.shared_index_topk = true;
+    w.compress_rope_freq_base = 160000.0f;
+    w.rope_scale_factor = 16.0f;
+    w.rope_yarn_beta_fast = 32.0f;
+    w.rope_yarn_beta_slow = 1.0f;
+    w.rope_orig_ctx = 65536;
+    w.candidate_source_layer = 0;
+    w.candidate_topk_blocks = 8;
+    w.candidate_block_size = 8;
+    constexpr int q_lora = 64, n_embd = 96, H = 32, D = 128;
+    constexpr int ratio = 1, kv_start = 20, n_tokens = 80, n_comp = kv_start + n_tokens;
+    TestLcg rng(4242u);
+    std::vector<float> wq[2], pj[2];
+    for (int l = 0; l < 2; ++l) {
+        wq[l].resize((size_t) H * D * q_lora);
+        pj[l].resize((size_t) H * n_embd);
+        for (auto & v : wq[l]) v = 0.2f * rng.next();
+        for (auto & v : pj[l]) v = rng.next();
+    }
+    std::vector<float> keys((size_t) n_comp * D), qr((size_t) n_tokens * q_lora), x((size_t) n_tokens * n_embd);
+    for (int c = 0; c < n_comp; ++c) {
+        for (int d = 0; d < D; ++d) keys[(size_t) c * D + d] = rng.next();
+        reference_fp4_round_trip(keys.data() + (size_t) c * D, D);
+    }
+    for (auto & v : qr) v = rng.next();
+    for (auto & v : x) v = rng.next();
+
+    ggml_init_params params{};
+    params.mem_size = 512 * ggml_tensor_overhead() + ggml_graph_overhead_custom(512, false);
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    DeepSeek4Layer L[2]{};
+    for (auto & l : L) {
+        l.indexer_attn_q_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, H * D);
+        l.indexer_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, H);
+    }
+    ggml_tensor * comp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D, n_comp);
+    ggml_tensor * qr_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_lora, n_tokens);
+    ggml_tensor * x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    for (ggml_tensor * t : {qr_t, x_t, pos_t}) ggml_set_input(t);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT(wbuf != nullptr);
+    std::vector<DeepSeek4I32ArrayBinding> arrays;
+    DeepSeek4IndexCandidates source;
+    source.source = true;
+    ggml_tensor * sel_src = deepseek4_build_indexer_topk(ctx, qr_t, x_t, w, L[0], comp, n_comp, kv_start,
+                                                         n_tokens, ratio, pos_t, nullptr, arrays, &source);
+    DeepSeek4IndexCandidates reader;
+    reader.blocks = source.blocks;
+    ggml_tensor * sel = deepseek4_build_indexer_topk(ctx, qr_t, x_t, w, L[1], comp, n_comp, kv_start,
+                                                     n_tokens, ratio, pos_t, nullptr, arrays, &reader);
+    TEST_ASSERT(sel_src && sel && source.blocks);
+    if (!sel_src || !sel || !source.blocks || !wbuf) { ggml_free(ctx); return; }
+    ggml_set_output(sel_src);
+    ggml_set_output(sel);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 512, false);
+    ggml_build_forward_expand(gf, sel_src);
+    ggml_build_forward_expand(gf, sel);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+    for (int l = 0; l < 2; ++l) {
+        ggml_backend_tensor_set(L[l].indexer_attn_q_b, wq[l].data(), 0, wq[l].size() * 4);
+        ggml_backend_tensor_set(L[l].indexer_proj, pj[l].data(), 0, pj[l].size() * 4);
+    }
+    std::vector<ggml_fp16_t> keys16(keys.size());
+    ggml_fp32_to_fp16_row(keys.data(), keys16.data(), (int64_t) keys.size());
+    ggml_backend_tensor_set(comp, keys16.data(), 0, keys16.size() * 2);
+    ggml_backend_tensor_set(qr_t, qr.data(), 0, qr.size() * 4);
+    ggml_backend_tensor_set(x_t, x.data(), 0, x.size() * 4);
+    std::vector<int32_t> pos((size_t) n_tokens);
+    for (int t = 0; t < n_tokens; ++t) pos[(size_t) t] = kv_start + t;
+    ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * 4);
+    for (const auto & b : arrays) ggml_backend_tensor_set(b.tensor, b.values.data(), 0, b.values.size() * 4);
+    TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    std::vector<int32_t> got((size_t) ggml_nelements(sel));
+    ggml_backend_tensor_get(sel, got.data(), 0, got.size() * 4);
+
+    const auto s_src = reference_indexer_scores(w, wq[0], pj[0], qr, x, keys, q_lora, n_embd, n_comp,
+                                                kv_start, n_tokens, ratio);
+    const auto s_rd = reference_indexer_scores(w, wq[1], pj[1], qr, x, keys, q_lora, n_embd, n_comp,
+                                               kv_start, n_tokens, ratio);
+    const int K = w.n_indexer_top_k;
+    int checked = 0, near_ties = 0, restricted = 0, changed = 0;
+    for (int t = 0; t < n_tokens; ++t) {
+        const int visible = (kv_start + t + 1) / ratio;
+        std::vector<int> blocks;
+        double block_margin = 0.0, row_margin = 0.0;
+        const std::vector<bool> allowed = reference_candidate_rows(
+            s_src[(size_t) t], visible, w.candidate_topk_blocks, w.candidate_block_size, blocks, &block_margin);
+        const std::vector<int> want = reference_topk_rows(s_rd[(size_t) t], K, &allowed, &row_margin);
+        std::vector<int> mine;
+        for (int i = 0; i < K; ++i) {
+            const int r = got[(size_t) t * K + i];
+            if (r < visible) mine.push_back(r);
+        }
+        std::sort(mine.begin(), mine.end());
+        if (block_margin < 1e-4 || row_margin < 1e-4) { ++near_ties; continue; }
+        TEST_ASSERT_MSG(mine == want, "indexer selection inside the candidate blocks differs from the reference");
+        restricted += visible > w.candidate_topk_blocks * w.candidate_block_size;
+        changed += want != reference_topk_rows(s_rd[(size_t) t], K, nullptr, nullptr);
+        ++checked;
+    }
+    // The blocks must have mattered somewhere, or this checks nothing new.
+    TEST_ASSERT(restricted > 0 && changed > 0);
+    ggml_gallocr_free(alloc);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx);
+    std::fprintf(stderr, " %d queries match (%d restricted, %d changed by the blocks), %d near ties skipped %s\n",
+                 checked, restricted, changed, near_ties, g_failures ? "done" : "ok");
 }
 
 static void test_hash_routing_lookup() {
@@ -8446,6 +8710,8 @@ int main(int argc, char ** argv) {
     test_engram_apply_synthetic(backend, "cpu");
     test_engram_apply_released_weights(backend, "cpu");
     test_v41_indexer_topk(backend, "cpu");
+    test_v41_candidate_blocks(backend, "cpu");
+    test_v41_indexer_candidates(backend, "cpu");
     test_ds4_ratio4_causal_visibility_formula();
     test_dspark_seed_row_restore_cpu();
     test_hash_routing_lookup();
@@ -8506,6 +8772,8 @@ int main(int argc, char ** argv) {
             test_engram_apply_synthetic(gpu, "gpu");
             test_engram_apply_released_weights(gpu, "gpu");
             test_v41_indexer_topk(gpu, "gpu");
+            test_v41_candidate_blocks(gpu, "gpu");
+            test_v41_indexer_candidates(gpu, "gpu");
             test_long_row_top_k(gpu, "gpu");
             test_long_concat(gpu, "gpu");
             ggml_backend_free(gpu);
