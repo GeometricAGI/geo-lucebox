@@ -283,7 +283,9 @@ struct DeepSeek4Weights {
     std::vector<uint8_t> index_source_flags;      // per layer: is an index source
     bool shared_comp_cache = false;               // some layer reads another layer's rows
 
-    // Forward-pass rules that differ between the families (set by the loader).
+    // Forward-pass rules that differ between the families, set by the loader
+    // and defaulting to V4. The graph tests these, never the architecture
+    // name; docs/DS41.md ("One backend, behavior rules") lists them all.
     bool attn_q_head_norm = true;    // unit-RMS per query head after wq_b (V4 only)
     bool hc_staggered_pre = false;   // V4.1 pre-mix: see ds4_hc_collapse in the graph
     // Indexer. V4 selects per ratio-4 layer on the sparse attention paths and
@@ -608,6 +610,18 @@ ggml_tensor * deepseek4_restrict_to_candidate_blocks(
 // Keep a per-token indexer visibility mask aligned with the scored suffix.
 ggml_tensor * deepseek4_indexer_visibility_suffix(
     ggml_context * ctx, ggml_tensor * mask, int first_scored, int n_scored);
+
+// Engram on the host hyper-connection paths (deepseek4_engram_apply.cpp): a
+// step reads the Engram rows of its tokens once for every Engram layer
+// (`keys`, a no-op without Engram), then each Engram layer updates the HC
+// copies entering it. `ctx` is the sequence's n-gram context.
+bool ds4_engram_read_keys(const DeepSeek4Weights & w, DeepSeek4EngramTokens & ctx,
+                          const int32_t * token_ids, int kv_start, int n_tokens,
+                          std::vector<float> & keys, DeepSeek4StepTelemetry * telemetry);
+bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
+                           const std::vector<float> & keys, float * hc_state, int n_tokens,
+                           DeepSeek4EngramApplyRunner & runner,
+                           DeepSeek4StepTelemetry * telemetry);
 
 // The Engram constants and table locations of a GGUF, without loading any
 // tensor (tools and tests).

@@ -2074,53 +2074,6 @@ ggml_tensor * deepseek4_build_indexer_topk(
     return ggml_concat(ctx, identity, selected, 1);
 }
 
-ggml_tensor * deepseek4_candidate_blocks(
-        ggml_context * ctx, ggml_tensor * scores, ggml_tensor * positions,
-        int ratio, int topk_blocks, int block_size) {
-    GGML_ASSERT(scores->type == GGML_TYPE_F32 && ggml_is_contiguous(scores));
-    GGML_ASSERT(positions->type == GGML_TYPE_I32 && positions->ne[0] == scores->ne[1]);
-    // Powers of two keep the frontier arithmetic below exact in F32.
-    GGML_ASSERT(ratio > 0 && (ratio & (ratio - 1)) == 0);
-    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
-    const int64_t n_tokens = scores->ne[1];
-    const int64_t n_full = scores->ne[0] / block_size;
-    GGML_ASSERT(n_full + 1 > topk_blocks);
-    // A full block scores as its best row; one the query cannot reach yet
-    // scores -1e30 like its rows. The partial block at the end (if any) is
-    // reachable only by the queries whose newest row it holds, and those pin
-    // it below, so its column starts at -1e30.
-    ggml_tensor * blocks = ggml_pool_2d(ctx, scores, GGML_OP_POOL_MAX,
-                                        block_size, 1, block_size, 1, 0.0f, 0.0f);
-    ggml_tensor * pos = ggml_cast(ctx, positions, GGML_TYPE_F32);
-    ggml_tensor * partial = ggml_scale_bias(ctx, pos, 0.0f, -1.0e30f);
-    blocks = ggml_concat(ctx, blocks, ggml_reshape_2d(ctx, partial, 1, n_tokens), 0);
-    // The block of the query's newest row, ((pos + 1) / ratio - 1) / block_size,
-    // is pinned in: it is only partly filled and could lose to an older block.
-    ggml_tensor * visible = ggml_floor(ctx, ggml_scale_bias(ctx, pos, 1.0f / ratio, 1.0f / ratio));
-    ggml_tensor * newest = ggml_floor(ctx, ggml_scale_bias(
-        ctx, visible, 1.0f / block_size, -1.0f / block_size));
-    ggml_tensor * pin = ggml_scale_bias(ctx, pos, 0.0f, 1.0e30f);
-    blocks = ggml_set_rows(ctx, ggml_reshape_3d(ctx, blocks, 1, n_full + 1, n_tokens),
-                           ggml_reshape_3d(ctx, pin, 1, 1, n_tokens),
-                           ggml_reshape_2d(ctx, ggml_cast(ctx, newest, GGML_TYPE_I32), 1, n_tokens));
-    return ggml_top_k(ctx, ggml_reshape_2d(ctx, blocks, n_full + 1, n_tokens), topk_blocks);
-}
-
-ggml_tensor * deepseek4_restrict_to_candidate_blocks(
-        ggml_context * ctx, ggml_tensor * scores, ggml_tensor * candidates, int block_size) {
-    GGML_ASSERT(candidates->type == GGML_TYPE_I32 && ggml_is_contiguous(candidates));
-    GGML_ASSERT(candidates->ne[1] == scores->ne[1]);
-    const int64_t n_blocks = candidates->ne[0], n_tokens = candidates->ne[1];
-    // Rows block * block_size + j of every candidate block (exact in F32);
-    // the mask keeps the scores there, rows past n_comp are ignored.
-    ggml_tensor * first = ggml_scale(ctx, ggml_cast(ctx, candidates, GGML_TYPE_F32), (float) block_size);
-    first = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, first, 1, n_blocks, n_tokens),
-                           block_size, n_blocks, n_tokens, 1);
-    ggml_tensor * rows = ggml_add(ctx, first, ggml_arange(ctx, 0.0f, (float) block_size, 1.0f));
-    rows = ggml_cast(ctx, ggml_reshape_2d(ctx, rows, block_size * n_blocks, n_tokens), GGML_TYPE_I32);
-    return ggml_ds4_indexer_mask(ctx, scores, rows, 0);
-}
-
 // ─── MLA Attention Block ────────────────────────────────────────────────
 
 // All persistent and live-state bindings consumed by one MLA lane.  Keeping
@@ -5550,49 +5503,6 @@ struct DeepSeek4HybridRuntime {
 };
 
 static thread_local DeepSeek4HybridRuntime ds4_hybrid_runtime;
-
-// ─── Engram on the host hyper-connection paths ──────────────────────────
-// A step reads the Engram rows of its tokens once, for every Engram layer;
-// each Engram layer then updates the residual copies entering it, before its
-// attention HC pre (model.py Transformer.forward), on the GPU that holds its
-// weights. `ctx` is the sequence's n-gram context (deepseek4_engram.h).
-static bool ds4_engram_read_keys(const DeepSeek4Weights & w, DeepSeek4EngramTokens & ctx,
-                                 const int32_t * token_ids, int kv_start, int n_tokens,
-                                 std::vector<float> & keys, DeepSeek4StepTelemetry * telemetry) {
-    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
-    if (!engram) return true;
-    if (!token_ids) {
-        std::fprintf(stderr, "[deepseek4] engram: the step carries no token ids\n");
-        return false;
-    }
-    const auto t0 = Ds4TimingClock::now();
-    keys.resize((size_t) engram->n_layers() * (size_t) n_tokens * engram->key_floats());
-    std::string err;
-    if (!engram->prepare(ctx, token_ids, kv_start, (size_t) n_tokens, keys.data(), &err)) {
-        std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
-        return false;
-    }
-    if (telemetry) telemetry->engram_read_us += ds4_elapsed_us(t0, Ds4TimingClock::now());
-    return true;
-}
-
-static bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
-                                  const std::vector<float> & keys, float * hc_state, int n_tokens,
-                                  DeepSeek4EngramApplyRunner & runner,
-                                  DeepSeek4StepTelemetry * telemetry) {
-    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
-    const int e = engram ? engram->layer_index(il) : -1;
-    if (e < 0) return true;
-    const auto t0 = Ds4TimingClock::now();
-    const float * layer_keys = keys.data() + (size_t) e * (size_t) n_tokens * engram->key_floats();
-    if (!runner.run(backend, w.layers[(size_t) il], w.n_embd, w.n_hc, w.rms_eps,
-                    hc_state, layer_keys, n_tokens)) {
-        std::fprintf(stderr, "[deepseek4] engram apply failed at layer %d\n", il);
-        return false;
-    }
-    if (telemetry) telemetry->engram_apply_us += ds4_elapsed_us(t0, Ds4TimingClock::now());
-    return true;
-}
 
 static const void * hc_fn_device_ptr(const HcWeightsCpu &, ggml_tensor * fn) {
     if (!fn) return nullptr;

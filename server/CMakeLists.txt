@@ -563,6 +563,7 @@ add_library(luce_common STATIC
     # DeepSeek V4 Flash target arch (and V4.1 Flash)
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_candidates.cpp
     src/deepseek4/deepseek4_engram.cpp
     src/deepseek4/deepseek4_engram_apply.cpp
     src/deepseek4/deepseek4_snapshot.cpp
@@ -632,6 +633,7 @@ add_library(luce_common STATIC
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
     src/common/moe_hybrid_expert_cache.cpp
+    src/common/platform_io.cpp
     src/common/moe_hybrid_stream.cpp
     src/common/moe_expert_compute.cpp
     src/common/moe_expert_compute_cpu.cpp
@@ -1884,7 +1886,8 @@ if(LUCE_TESTS)
         # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or GPU.
         add_executable(test_ds4_engram
             test/test_ds4_engram.cpp
-            src/deepseek4/deepseek4_engram.cpp)
+            src/deepseek4/deepseek4_engram.cpp
+            src/common/platform_io.cpp)
         target_include_directories(test_ds4_engram PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         find_package(Threads REQUIRED)

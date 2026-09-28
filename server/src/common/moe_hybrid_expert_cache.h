@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "platform_io.h"
 #include "moe_hybrid_routing_stats.h"
 #include "moe_hybrid_storage.h"
 #include "moe_hybrid_types.h"
@@ -318,7 +319,7 @@ private:
     size_t refill_from_ = SIZE_MAX;    // warm_ entries from here reload evicted decode slots
     bool bulk_ = false;
     bool direct_all_ = false;          // every load reads with O_DIRECT
-    int direct_fd_ = -1;               // the model file opened with O_DIRECT, or -1
+    ReadOnlyFile direct_file_;         // the model file opened for direct reads, if supported
     std::vector<uint64_t> evicted_hot_; // decode slots bulk loads evicted, oldest first
     int warm_loading_ = 0;
     uint64_t warm_loads_ = 0, warm_bytes_ = 0;

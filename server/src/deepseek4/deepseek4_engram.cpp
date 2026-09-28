@@ -9,20 +9,6 @@
 #include <cstring>
 #include <thread>
 
-#if defined(_WIN32)
-#  include <fcntl.h>
-#  include <io.h>
-#  include <sys/stat.h>
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#else
-#  include <fcntl.h>
-#  include <sys/stat.h>
-#  include <unistd.h>
-#endif
-
 namespace luce::common {
 
 // ── 1. addressing ─────────────────────────────────────────────────────────
@@ -132,68 +118,29 @@ float deepseek4_engram_decode_value(uint8_t e4m3, uint8_t e8m0) {
     return v;
 }
 
-static void close_fd(int fd) {
-#if defined(_WIN32)
-    ::_close(fd);
-#else
-    ::close(fd);
-#endif
-}
-
 bool DeepSeek4EngramTable::open(const std::string & path, uint64_t offset, uint64_t rows,
                                 std::string * err) {
     close();
-#if defined(_WIN32)
-    const int fd = ::_open(path.c_str(), _O_RDONLY | _O_BINARY);
-    struct _stat64 st;
-    const bool regular = fd >= 0 && ::_fstat64(fd, &st) == 0 && (st.st_mode & _S_IFREG);
-#else
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    struct stat st;
-    const bool regular = fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
-#endif
-    if (fd < 0) { if (err) *err = "engram table: open failed: " + path; return false; }
-    if (!regular || offset + rows * (uint64_t) kRowBytes > (uint64_t) st.st_size) {
-        close_fd(fd);
+    if (!file_.open(path, /*direct=*/false, err)) {
+        if (err) *err = "engram table: " + *err;
+        return false;
+    }
+    if (offset + rows * (uint64_t) kRowBytes > file_.size()) {
+        file_.close();
         if (err) *err = "engram table: offset/rows exceed the file";
         return false;
     }
-    fd_ = fd; offset_ = offset; rows_ = rows;
+    offset_ = offset; rows_ = rows;
     return true;
 }
 
 void DeepSeek4EngramTable::close() {
-    if (fd_ >= 0) close_fd(fd_);
-    fd_ = -1; offset_ = 0; rows_ = 0;
+    file_.close();
+    offset_ = 0; rows_ = 0;
 }
 
 namespace {
 struct RowRequest { uint32_t row, slot; };
-
-// Positional read of one row; safe from several threads on the same file.
-bool read_one(int fd, uint64_t off, uint8_t * buf) {
-    size_t done = 0;
-    while (done < (size_t) DeepSeek4EngramTable::kRowBytes) {
-        const size_t want = DeepSeek4EngramTable::kRowBytes - done;
-#if defined(_WIN32)
-        OVERLAPPED ov{};
-        ov.Offset = (DWORD) ((off + done) & 0xffffffffu);
-        ov.OffsetHigh = (DWORD) ((off + done) >> 32);
-        DWORD got = 0;
-        if (!ReadFile((HANDLE) _get_osfhandle(fd), buf + done, (DWORD) want, &got, &ov) || got == 0) {
-            errno = EIO;
-            return false;
-        }
-        done += got;
-#else
-        const ssize_t n = pread(fd, buf + done, want, (off_t) (off + done));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { if (n == 0) errno = EIO; return false; }
-        done += (size_t) n;
-#endif
-    }
-    return true;
-}
 
 bool decode_row(const uint8_t * raw, float * out) {
     for (int j = 0; j < DeepSeek4EngramTable::kDim; ++j) {
@@ -206,7 +153,7 @@ bool decode_row(const uint8_t * raw, float * out) {
 }  // namespace
 
 bool DeepSeek4EngramTable::read(const uint32_t * row_ids, size_t count, float * out, int threads) const {
-    if (fd_ < 0) { errno = EBADF; return false; }
+    if (!file_.is_open()) { errno = EBADF; return false; }
     for (size_t i = 0; i < count; ++i) {
         if (row_ids[i] >= rows_) { errno = EINVAL; return false; }
     }
@@ -227,7 +174,7 @@ bool DeepSeek4EngramTable::read(const uint32_t * row_ids, size_t count, float * 
             if (i > begin && req[i].row == req[i - 1].row) {
                 std::memcpy(dst, previous, kDim * sizeof(float));
             } else {
-                if (!read_one(fd_, offset_ + (uint64_t) req[i].row * kRowBytes, raw) ||
+                if (!file_.read_at(offset_ + (uint64_t) req[i].row * kRowBytes, raw, kRowBytes) ||
                     !decode_row(raw, dst)) {
                     errs[(size_t) p] = errno ? errno : EIO;
                     return;
@@ -250,16 +197,10 @@ bool DeepSeek4EngramTable::read(const uint32_t * row_ids, size_t count, float * 
 
 
 void DeepSeek4EngramTable::prefetch(const uint32_t * row_ids, size_t count) const {
-#if defined(_WIN32)
-    (void) row_ids; (void) count;   // no readahead hint; rows are read on demand
-#else
-    if (fd_ < 0) return;
+    if (!file_.is_open()) return;
     for (size_t i = 0; i < count; ++i) {
-        if (row_ids[i] >= rows_) continue;
-        (void) posix_fadvise(fd_, (off_t) (offset_ + (uint64_t) row_ids[i] * kRowBytes), kRowBytes,
-                             POSIX_FADV_WILLNEED);
+        if (row_ids[i] < rows_) file_.advise_willneed(offset_ + (uint64_t) row_ids[i] * kRowBytes, kRowBytes);
     }
-#endif
 }
 
 // ── host-side runtime ─────────────────────────────────────────────────────

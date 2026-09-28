@@ -21,6 +21,7 @@
 // engram.py (NgramHashState); antirez/ds4 ds4_engram.c as a second reading.
 #pragma once
 
+#include "common/platform_io.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -111,32 +112,24 @@ public:
     static constexpr int kRowBytes = 264;   // 256 values + 8 block scales
 
     DeepSeek4EngramTable() = default;
-    DeepSeek4EngramTable(DeepSeek4EngramTable && o) noexcept : fd_(o.fd_), offset_(o.offset_), rows_(o.rows_) { o.fd_ = -1; }
-    DeepSeek4EngramTable & operator=(DeepSeek4EngramTable && o) noexcept {
-        if (this != &o) { close(); fd_ = o.fd_; offset_ = o.offset_; rows_ = o.rows_; o.fd_ = -1; }
-        return *this;
-    }
-    DeepSeek4EngramTable(const DeepSeek4EngramTable &) = delete;
-    DeepSeek4EngramTable & operator=(const DeepSeek4EngramTable &) = delete;
-    ~DeepSeek4EngramTable() { close(); }
     // A separate, unbuffered descriptor on the GGUF; `offset` is the absolute
     // byte offset of the table, `rows` its row count.
     bool open(const std::string & path, uint64_t offset, uint64_t rows, std::string * err);
     void close();
-    bool is_open() const { return fd_ >= 0; }
+    bool is_open() const { return file_.is_open(); }
     uint64_t rows() const { return rows_; }
 
     // Decodes `count` rows into out[count][kDim]. Rows are fetched in sorted
     // order with duplicates read once; batches of 256 rows or more use
     // `threads` readers. False (errno kept) on a short read or a bad code.
     bool read(const uint32_t * row_ids, size_t count, float * out, int threads = 16) const;
-    // Starts reading `count` rows into the page cache without waiting
-    // (POSIX_FADV_WILLNEED), so a later `read` of them does not wait on the
-    // drive one row at a time.
+    // Starts reading `count` rows into the page cache without waiting (a
+    // readahead hint where the platform has one), so a later `read` of them
+    // does not wait on the drive one row at a time.
     void prefetch(const uint32_t * row_ids, size_t count) const;
 
 private:
-    int fd_ = -1;
+    ReadOnlyFile file_;
     uint64_t offset_ = 0;
     uint64_t rows_ = 0;
 };

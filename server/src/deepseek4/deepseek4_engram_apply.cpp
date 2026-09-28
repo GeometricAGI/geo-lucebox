@@ -6,7 +6,9 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace luce::common {
@@ -139,6 +141,54 @@ bool DeepSeek4EngramApplyRunner::run(ggml_backend_t backend, const DeepSeek4Laye
         ggml_free(ctx);
         if (!ok) return false;
     }
+    return true;
+}
+
+static uint64_t elapsed_us(std::chrono::steady_clock::time_point t0) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
+// ─── Engram on the host hyper-connection paths ──────────────────────────
+// A step reads the Engram rows of its tokens once, for every Engram layer;
+// each Engram layer then updates the residual copies entering it, before its
+// attention HC pre (model.py Transformer.forward), on the GPU that holds its
+// weights. `ctx` is the sequence's n-gram context (deepseek4_engram.h).
+bool ds4_engram_read_keys(const DeepSeek4Weights & w, DeepSeek4EngramTokens & ctx,
+                          const int32_t * token_ids, int kv_start, int n_tokens,
+                          std::vector<float> & keys, DeepSeek4StepTelemetry * telemetry) {
+    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
+    if (!engram) return true;
+    if (!token_ids) {
+        std::fprintf(stderr, "[deepseek4] engram: the step carries no token ids\n");
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    keys.resize((size_t) engram->n_layers() * (size_t) n_tokens * engram->key_floats());
+    std::string err;
+    if (!engram->prepare(ctx, token_ids, kv_start, (size_t) n_tokens, keys.data(), &err)) {
+        std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+        return false;
+    }
+    if (telemetry) telemetry->engram_read_us += elapsed_us(t0);
+    return true;
+}
+
+bool ds4_engram_apply_host(ggml_backend_t backend, const DeepSeek4Weights & w, int il,
+                           const std::vector<float> & keys, float * hc_state, int n_tokens,
+                           DeepSeek4EngramApplyRunner & runner,
+                           DeepSeek4StepTelemetry * telemetry) {
+    const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
+    const int e = engram ? engram->layer_index(il) : -1;
+    if (e < 0) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const float * layer_keys = keys.data() + (size_t) e * (size_t) n_tokens * engram->key_floats();
+    if (!runner.run(backend, w.layers[(size_t) il], w.n_embd, w.n_hc, w.rms_eps,
+                    hc_state, layer_keys, n_tokens)) {
+        std::fprintf(stderr, "[deepseek4] engram apply failed at layer %d\n", il);
+        return false;
+    }
+    if (telemetry) telemetry->engram_apply_us += elapsed_us(t0);
     return true;
 }
 

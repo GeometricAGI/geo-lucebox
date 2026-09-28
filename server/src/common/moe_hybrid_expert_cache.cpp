@@ -13,15 +13,6 @@
 #include <cstring>
 #include <thread>
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
-
 namespace luce::common {
 
 namespace {
@@ -64,43 +55,23 @@ ExpertRanges expert_ranges(const LayerExpertRegions & r, int expert) {
 }
 
 void advise_willneed(const void * map, size_t map_size, const ExpertRanges & ranges) {
-#if !defined(_WIN32)
-    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
-    for (int i = 0; i < 3; ++i) {
-        if (ranges.size[i] == 0 || ranges.off[i] + ranges.size[i] > map_size) continue;
-        const size_t start = ranges.off[i] / page * page;
-        ::madvise(const_cast<uint8_t *>(static_cast<const uint8_t *>(map)) + start,
-                  ranges.size[i] + (ranges.off[i] - start), MADV_WILLNEED);
-    }
-#else
-    (void) map; (void) map_size; (void) ranges;
-#endif
+    for (int i = 0; i < 3; ++i) advise_mapped_willneed(map, map_size, ranges.off[i], ranges.size[i]);
 }
 
 }  // namespace
 
-constexpr size_t kDirectAlign = 4096;
+constexpr size_t kDirectAlign = ReadOnlyFile::kDirectAlign;
 
-// Reads [off, off + size) of `fd` (opened with O_DIRECT) into page-aligned
+// Reads [off, off + size) of the directly opened `file` into page-aligned
 // `buf` (capacity for size + 2 pages), returning where the bytes start.
-// POSIX only: on Windows the model file is not opened for direct reads and
-// every load goes through the mapping.
-static const uint8_t * direct_read(int fd, uint8_t * buf, uint64_t off, size_t size) {
-#if defined(_WIN32)
-    (void) fd; (void) buf; (void) off; (void) size;
-    return nullptr;
-#else
+static const uint8_t * direct_read(const ReadOnlyFile & file, uint8_t * buf, uint64_t off, size_t size) {
     const uint64_t first = off & ~(uint64_t) (kDirectAlign - 1);
     const uint64_t end = (off + size + kDirectAlign - 1) & ~(uint64_t) (kDirectAlign - 1);
-    size_t done = 0;
-    while (first + done < off + size) {
-        const ssize_t n = pread(fd, buf + done, (size_t) (end - first - done), (off_t) (first + done));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return nullptr;
-        done += (size_t) n;
-    }
+    // The last block may run past the end of the file: only the requested
+    // bytes must arrive.
+    const int64_t got = file.read_upto(first, buf, (size_t) (end - first));
+    if (got < 0 || (uint64_t) got < off + size - first) return nullptr;
     return buf + (off - first);
-#endif
 }
 
 struct MoeStreamedExpertCache::Loader {
@@ -240,12 +211,11 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
             return fail("failed to allocate pinned expert staging");
         }
     }
-#if !defined(_WIN32)
-    if (!opts.direct_path.empty()) {
-        direct_fd_ = ::open(opts.direct_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-        direct_all_ = opts.direct_all && direct_fd_ >= 0;
+    // Where direct reads are unsupported the file stays closed and every load
+    // goes through the mapping.
+    if (!opts.direct_path.empty() && direct_file_.open(opts.direct_path, /*direct=*/true)) {
+        direct_all_ = opts.direct_all;
     }
-#endif
     for (Loader * l : loaders_) threads_.emplace_back(&MoeStreamedExpertCache::loader_main, this, l);
     if (!mailbox_.init(this, (int) storage.layers.size(), cfg.n_expert, cfg.n_expert_used, err)) {
         return fail(err ? *err : "failed to set up the streamed mailbox");
@@ -273,10 +243,7 @@ void MoeStreamedExpertCache::destroy() {
         delete l;
     }
     loaders_.clear();
-#if !defined(_WIN32)
-    if (direct_fd_ >= 0) ::close(direct_fd_);
-#endif
-    direct_fd_ = -1;
+    direct_file_.close();
     for (auto & kv : graphs_) kv.second.free();
     graphs_.clear();
     views_.clear();
@@ -392,10 +359,10 @@ bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot,
     size_t at = 0;
     size_t staged_at[3] = {0, 0, 0};
     // Bulk loads read the drive directly into page-aligned staging.
-    bool direct = (s.bulk || direct_all_) && direct_fd_ >= 0;
+    bool direct = (s.bulk || direct_all_) && direct_file_.is_open();
     for (int i = 0; i < 3 && direct; ++i) {
         if (r.size[i] == 0) continue;
-        const uint8_t * src = direct_read(direct_fd_, staging + at, r.off[i], r.size[i]);
+        const uint8_t * src = direct_read(direct_file_, staging + at, r.off[i], r.size[i]);
         if (!src) { direct = false; break; }
         staged_at[i] = (size_t) (src - staging);
         at += (staged_at[i] - at + r.size[i] + kDirectAlign - 1) & ~(kDirectAlign - 1);
@@ -906,34 +873,6 @@ namespace {
 
 constexpr size_t kMailboxLine = 64;
 
-void cpu_relax() {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-    _mm_pause();
-#elif defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__)
-    asm volatile("yield");
-#endif
-}
-
-// Acquire / release on the host-mapped mailbox words. MSVC has no
-// __atomic builtins; on x86-64 an aligned volatile access with a compiler
-// barrier gives the same ordering.
-#if defined(_MSC_VER)
-uint32_t mailbox_load(const uint32_t * p) {
-    const uint32_t v = *(const volatile uint32_t *) p;
-    _ReadWriteBarrier();
-    return v;
-}
-void mailbox_store(uint32_t * p, uint32_t v) {
-    _ReadWriteBarrier();
-    *(volatile uint32_t *) p = v;
-}
-#else
-uint32_t mailbox_load(const uint32_t * p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
-void mailbox_store(uint32_t * p, uint32_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
-#endif
-
 }  // namespace
 
 MoeStreamedMailbox::~MoeStreamedMailbox() {
@@ -1016,7 +955,7 @@ void MoeStreamedMailbox::begin(const std::vector<Job> & jobs, int32_t invalid_ro
     std::lock_guard<std::mutex> lk(mu_);
     uint32_t next = *step_ + 1;
     if (next == 0) next = 1;  // 0 is the initial value of every flag
-    mailbox_store(step_, next);
+    host_word_store_release(step_, next);
     jobs_ = jobs;
     invalid_route_ = invalid_route;
     error_.clear();
@@ -1042,7 +981,7 @@ void MoeStreamedMailbox::resolver_main() {
         cv_.wait(lk, [&] { return stopping_ || pending_; });
         if (stopping_) break;
         const std::vector<Job> jobs = jobs_;
-        const uint32_t step = mailbox_load(step_);
+        const uint32_t step = host_word_load_acquire(step_);
         lk.unlock();
         std::string error;
         for (size_t j = 0; j < jobs.size(); ++j) {
@@ -1052,7 +991,7 @@ void MoeStreamedMailbox::resolver_main() {
             // (it failed); stop once end() says the launch is over.
             bool posted = false;
             for (uint32_t spin = 0;; ++spin) {
-                if (mailbox_load(c.posted) == step) { posted = true; break; }
+                if (host_word_load_acquire(c.posted) == step) { posted = true; break; }
                 if ((spin & 1023) == 1023) {
                     std::lock_guard<std::mutex> g(mu_);
                     if (launch_done_ || stopping_) break;
@@ -1067,7 +1006,7 @@ void MoeStreamedMailbox::resolver_main() {
             // queue its loads behind this layer's before blocking on them.
             if (j + 1 < jobs.size() && jobs[j + 1].layer == job.layer + 1) {
                 const Channel & next = channels_[(size_t) jobs[j + 1].layer];
-                if (mailbox_load(next.predicted) == step) {
+                if (host_word_load_acquire(next.predicted) == step) {
                     cache_->prefetch(jobs[j + 1].layer, next.predicted_ids,
                                      std::min(jobs[j + 1].n_routes, n_expert_used_ * kMaxTokens));
                 }
@@ -1103,7 +1042,7 @@ bool MoeStreamedMailbox::answer(const Job & job, uint32_t step, std::string * er
         std::memcpy(c.lut + (size_t) t * n_expert_, c.lut, sizeof(int32_t) * (size_t) n_expert_);
         std::memcpy(c.valid + (size_t) t * n_expert_, c.valid, sizeof(float) * (size_t) n_expert_);
     }
-    mailbox_store(c.answered, step);
+    host_word_store_release(c.answered, step);
     return ok;
 }
 
