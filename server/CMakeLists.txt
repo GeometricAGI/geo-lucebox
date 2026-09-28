@@ -2841,6 +2841,15 @@ if(LUCE_SERVER)
             )
             install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
                     DESTINATION share)
+            # The ds41-lucebox profile's data files, found next to the binary
+            # (build/share, <prefix>/share) like status.html.
+            add_custom_command(TARGET luce_server POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CMAKE_CURRENT_SOURCE_DIR}/share/deepseek41"
+                    "$<TARGET_FILE_DIR:luce_server>/share/deepseek41"
+                COMMENT "Copying share/deepseek41 to build/share/")
+            install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/share/deepseek41"
+                    DESTINATION share)
         endif()
     endif()
 

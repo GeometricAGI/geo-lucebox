@@ -1080,6 +1080,10 @@ bool MoeStreamedMailbox::answer(const Job & job, uint32_t step, std::string * er
     const int n_routes = std::min(job.n_routes, n_expert_used_ * kMaxTokens);
     const int n_tokens = std::max(1, std::min(job.n_tokens, kMaxTokens));
     if (observer_) observer_(job.layer, c.ids, n_routes);
+    // This layer's routes exist only once the previous layer's output did,
+    // so the device is done with the previous layer's slots: unpin them, and
+    // one launch needs only one layer's streamed experts resident at a time.
+    cache_->release_acquired();
     slot_of_.assign((size_t) n_expert_, -1);
     const bool ok = cache_->acquire(job.layer, c.ids, n_routes, slot_of_, err);
     for (int e = 0; e < n_expert_; ++e) {
@@ -1122,6 +1126,13 @@ bool MoeExpertPromoter::init(MoeHybridStorage & storage, int n_expert,
         const MoeHybridLayerStorage & st = storage.layers[(size_t) il];
         if (st.cache_slots <= 0 || st.hot_local_by_global.size() != (size_t) n_expert) continue;
         if (!(st.gate_up_hot || (st.gate_hot && st.up_hot)) || !st.down_hot) continue;
+        // A mixed-codebook row carries per-expert decode tables that a raw
+        // byte copy does not update: those layers keep a static placement.
+        bool mixed = false;
+        for (const ggml_tensor * t : {st.gate_hot, st.up_hot, st.down_hot, st.gate_up_hot}) {
+            mixed = mixed || (t && (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX));
+        }
+        if (mixed) continue;
         rows_[(size_t) il].assign((size_t) st.cache_slots, Row{});
         total_rows += st.cache_slots;
         for (int e = 0; e < n_expert; ++e) {

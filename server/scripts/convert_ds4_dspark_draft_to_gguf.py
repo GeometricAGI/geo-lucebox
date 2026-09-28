@@ -133,6 +133,8 @@ def load_f32(st: Shards, name: str) -> np.ndarray:
     dtype, shape, data = st.raw(name)
     if dtype == "F32":
         return np.frombuffer(data, dtype=np.float32).reshape(shape).copy()
+    if dtype == "F16":
+        return np.frombuffer(data, dtype=np.float16).astype(np.float32).reshape(shape)
     if dtype == "BF16":
         u = np.frombuffer(data, dtype=np.uint16).astype(np.uint32) << 16
         return u.view(np.float32).reshape(shape)

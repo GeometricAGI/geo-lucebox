@@ -378,7 +378,12 @@ size_t ggml_backend_cuda_set_host_spill(int device, size_t carve_reserve, size_t
         carve_reserve = 0;
         host_bytes = 0;
     }
-    host_bytes = std::min(host_bytes, ggml_cuda_lockable_host_bytes());
+    // Under a finite lock limit, leave room for the runtime's own pinned
+    // buffers (copy staging, graph inputs).
+    const size_t lockable = ggml_cuda_lockable_host_bytes();
+    constexpr size_t pinned_headroom = (size_t) 512 << 20;
+    host_bytes = std::min(host_bytes, lockable == SIZE_MAX ? lockable
+                                      : lockable > pinned_headroom ? lockable - pinned_headroom : 0);
     std::lock_guard<std::mutex> lock(g_host_spill_mutex);
     ggml_cuda_host_spill_state & st = g_host_spill[device];
     st.carve_reserve = host_bytes > 0 ? carve_reserve : 0;

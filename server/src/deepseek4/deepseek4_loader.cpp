@@ -665,8 +665,11 @@ static bool read_deepseek4_engram(gguf_context * gctx, ggml_context * meta_ctx,
             return false;
         }
     }
+    // The token that fills n-gram slots with no history; the reference
+    // (model.py engram_pad_id) uses 2.
+    if (gguf_find_key(gctx, key("pad_id").c_str()) < 0) e.pad_id = 2;
     if (e.pad_id < 0) {
-        err = "engram pad_id missing";
+        err = "engram pad_id is negative";
         return false;
     }
     for (size_t l = 0; l < n_eng; ++l) {
