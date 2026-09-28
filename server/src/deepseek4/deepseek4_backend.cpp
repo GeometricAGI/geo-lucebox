@@ -2347,7 +2347,12 @@ DeepSeek4Backend::HybridPrefillScratch DeepSeek4Backend::hybrid_prefill_scratch_
     const size_t mask_row = ((size_t) w.n_swa + (size_t) std::max(1, chunk) + comp_rows) *
                             (f32 + sizeof(uint16_t));
     size_t mask = mask_row;
-    const size_t routes = (size_t) w.n_expert_used * 3 * (size_t) w.n_ff_exp * f32;
+    // Per routed token the expert-major MoE graph holds the gathered input and
+    // the down output (n_embd each) besides gate, up and their product
+    // (n_ff_exp each); measured about 270 KiB a token on the R9700 at a 4K
+    // chunk, which the three ff rows alone undercounted.
+    const size_t routes = (size_t) w.n_expert_used *
+                          (2 * (size_t) w.n_embd + 3 * (size_t) w.n_ff_exp) * f32;
     const size_t token = (size_t) w.n_embd * f32;
     HybridPrefillScratch out;
     if (w.shared_index_topk) {
