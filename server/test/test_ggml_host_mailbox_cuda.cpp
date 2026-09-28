@@ -102,9 +102,6 @@ struct HostMailboxFixture {};
 
 TEST_CASE(HostMailboxFixture, every_device_answers_each_launch) {
     int n = 0;
-    if (hipGetDeviceCount(&n) != hipSuccess || n == 0) {
-        std::fprintf(stderr, "no HIP device; skipping\n");
-        return;
-    }
+    if (hipGetDeviceCount(&n) != hipSuccess || n == 0) SKIP("no HIP device");
     for (int d = 0; d < n; ++d) CHECK(run_device(d));
 }
