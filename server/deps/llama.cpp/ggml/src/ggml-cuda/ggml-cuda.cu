@@ -377,8 +377,10 @@ size_t ggml_backend_cuda_set_host_spill(int device, size_t carve_reserve, size_t
     }
     host_bytes = std::min(host_bytes, ggml_cuda_lockable_host_bytes());
     std::lock_guard<std::mutex> lock(g_host_spill_mutex);
-    g_host_spill[device].carve_reserve = host_bytes > 0 ? carve_reserve : 0;
-    g_host_spill[device].host_left = host_bytes;
+    ggml_cuda_host_spill_state & st = g_host_spill[device];
+    st.carve_reserve = host_bytes > 0 ? carve_reserve : 0;
+    // Spills still alive count against the new budget.
+    st.host_left = host_bytes > st.host_used ? host_bytes - st.host_used : 0;
     return host_bytes;
 }
 
@@ -1027,11 +1029,18 @@ struct ggml_cuda_copy_staging_buffers {
     }
 };
 
+// Null when pinned memory is off (GGML_CUDA_NO_PINNED) or cannot be had:
+// the caller then copies directly from pageable memory.
 static char * ggml_cuda_copy_staging(int slot) {
+    static const bool no_pinned = getenv("GGML_CUDA_NO_PINNED") != nullptr;
+    if (no_pinned) return nullptr;
     thread_local ggml_cuda_copy_staging_buffers staging;
     if (!staging.buf[slot]) {
         void * ptr = nullptr;
-        CUDA_CHECK(cudaMallocHost(&ptr, GGML_CUDA_STAGED_COPY_CHUNK));
+        if (cudaMallocHost(&ptr, GGML_CUDA_STAGED_COPY_CHUNK) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
         staging.buf[slot] = (char *) ptr;
     }
     return staging.buf[slot];
@@ -1102,7 +1111,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         }
         return;
     }
-    if (size >= GGML_CUDA_STAGED_COPY_MIN) {
+    if (size >= GGML_CUDA_STAGED_COPY_MIN && ggml_cuda_copy_staging(0) && ggml_cuda_copy_staging(1)) {
         ggml_cuda_staged_h2d((char *) tensor->data + offset, (const char *) data, size);
         return;
     }
@@ -1114,7 +1123,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    if (size >= GGML_CUDA_STAGED_COPY_MIN && !ctx->is_managed) {
+    if (size >= GGML_CUDA_STAGED_COPY_MIN && !ctx->is_managed && ggml_cuda_copy_staging(0)) {
         ggml_cuda_staged_d2h((char *) data, (const char *) tensor->data + offset, size);
         return;
     }

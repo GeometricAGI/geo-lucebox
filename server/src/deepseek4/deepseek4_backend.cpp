@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <system_error>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1685,6 +1686,13 @@ bool DeepSeek4Backend::load_routing_adjustments() {
         f.seekg(0);
         f.read(reinterpret_cast<char *>(w_.router_bias_delta.data()), (std::streamsize) (n * sizeof(float)));
         if (!f) return false;
+        for (float v : w_.router_bias_delta) {
+            if (!std::isfinite(v)) {
+                std::fprintf(stderr, "[deepseek4] router bias %s holds a non-finite value\n",
+                             cfg_.router_bias_path.c_str());
+                return false;
+            }
+        }
     }
     if (!cfg_.protected_experts_path.empty()) {
         std::ifstream f(cfg_.protected_experts_path);
@@ -1705,8 +1713,9 @@ bool DeepSeek4Backend::load_routing_adjustments() {
         for (auto it = j.begin(); it != j.end(); ++it) {
             int layer = -1;
             const std::string & key = it.key();
-            std::from_chars(key.data(), key.data() + key.size(), layer);
-            if (layer < 0 || layer >= w_.n_layer || !it.value().is_array()) {
+            const auto parsed = std::from_chars(key.data(), key.data() + key.size(), layer);
+            if (parsed.ec != std::errc() || parsed.ptr != key.data() + key.size() ||
+                layer < 0 || layer >= w_.n_layer || !it.value().is_array()) {
                 std::fprintf(stderr, "[deepseek4] protected experts: bad layer entry \"%s\"\n", key.c_str());
                 return false;
             }
@@ -2040,6 +2049,13 @@ bool DeepSeek4Backend::load_model() {
         requires_monolithic_model() && !heterogeneous_tp;
     if (target_backend == PlacementBackend::Hip &&
         (force_full || need_monolithic)) {
+        // A fully resident model has no expert owners to place.
+        if (!cfg_.expert_placement_path.empty()) {
+            std::fprintf(stderr, "[deepseek4] --ds4-expert-placement needs the hybrid expert tier, "
+                         "which this configuration loads fully resident; add --expert-device or "
+                         "drop the placement\n");
+            return false;
+        }
         std::fprintf(stderr,
                      "[deepseek4] monolithic execution requested "
                      "(forced=%s, paged=%s, fused_decode=%s, "
@@ -2745,6 +2761,17 @@ bool DeepSeek4Backend::size_hybrid_prefill_chunk() {
     }
     int tokens = fit(cfg_.device.gpu, per_token.target, per_token.target_fixed);
     if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(stream_cache_device_, &free_b, &total_b);
+        const size_t keep = ds4_device_headroom_bytes(stream_cache_device_) / 2;
+        if (free_b < keep + 64 * per_token.second) {
+            std::fprintf(stderr,
+                         "[deepseek4] device %d needs %.2f GiB free to prefill 64 tokens, %.2f GiB are; "
+                         "lower the expert budgets\n",
+                         stream_cache_device_, (keep + 64 * per_token.second) / 1073741824.0,
+                         free_b / 1073741824.0);
+            return false;
+        }
         tokens = std::min(tokens, fit(stream_cache_device_, per_token.second, 0));
     }
     if (tokens < chunk) {
@@ -3510,7 +3537,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     const bool want_target_model = park_target_includes_target_model(target);
 
     if (want_target_model && parked_) {
-        if (!load_model() || !apply_routing_adjustments()) {
+        if (!load_model() || !apply_routing_adjustments() || !init_engram()) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             release_vision();
             free_deepseek4_weights(w_);

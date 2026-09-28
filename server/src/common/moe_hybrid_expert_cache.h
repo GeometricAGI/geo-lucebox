@@ -401,6 +401,11 @@ private:
     struct Row {
         int32_t expert = -1;
         RowState state = RowState::Free;
+        // The expert's secondary-owner rows while it is promoted (-1: none),
+        // restored on demotion. Each owner computes every route its map
+        // covers, so a promoted expert must leave the secondary maps.
+        int32_t cold_local = -1;
+        int32_t decode_cold_local = -1;
     };
     struct Change {
         int layer = -1;

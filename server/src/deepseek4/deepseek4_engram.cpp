@@ -125,7 +125,7 @@ bool DeepSeek4EngramTable::open(const std::string & path, uint64_t offset, uint6
         if (err) *err = "engram table: " + *err;
         return false;
     }
-    if (offset + rows * (uint64_t) kRowBytes > file_.size()) {
+    if (offset > file_.size() || rows > (file_.size() - offset) / (uint64_t) kRowBytes) {
         file_.close();
         if (err) *err = "engram table: offset/rows exceed the file";
         return false;

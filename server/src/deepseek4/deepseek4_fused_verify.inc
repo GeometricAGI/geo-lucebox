@@ -1078,7 +1078,7 @@ static bool ds4_build_fused_verify_graph(
         if (window_idx >= 0) {
             // The window row this token wrote, before the next lane's write.
             const DeepSeek4CompressorState & st = lc->attn_compressor;
-            const size_t row_off = (size_t) (a_kv_start % ratio) * st.state_kv->nb[1];
+            const size_t row_off = (size_t) ds4_compressor_state_row(ratio, a_kv_start) * st.state_kv->nb[1];
             window_kv_rows.push_back(ggml_cont(ctx, ggml_view_2d(
                 ctx, st.state_kv, st.state_kv->ne[0], 1, st.state_kv->nb[1], row_off)));
             window_score_rows.push_back(ggml_cont(ctx, ggml_view_2d(

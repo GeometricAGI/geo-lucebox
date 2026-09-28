@@ -11,6 +11,9 @@
 #include "CppUnitTestFramework.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unistd.h>
@@ -180,12 +183,29 @@ struct TempTable {
     explicit TempTable(const std::vector<std::vector<uint8_t>> & rows) {
         char name[] = "/tmp/ds4_engram_XXXXXX";
         const int fd = mkstemp(name);
+        if (fd < 0) {
+            std::fprintf(stderr, "mkstemp failed: %s\n", std::strerror(errno));
+            std::abort();
+        }
         path = name;
-        if (fd < 0) return;
         std::vector<uint8_t> header(offset, 0xAB);
-        (void) !write(fd, header.data(), header.size());
-        for (const auto & row : rows) (void) !write(fd, row.data(), row.size());
+        bool ok = write_all(fd, header.data(), header.size());
+        for (const auto & row : rows) ok = ok && write_all(fd, row.data(), row.size());
         close(fd);
+        if (!ok) {
+            std::fprintf(stderr, "writing %s failed: %s\n", path.c_str(), std::strerror(errno));
+            std::abort();
+        }
+    }
+    static bool write_all(int fd, const uint8_t * p, size_t n) {
+        while (n > 0) {
+            const ssize_t w = write(fd, p, n);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) return false;
+            p += w;
+            n -= (size_t) w;
+        }
+        return true;
     }
     ~TempTable() { if (!path.empty()) unlink(path.c_str()); }
 };

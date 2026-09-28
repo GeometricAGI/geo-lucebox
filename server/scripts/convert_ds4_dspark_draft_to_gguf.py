@@ -61,6 +61,10 @@ class Shards:
                 self.headers[fn] = (8 + n, json.loads(f.read(n)))
         return self.headers[fn]
 
+    def dtype(self, name):
+        _, h = self._header(self.index[name])
+        return h[name]["dtype"]
+
     def has(self, name):
         return name in self.index
 
@@ -380,7 +384,10 @@ def main():
             if not srcs:
                 blob = np.zeros(ne, dtype=np.float32).tobytes()
             else:
-                parts = [repack_mxfp4(st, s) if ttype == T_MXFP4 else encode(q, load_f32(st, s), ttype)
+                # Packed FP4 experts repack bit-exactly; other encodings
+                # (FP8, BF16, F32) are dequantized and quantized to MXFP4.
+                parts = [repack_mxfp4(st, s) if ttype == T_MXFP4 and st.dtype(s) == "I8"
+                         else encode(q, load_f32(st, s), ttype)
                          for s in srcs]
                 blob = b"".join(parts)
             assert len(blob) == size, (gname, len(blob), size)

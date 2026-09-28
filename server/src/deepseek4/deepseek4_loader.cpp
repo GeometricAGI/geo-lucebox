@@ -192,7 +192,10 @@ uint64_t get_u64_or(gguf_context * g, const char * key, uint64_t def) {
     const enum gguf_type t = gguf_get_kv_type(g, id);
     if (t == GGUF_TYPE_UINT64) return gguf_get_val_u64(g, id);   // exact
     double v;
-    if (!get_number(g, id, v) || v < 0) return def;
+    if (!get_number(g, id, v) || !std::isfinite(v) || v < 0 || v >= 18446744073709551616.0 ||
+        v != std::floor(v)) {
+        return def;
+    }
     return (uint64_t) v;
 }
 

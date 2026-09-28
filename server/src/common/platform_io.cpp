@@ -48,7 +48,14 @@ bool ReadOnlyFile::open(const std::string & path, bool direct, std::string * err
         if (err) *err = "direct reads are not supported on this platform";
         return false;
     }
-    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    // Paths are UTF-8, as the model loader takes them.
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring wpath(wlen > 0 ? (size_t) wlen : 0, L'\0');
+    if (wlen <= 0 || MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen) != wlen) {
+        if (err) *err = "cannot open " + path;
+        return false;
+    }
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     LARGE_INTEGER sz{};
     if (h == INVALID_HANDLE_VALUE || !GetFileSizeEx(h, &sz)) {
@@ -152,6 +159,9 @@ int64_t ReadOnlyFile::read_upto(uint64_t offset, void * buf, size_t size) const 
         if (n < 0) return -1;
         if (n == 0) break;
         done += (size_t) n;
+        // A direct read comes back short only at the end of the file, and
+        // a retry from there would not be block-aligned.
+        if (direct_ && done < size) break;
     }
     return (int64_t) done;
 }

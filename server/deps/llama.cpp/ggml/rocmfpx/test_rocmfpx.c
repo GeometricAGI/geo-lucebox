@@ -63,6 +63,15 @@ static void check_fp2_sign_flip(void) {
         assert(flipped[i] == (i < QK_ROCMFP2/2 ? ref[i] : -ref[i]));
     }
 
+    // The first half flips alone too.
+    block_rocmfp2 first_half = plain;
+    first_half.e[0] |= 0x80;
+    assert(rocmfpx_validate_row_data_fp2(&first_half, sizeof(first_half)));
+    rocmfpx_dequantize_row_fp2(&first_half, flipped, QK_ROCMFP2);
+    for (int i = 0; i < QK_ROCMFP2; ++i) {
+        assert(flipped[i] == (i < QK_ROCMFP2/2 ? -ref[i] : ref[i]));
+    }
+
     signed_block.e[0] = 0xff;  // sign bit over an invalid scale
     assert(!rocmfpx_validate_row_data_fp2(&signed_block, sizeof(signed_block)));
 }

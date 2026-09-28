@@ -1882,8 +1882,9 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_engram.cpp")
-        # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or GPU.
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_engram.cpp")
+        # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or
+        # GPU. The fixture writes its tables with POSIX file calls.
         add_executable(test_ds4_engram
             test/test_ds4_engram.cpp
             src/deepseek4/deepseek4_engram.cpp

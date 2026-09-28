@@ -147,8 +147,8 @@ static void test_dspark_seed_row_restore_cpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
-static void test_ds4_ratio4_causal_visibility_formula() {
-    std::fprintf(stderr, "  test_ds4_ratio4_causal_visibility_formula ...");
+static void test_ds4_causal_visibility_formula() {
+    std::fprintf(stderr, "  test_ds4_causal_visibility_formula ...");
     constexpr int raw_window = 128;
     const auto check_chunk = [&](int kv_start, int n_tokens, int ratio = 4) {
         const int prior_rows = std::min(kv_start, raw_window);
@@ -178,7 +178,7 @@ static void test_ds4_ratio4_causal_visibility_formula() {
             // Truncated/empty histories exercise the capacity bound as well
             // as the usual complete ratio-4 history used by prefill.
             for (int capacity : {0, 1, n_comp_rows / 2, n_comp_rows}) {
-                const auto actual = ds4_ratio4_causal_visibility(
+                const auto actual = ds4_causal_visibility(
                     token, n_tokens, raw_rows, capacity, raw_window, kv_start, ratio);
                 int reference_comp = 0;
                 for (int row = 0; row < capacity; ++row) {
@@ -8997,7 +8997,7 @@ int main(int argc, char ** argv) {
     test_v41_indexer_topk(backend, "cpu");
     test_v41_candidate_blocks(backend, "cpu");
     test_v41_indexer_candidates(backend, "cpu");
-    test_ds4_ratio4_causal_visibility_formula();
+    test_ds4_causal_visibility_formula();
     test_dspark_seed_row_restore_cpu();
     test_hash_routing_lookup();
     test_raw_ring_spans_after_wrap();

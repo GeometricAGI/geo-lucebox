@@ -1,6 +1,6 @@
 #pragma once
 
-struct ds4_ratio4_visibility {
+struct ds4_causal_visibility_range {
     int raw_first;
     int raw_last;
     int comp_first;
@@ -13,7 +13,7 @@ __host__ __device__
 #endif
 // `ratio` is the layer's compression ratio: a compressed row becomes
 // visible once its `ratio` source tokens are complete (V4: 4; V4.1: 1, 2).
-static inline ds4_ratio4_visibility ds4_ratio4_causal_visibility(
+static inline ds4_causal_visibility_range ds4_causal_visibility(
         int token, int n_tokens, int raw_rows, int n_comp_rows,
         int raw_window, int kv_start, int ratio = 4) {
     const int prior_rows = raw_rows - n_tokens;

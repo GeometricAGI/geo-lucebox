@@ -349,7 +349,7 @@ __global__ static void ds4_fa_ratio4_causal_bounds_kernel(
                   (int) threadIdx.x;
     if (t >= n_tokens) return;
 
-    const auto visible = ds4_ratio4_causal_visibility(
+    const auto visible = ds4_causal_visibility(
         t, n_tokens, raw_rows, n_kv - raw_rows, raw_window, kv_start,
         causal_ratio);
     int * token_bounds = bounds + (size_t) t * 4;

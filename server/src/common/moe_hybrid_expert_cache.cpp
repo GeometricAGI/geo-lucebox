@@ -345,9 +345,15 @@ void MoeStreamedExpertCache::loader_main(Loader * self) {
             // Nobody needs it yet: a failed warm load just leaves the slot empty.
             slot_of_.erase(key(s.layer, s.expert));
             s = Slot{};
-        } else if (!ok && failed_.empty()) {
-            failed_ = "failed to load expert " + std::to_string(slots_[(size_t) slot].expert) +
-                      " of layer " + std::to_string(slots_[(size_t) slot].layer);
+        } else if (!ok) {
+            // Fails the call waiting for it. The slot holds no valid expert:
+            // drop it from the lookup so a later call loads the expert again;
+            // unreachable, it is evicted like any other once unpinned.
+            if (failed_.empty()) {
+                failed_ = "failed to load expert " + std::to_string(s.expert) +
+                          " of layer " + std::to_string(s.layer);
+            }
+            slot_of_.erase(key(s.layer, s.expert));
         }
         cv_.notify_all();
     }
@@ -649,6 +655,8 @@ MoeStreamedExpertCache::Graph * MoeStreamedExpertCache::graph_for(
 bool MoeStreamedExpertCache::pin_ready_locked(std::unique_lock<std::mutex> & lk, int layer,
                                               const int32_t * experts, size_t n,
                                               std::vector<int> & slots) {
+    // A failure belongs to the call that waited for it; this one starts clean.
+    failed_.clear();
     slots.clear();
     slots.reserve(n);
     for (size_t i = 0; i < n; ++i) {
@@ -1179,7 +1187,16 @@ uint64_t MoeExpertPromoter::apply_pending() {
             st.decode_hot_local_by_global[(size_t) row.expert] = local;
         }
         st.spare_global[(size_t) c.row] = c.promote ? row.expert : -1;
+        const size_t e = (size_t) row.expert;
         if (c.promote) {
+            if (e < st.cold_local_by_global.size()) {
+                row.cold_local = st.cold_local_by_global[e];
+                st.cold_local_by_global[e] = -1;
+            }
+            if (e < st.decode_cold_local_by_global.size()) {
+                row.decode_cold_local = st.decode_cold_local_by_global[e];
+                st.decode_cold_local_by_global[e] = -1;
+            }
             st.set_expert_hot(row.expert);
             row.state = RowState::Active;
             ++stats_.promoted;
@@ -1190,6 +1207,10 @@ uint64_t MoeExpertPromoter::apply_pending() {
                              stats_.resident, stats_.bytes / 1073741824.0);
             }
         } else {
+            if (e < st.cold_local_by_global.size()) st.cold_local_by_global[e] = row.cold_local;
+            if (e < st.decode_cold_local_by_global.size()) {
+                st.decode_cold_local_by_global[e] = row.decode_cold_local;
+            }
             st.clear_expert_hot(row.expert);
             row = Row{};
             ++stats_.demoted;
@@ -1236,10 +1257,18 @@ bool MoeExpertPromoter::copy_expert(int layer, int row, int expert) {
         uint8_t * dst = static_cast<uint8_t *>(dst_t[i]->data) + hot_row * r.size[i];
         if (from_peer && src_t[i]) {
             const auto * src = static_cast<const uint8_t *>(src_t[i]->data) + (size_t) cold_local * r.size[i];
-            if (cudaMemcpyAsync(dst, src, r.size[i], cudaMemcpyDeviceToDevice,
-                                static_cast<cudaStream_t>(stream_)) != cudaSuccess) {
+            // The secondary stack lives on another device: a peer copy.
+            cudaPointerAttributes attr{};
+            if (cudaPointerGetAttributes(&attr, src) != cudaSuccess) {
+                (void) cudaGetLastError();
                 return false;
             }
+            const cudaError_t copied = attr.device >= 0 && attr.device != opts_.device
+                ? cudaMemcpyPeerAsync(dst, opts_.device, src, attr.device, r.size[i],
+                                      static_cast<cudaStream_t>(stream_))
+                : cudaMemcpyAsync(dst, src, r.size[i], cudaMemcpyDeviceToDevice,
+                                  static_cast<cudaStream_t>(stream_));
+            if (copied != cudaSuccess) return false;
         } else {
             std::memcpy(staging + at, file + r.off[i], r.size[i]);
             if (cudaMemcpyAsync(dst, staging + at, r.size[i], cudaMemcpyHostToDevice,

@@ -279,10 +279,14 @@ bool MoeHybridStorage::empty() const {
 void MoeHybridStorage::count_routes(int layer, const int32_t * expert_ids, size_t n) {
     if (layer < 0 || (size_t)layer >= layers.size()) return;
     const MoeHybridLayerStorage & st = layers[(size_t)layer];
+    // Classify by the owner maps decode routes with (the physical ones when
+    // no decode maps are set), as the evaluator does.
+    const std::vector<int32_t> & hot = st.decode_hot_local_by_global.empty()
+        ? st.hot_local_by_global : st.decode_hot_local_by_global;
     for (size_t i = 0; i < n; ++i) {
         const int32_t gid = expert_ids[i];
-        if (gid < 0 || (size_t)gid >= st.hot_local_by_global.size()) continue;
-        if (st.hot_local_by_global[(size_t)gid] >= 0) {
+        if (gid < 0 || (size_t)gid >= hot.size()) continue;
+        if (hot[(size_t)gid] >= 0) {
             ++route_counts.primary;
         } else if (st.is_streamed(gid)) {
             ++route_counts.streamed;
