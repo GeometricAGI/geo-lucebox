@@ -257,6 +257,9 @@ void MoeStreamedExpertCache::destroy() {
     direct_file_.close();
     bulk_ = false;
     direct_all_ = false;
+    acquired_.clear();
+    staged_.clear();
+    staged_layer_ = -1;
     for (auto & kv : graphs_) kv.second.free();
     graphs_.clear();
     views_.clear();

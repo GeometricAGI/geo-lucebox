@@ -1416,7 +1416,6 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_ggml_host_mailbox_cuda PRIVATE
             ggml ${LUCE_GGML_BACKEND_TARGET} hip::host)
-        list(APPEND _raw_unit_test_targets test_ggml_host_mailbox_cuda)
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip")
         add_executable(test_ds4_maskless_prefill test/test_ds4_maskless_prefill.cpp)
@@ -2435,6 +2434,7 @@ if(LUCE_TESTS)
         test_rope_tail
         test_paged_kv_pool
         test_ds4_engram
+        test_ggml_host_mailbox_cuda
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu

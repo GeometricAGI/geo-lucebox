@@ -681,6 +681,12 @@ static bool read_deepseek4_engram(gguf_context * gctx, ggml_context * meta_ctx,
         tab.layer_id    = e.layer_ids[l];
         tab.file_offset = (uint64_t) gguf_get_data_offset(gctx) + (uint64_t) gguf_get_tensor_offset(gctx, tid);
         tab.ggml_type   = (int) gguf_get_tensor_type(gctx, tid);
+        // Rows are 256 E4M3 values and 8 E8M0 scales as raw bytes.
+        if (tab.ggml_type != GGML_TYPE_I8) {
+            err = name + " must be an I8 table (E4M3 + E8M0 rows), not " +
+                  ggml_type_name((ggml_type) tab.ggml_type);
+            return false;
+        }
         if (t) {
             tab.row_bytes = (uint32_t) ggml_row_size(t->type, t->ne[0]);
             tab.rows      = (uint64_t) t->ne[1];

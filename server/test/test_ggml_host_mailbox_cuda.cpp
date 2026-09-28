@@ -10,6 +10,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "CppUnitTestFramework.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -94,16 +96,15 @@ bool run_device(int device) {
     return ok;
 }
 
+struct HostMailboxFixture {};
+
 }  // namespace
 
-int main() {
+TEST_CASE(HostMailboxFixture, every_device_answers_each_launch) {
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess || n == 0) {
         std::fprintf(stderr, "no HIP device; skipping\n");
-        return 77;
+        return;
     }
-    bool ok = true;
-    for (int d = 0; d < n; ++d) ok = run_device(d) && ok;
-    std::fprintf(stderr, ok ? "PASS\n" : "FAIL\n");
-    return ok ? 0 : 1;
+    for (int d = 0; d < n; ++d) CHECK(run_device(d));
 }
