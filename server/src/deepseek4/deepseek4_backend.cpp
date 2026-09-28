@@ -1857,8 +1857,14 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, int secondar
                             (1ULL << 30);
             const uint64_t avail = ds4_host_available_bytes();
             const uint64_t keep = ds4_host_reserve_bytes(w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192);
-            host_bytes = ggml_backend_cuda_set_host_spill(secondary_gpu, carve_reserve,
-                                                          avail > keep ? avail - keep : 0);
+            const uint64_t host_want = avail > keep ? avail - keep : 0;
+            host_bytes = ggml_backend_cuda_set_host_spill(secondary_gpu, carve_reserve, host_want);
+            if (host_bytes + (1ULL << 30) < host_want) {
+                std::fprintf(stderr, "[deepseek4] device %d: only %.2f of %.2f GiB of host memory can be locked "
+                             "(RLIMIT_MEMLOCK); the rest of these experts stream from the drive. Run as a "
+                             "service with LimitMEMLOCK=infinity (or as root), or raise `ulimit -l`.\n",
+                             secondary_gpu, host_bytes / 1073741824.0, host_want / 1073741824.0);
+            }
             if (host_bytes > 0) {
                 std::fprintf(stderr, "[deepseek4] device %d: experts past the carve (keeping %.2f GiB free) "
                              "go to locked host memory, up to %.2f GiB (%.2f GiB available, %.2f GiB kept)\n",

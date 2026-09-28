@@ -288,10 +288,21 @@ static bool ggml_cuda_host_spill_take(void * p) {
     return true;
 }
 
-// Host bytes this process may lock: RLIMIT_MEMLOCK, its soft limit first
-// raised to the hard one.
+// Host bytes this process may lock: unlimited with CAP_IPC_LOCK (a root
+// service), else RLIMIT_MEMLOCK, its soft limit first raised to the hard one.
 static size_t ggml_cuda_lockable_host_bytes() {
 #if defined(GGML_USE_HIP) && defined(__linux__)
+    if (FILE * f = fopen("/proc/self/status", "r")) {
+        char line[256];
+        unsigned long long cap_eff = 0;
+        bool found = false;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "CapEff: %llx", &cap_eff) == 1) { found = true; break; }
+        }
+        fclose(f);
+        constexpr int cap_ipc_lock = 14;
+        if (found && (cap_eff >> cap_ipc_lock) & 1) return SIZE_MAX;
+    }
     struct rlimit rl;
     if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) return 0;
     if (rl.rlim_cur < rl.rlim_max) {
