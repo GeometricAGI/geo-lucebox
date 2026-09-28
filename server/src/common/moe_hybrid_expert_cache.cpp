@@ -18,6 +18,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace luce::common {
 
@@ -80,7 +83,13 @@ constexpr size_t kDirectAlign = 4096;
 
 // Reads [off, off + size) of `fd` (opened with O_DIRECT) into page-aligned
 // `buf` (capacity for size + 2 pages), returning where the bytes start.
+// POSIX only: on Windows the model file is not opened for direct reads and
+// every load goes through the mapping.
 static const uint8_t * direct_read(int fd, uint8_t * buf, uint64_t off, size_t size) {
+#if defined(_WIN32)
+    (void) fd; (void) buf; (void) off; (void) size;
+    return nullptr;
+#else
     const uint64_t first = off & ~(uint64_t) (kDirectAlign - 1);
     const uint64_t end = (off + size + kDirectAlign - 1) & ~(uint64_t) (kDirectAlign - 1);
     size_t done = 0;
@@ -91,6 +100,7 @@ static const uint8_t * direct_read(int fd, uint8_t * buf, uint64_t off, size_t s
         done += (size_t) n;
     }
     return buf + (off - first);
+#endif
 }
 
 struct MoeStreamedExpertCache::Loader {
@@ -230,10 +240,12 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
             return fail("failed to allocate pinned expert staging");
         }
     }
+#if !defined(_WIN32)
     if (!opts.direct_path.empty()) {
         direct_fd_ = ::open(opts.direct_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         direct_all_ = opts.direct_all && direct_fd_ >= 0;
     }
+#endif
     for (Loader * l : loaders_) threads_.emplace_back(&MoeStreamedExpertCache::loader_main, this, l);
     if (!mailbox_.init(this, (int) storage.layers.size(), cfg.n_expert, cfg.n_expert_used, err)) {
         return fail(err ? *err : "failed to set up the streamed mailbox");
@@ -261,7 +273,9 @@ void MoeStreamedExpertCache::destroy() {
         delete l;
     }
     loaders_.clear();
+#if !defined(_WIN32)
     if (direct_fd_ >= 0) ::close(direct_fd_);
+#endif
     direct_fd_ = -1;
     for (auto & kv : graphs_) kv.second.free();
     graphs_.clear();
@@ -893,15 +907,32 @@ namespace {
 constexpr size_t kMailboxLine = 64;
 
 void cpu_relax() {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
 #elif defined(__aarch64__)
     asm volatile("yield");
 #endif
 }
 
+// Acquire / release on the host-mapped mailbox words. MSVC has no
+// __atomic builtins; on x86-64 an aligned volatile access with a compiler
+// barrier gives the same ordering.
+#if defined(_MSC_VER)
+uint32_t mailbox_load(const uint32_t * p) {
+    const uint32_t v = *(const volatile uint32_t *) p;
+    _ReadWriteBarrier();
+    return v;
+}
+void mailbox_store(uint32_t * p, uint32_t v) {
+    _ReadWriteBarrier();
+    *(volatile uint32_t *) p = v;
+}
+#else
 uint32_t mailbox_load(const uint32_t * p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 void mailbox_store(uint32_t * p, uint32_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+#endif
 
 }  // namespace
 
