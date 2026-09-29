@@ -6130,8 +6130,6 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
-    // Placement generation the owner lookup rows were last written for.
-    uint64_t lut_generation = 0;
     // Posts of each layer's predicted next-layer routes (streamed mailbox).
     std::vector<ggml_tensor *> stream_predict_posts;
     std::vector<AuthoritativeRouteOutput> authoritative_routes;

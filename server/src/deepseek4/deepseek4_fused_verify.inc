@@ -255,15 +255,6 @@ static std::vector<MoeStreamedMailbox::Job> ds4_fused_stream_jobs(
 static enum ggml_status ds4_fused_graph_compute(
         const DeepSeek4Weights & w, DeepSeek4FusedDecodeGraph & fg, ggml_backend_t backend,
         MoeHybridStorage * hybrid, const char * who) {
-    // Placement moves (MoeExpertPromoter) land between launches; the owner
-    // lookup rows follow them before this launch.
-    if (hybrid && hybrid->promoter) {
-        const uint64_t generation = hybrid->promoter->apply_pending();
-        if (generation != fg.lut_generation) {
-            ds4_fused_verify_refresh_hybrid_luts(w, hybrid, fg);
-            fg.lut_generation = generation;
-        }
-    }
     MoeStreamedMailbox * mailbox =
         hybrid && hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
     const std::vector<MoeStreamedMailbox::Job> jobs =
@@ -1644,7 +1635,6 @@ static bool ds4_build_fused_verify_graph(
         }
 
         ds4_fused_verify_refresh_hybrid_luts(w, hybrid, fg);
-        fg.lut_generation = hybrid->promoter ? hybrid->promoter->generation() : 0;
     } else {
         if (!fg.sg.alloc) {
             fg.sg.alloc = ggml_gallocr_new(
