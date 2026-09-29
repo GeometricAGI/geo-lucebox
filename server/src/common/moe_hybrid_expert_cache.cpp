@@ -499,6 +499,10 @@ int MoeStreamedExpertCache::warm(const MoeHybridRoutingStats & usage) {
     warm_.clear();
     for (size_t i = 0; i < n; ++i) warm_.push_back(key(ranked[i].layer, ranked[i].expert));
     warm_next_ = 0;
+    // A new list fills empty slots only: no refill entries from an earlier
+    // bulk load.
+    refill_from_ = SIZE_MAX;
+    warm_blocked_ = false;
     warm_loads_ = warm_bytes_ = 0;
     warm_t0_ = Clock::now();
     // Warm slots count as used before anything a request touches, the most
