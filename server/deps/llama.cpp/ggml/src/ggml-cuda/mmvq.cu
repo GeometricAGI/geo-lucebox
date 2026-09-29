@@ -540,6 +540,7 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
 // switches list the mix types individually, which is how a path gets missed.
 bool ggml_cuda_qtype_has_no_mmvq(enum ggml_type type) {
     switch (type) {
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX:
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_GQH3:

@@ -4047,6 +4047,7 @@ class GGMLQuantizationType(IntEnum):
     GQH3             = 108
     GQH2_H           = 109
     GQH2_C           = 110
+    MXFP8            = 117
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4234,6 +4235,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.GQH3:             (256, 105),
     GGMLQuantizationType.GQH2_H:           (256, 73),
     GGMLQuantizationType.GQH2_C:           (256, 66),
+    GGMLQuantizationType.MXFP8:            (256, 264),
 }
 
 

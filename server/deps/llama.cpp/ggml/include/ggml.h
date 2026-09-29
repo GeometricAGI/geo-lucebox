@@ -451,7 +451,8 @@ extern "C" {
         GGML_TYPE_GQH_T_G32_R3 = 114, // research group32/r3, 56 B per 256 weights
         GGML_TYPE_DSV41_INT3_G64 = 115, // dense 3-bit codes + F32 scale, 28B/64
         GGML_TYPE_DSV41_INT3_G128 = 116, // dense 3-bit codes + F32 scale, 52B/128
-        GGML_TYPE_COUNT   = 117,
+        GGML_TYPE_MXFP8   = 117, // E4M3 codes + one E8M0 scale per 32; 264 B per 256 weights (lossless for DS4.1 native FP8)
+        GGML_TYPE_COUNT   = 118,
     };
 
     // precision
