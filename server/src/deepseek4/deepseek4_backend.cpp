@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
@@ -1969,7 +1970,6 @@ void DeepSeek4Backend::log_route_counts(const char * phase) {
                      cs.wait_us / 1000.0, cs.missed, cs.late, cs.compute_us / 1000.0,
                      100.0 * (double) cs.predicted_used / (double) std::max<uint64_t>(1, cs.predicted_of),
                      cs.predicted_of);
-        expert_cache_.reset_stats();
     } else if (c.total() > 0) {
         std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
                      "streamed %.1f%%; streamed %" PRIu64 " experts %.2f GiB: read %.0f ms, upload %.0f ms, "
@@ -1979,11 +1979,16 @@ void DeepSeek4Backend::log_route_counts(const char * phase) {
                      st.experts, gib(st.bytes), st.read_us / 1000.0, st.upload_us / 1000.0,
                      st.compute_us / 1000.0);
     }
-    c = {};
-    stream_engine_.reset_stats();
+    reset_route_counts();
     // Runtime allocations (graph caches, prefill scratch) must stay inside
     // the headroom the fit check left; report where each phase ends.
     if (moe_hybrid_) log_device_memory(phase);
+}
+
+void DeepSeek4Backend::reset_route_counts() {
+    if (moe_hybrid_) moe_hybrid_->route_counts = {};
+    stream_engine_.reset_stats();
+    if (expert_cache_.ready()) expert_cache_.reset_stats();
 }
 
 bool DeepSeek4Backend::validate_prefill_mode() const {
@@ -3323,7 +3328,16 @@ bool DeepSeek4Backend::init_hybrid_model() {
                 if (t) per_expert += ggml_nbytes(t) / (size_t) w_.n_expert;
             }
         }
-        if (per_expert > 0) spare_rows = (int) (((size_t) std::atoll(v) << 20) / per_expert);
+        // A positive whole number of MiB, at most 1 TiB; anything else keeps
+        // promotion off.
+        char * end = nullptr;
+        errno = 0;
+        const long long mb = std::strtoll(v, &end, 10);
+        if (errno == 0 && end != v && *end == '\0' && mb > 0 && mb <= (1LL << 20) && per_expert > 0) {
+            spare_rows = (int) std::min<size_t>(((size_t) mb << 20) / per_expert, (size_t) w_.n_expert);
+        } else {
+            std::fprintf(stderr, "[deepseek4] ignoring LUCE_EXPERT_PROMOTE_MB=%s: expected MiB in 1..1048576\n", v);
+        }
     }
     if (!build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
@@ -3715,6 +3729,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DeepSeek4ImagePrompt * images,
                                   int prefix_tokens,
                                   const std::vector<int> & restore_points) {
+    // A cancelled or failed request returns before logging its counts: start
+    // this one's from zero.
+    reset_route_counts();
     // Image prompts capture DSpark features from their text chunks only: the
     // image graph takes no capture hooks (see the chunking below).
     const bool capture_spec = spec_enabled_ && spec_drafter_;

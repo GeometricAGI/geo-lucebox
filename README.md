@@ -35,7 +35,7 @@
 | [KVFlash](https://www.lucebox.com/blog/laguna-xs21) | Laguna XS 2.1 33B at 256K on RTX 3090 | **152.3 tok/s** with an 8K pool |
 | [Heterogeneous execution](https://www.lucebox.com/#benchmark) | DeepSeek V4 on R9700 + Strix Halo | **86 tok/s** decode; **788 tok/s** prefill at 2K |
 | [Paged attention + continuous batching](https://www.lucebox.com/blog/continuous-batching/) | Qwen 3.8 27B + DFlash2 on R9700; DeepSeek V4 Flash AR on Strix Halo | **300.9 tok/s** total at 5 clients (Qwen); **48.4 tok/s** output-window at 4 clients (DeepSeek) |
-| [Three-tier experts](server/docs/DS41.md) | DeepSeek V4.1 Flash on R9700 + Strix Halo + SSD | **26-28 tok/s** decode on code; **134 tok/s** prefill at 4K (12K context; 23 tok/s at the 128K default) |
+| [Three-tier experts](server/docs/DS41.md) | DeepSeek V4.1 Flash on R9700 + Strix Halo + SSD | **25-26 tok/s** decode on code; **118-121 tok/s** prefill at 4K, at the profile's 128K context |
 | [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) | Qwen 3.5 0.8B on RTX 3090 | **413 tok/s**, **1.87 tok/J** |
 | [Vision (image input)](https://www.lucebox.com/blog/vision-llm-inference) | Qwen 3.8 27B vision on R9700 + DeepSeek V4 Flash Vision on Strix Halo, together | **3.2×** the image-question throughput of a DGX Spark (58 vs 18 a minute); **2.4×** faster at 8 users with the same model file |
 

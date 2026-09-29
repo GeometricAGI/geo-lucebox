@@ -310,6 +310,8 @@ private:
     bool upload_protected_routing();
     bool apply_expert_ownership(bool secondary_owner, int secondary_gpu, MoeHybridConfig & hybrid_cfg);
     void log_route_counts(const char * phase);
+    // Zeroes the per-phase route and streamed-cache counters.
+    void reset_route_counts();
     bool init_moe_tensor_parallel();
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,

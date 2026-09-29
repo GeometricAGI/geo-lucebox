@@ -298,7 +298,7 @@ private:
     // marks it loading; -1 when the warm list is done or no slot is empty.
     int  next_warm_locked();
     void loader_main(Loader * self);
-    bool load_slot(Loader & loader, int slot, uint64_t * read_us, uint64_t * upload_us);
+    bool load_slot(Loader & loader, int slot, bool bulk, uint64_t * read_us, uint64_t * upload_us);
     Graph * graph_for(int view, const MoeLayerDesc & desc, int n_routes, int n_tokens,
                       std::string * err);
     bool build_graph(Graph & g, int view, const MoeLayerDesc & desc, int n_routes,

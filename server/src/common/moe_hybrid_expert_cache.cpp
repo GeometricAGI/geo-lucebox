@@ -334,9 +334,11 @@ void MoeStreamedExpertCache::loader_main(Loader * self) {
             slot = jobs_.front();
             jobs_.pop_front();
         }
+        // Read under the lock: stage() may retouch a loading slot meanwhile.
+        const bool bulk = slots_[(size_t) slot].bulk;
         lk.unlock();
         uint64_t read_us = 0, upload_us = 0;
-        const bool ok = load_slot(*self, slot, &read_us, &upload_us);
+        const bool ok = load_slot(*self, slot, bulk, &read_us, &upload_us);
         lk.lock();
         slots_[(size_t) slot].state = SlotState::Ready;
         if (warm) {
@@ -369,7 +371,7 @@ void MoeStreamedExpertCache::loader_main(Loader * self) {
 }
 
 // A loading slot is never evicted, so its layer/expert are stable here.
-bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot,
+bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot, bool bulk,
                                        uint64_t * read_us, uint64_t * upload_us) {
     const Slot & s = slots_[(size_t) slot];
     const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) s.layer], s.expert);
@@ -384,7 +386,7 @@ bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot,
     size_t at = 0;
     size_t staged_at[3] = {0, 0, 0};
     // Bulk loads read the drive directly into page-aligned staging.
-    bool direct = (s.bulk || direct_all_) && direct_file_.is_open();
+    bool direct = (bulk || direct_all_) && direct_file_.is_open();
     for (int i = 0; i < 3 && direct; ++i) {
         if (r.size[i] == 0) continue;
         const uint8_t * src = direct_read(direct_file_, staging + at, r.off[i], r.size[i]);
@@ -577,7 +579,11 @@ int MoeStreamedExpertCache::lookup_or_load_locked(int layer, int expert, bool fr
     s.last_use = ++tick_;
     slot_of_[k] = slot;
     const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) layer], expert);
-    if (!direct_all_) advise_willneed(storage_->mmap_data, storage_->mmap_size, r);
+    // A direct read (every load, or a bulk one) bypasses the page cache:
+    // readahead would only fill it.
+    if (!direct_all_ && !(bulk_ && direct_file_.is_open())) {
+        advise_willneed(storage_->mmap_data, storage_->mmap_size, r);
+    }
     if (front) jobs_.push_front(slot); else jobs_.push_back(slot);
     stats_.loads += 1;
     stats_.bytes += r.size[0] + r.size[1] + r.size[2];
