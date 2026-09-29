@@ -687,6 +687,8 @@ bool MoeStreamedExpertCache::pin_ready_locked(std::unique_lock<std::mutex> & lk,
             cv_.wait(lk);  // every slot pinned or loading
         }
         Slot & s = slots_[(size_t) slot];
+        if (!hit) ++stats_.missed;
+        else if (s.state == SlotState::Loading && !s.demand) ++stats_.late;
         ++s.pins;
         if (!s.demand) ++stats_.hits;
         if (s.prefetched) ++stats_.prefetch_hits;

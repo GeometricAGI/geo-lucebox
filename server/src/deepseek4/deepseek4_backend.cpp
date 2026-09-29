@@ -1829,11 +1829,11 @@ static uint64_t ds4_host_available_bytes() {
 }
 
 // Host RAM kept free of the locked expert tier: the OS and this process's
-// own host buffers (a layer-major prompt keeps its HC state and embeddings,
-// (n_hc + 1) * n_embd floats per token, on the host).
+// own host buffers (a layer-major pass keeps its HC state and embeddings,
+// (n_hc + 1) * n_embd floats per token of at most one pass span, on the host).
 static uint64_t ds4_host_reserve_bytes(const DeepSeek4Weights & w, int max_ctx) {
-    return (5ULL << 30) + (uint64_t) std::max(0, max_ctx) * (uint64_t) (w.n_hc + 1) *
-                              (uint64_t) w.n_embd * sizeof(float);
+    const int span = std::min(std::max(0, max_ctx), DS4_LAYER_MAJOR_PROMPT_SPAN);
+    return (5ULL << 30) + (uint64_t) span * (uint64_t) (w.n_hc + 1) * (uint64_t) w.n_embd * sizeof(float);
 }
 
 // The streamed expert cache an integrated secondary keeps in its carve when
@@ -1959,13 +1959,14 @@ void DeepSeek4Backend::log_route_counts(const char * phase) {
         std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
                      "streamed %.1f%%; streamed %" PRIu64 " experts, cache hit %.1f%% (prefetched %.1f%%, warm %.1f%%), "
                      "loaded %" PRIu64 " (%" PRIu64 " by prefetch) %.2f GiB: read %.0f ms, upload %.0f ms, "
-                     "wait %.0f ms, compute %.0f ms; prefetch accuracy %.1f%% of %" PRIu64 "\n",
+                     "wait %.0f ms (%" PRIu64 " missed, %" PRIu64 " late), compute %.0f ms; "
+                     "prefetch accuracy %.1f%% of %" PRIu64 "\n",
                      phase, c.total(), 100.0 * (double) c.primary / total,
                      100.0 * (double) c.secondary / total, 100.0 * (double) c.streamed / total,
                      cs.experts, 100.0 * (double) cs.hits / used, 100.0 * (double) cs.prefetch_hits / used,
                      100.0 * (double) cs.warm_hits / used,
                      cs.loads, cs.prefetched, gib(cs.bytes), cs.read_us / 1000.0, cs.upload_us / 1000.0,
-                     cs.wait_us / 1000.0, cs.compute_us / 1000.0,
+                     cs.wait_us / 1000.0, cs.missed, cs.late, cs.compute_us / 1000.0,
                      100.0 * (double) cs.predicted_used / (double) std::max<uint64_t>(1, cs.predicted_of),
                      cs.predicted_of);
         expert_cache_.reset_stats();
@@ -3936,6 +3937,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             while (i + span < n_total) {
                 const int n = plan_chunk(i + span, pos + span, snapshot_saved);
                 if (!plain_chunk(i + span, n, snapshot_saved)) break;
+                if (!bands.empty() && span + n > DS4_LAYER_MAJOR_PROMPT_SPAN) break;
                 bands.push_back(n);
                 span += n;
             }

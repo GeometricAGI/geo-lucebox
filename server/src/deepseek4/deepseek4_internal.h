@@ -46,6 +46,11 @@ namespace luce::common {
 // the raw-cache rounding boundary between them.
 inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
 inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 10240;
+// Longest prompt span one layer-major pass covers. The pass keeps each token's
+// HC state and embedding on the host, so this, not the context length, bounds
+// that memory; a longer prompt runs as several passes, each reading the
+// streamed experts once.
+inline constexpr int DS4_LAYER_MAJOR_PROMPT_SPAN = 16384;
 // Chunks of four rows or fewer take the decode-shaped path, not layer-major.
 inline constexpr int DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS = 5;
 // Staged image prefill rows per batched step, shared by the pending requests.

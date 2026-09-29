@@ -232,6 +232,8 @@ public:
         uint64_t prefetched    = 0;  // loads issued by prefetch()
         uint64_t predicted_used = 0; // used experts that the prediction named
         uint64_t predicted_of  = 0;  // used experts in layers with a prediction
+        uint64_t missed        = 0;  // needed experts not cached or loading yet
+        uint64_t late          = 0;  // needed experts whose prefetch was still loading
         uint64_t read_us       = 0;  // loader time copying out of the mapping
         uint64_t upload_us     = 0;  // loader time uploading
         uint64_t wait_us       = 0;  // eval time blocked on loads
