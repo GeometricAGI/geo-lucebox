@@ -149,7 +149,10 @@ bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
     }
     const size_t fixed = 3 * (kStackTail + kAlign);
     n_slots_ = pool > fixed ? (int) ((pool - fixed) / slot_bytes_) : 0;
-    const int min_slots = std::max(16, 2 * cfg.n_expert_used);
+    // A fused launch pins one layer's distinct streamed experts at once: up
+    // to n_expert_used per token of its widest step.
+    const int min_slots = std::max({16, 2 * cfg.n_expert_used,
+                                    std::min(cfg.n_expert, cfg.n_expert_used * MoeStreamedMailbox::kMaxTokens)});
     if (n_slots_ < min_slots) {
         return fail("device " + std::to_string(device_) + " has room for " +
                     std::to_string(n_slots_) + " expert slots, need at least " +
@@ -605,12 +608,14 @@ void MoeStreamedExpertCache::stage(int layer, const int32_t * selected, int n_ro
     staged_layer_ = layer;
     // At most half the slots, so an eval chunk always finds room next to them.
     const size_t max_staged = (size_t) std::max(1, n_slots_ / 2);
+    std::vector<uint8_t> seen((size_t) cfg_.n_expert, 0);
     for (int i = 0; i < n_routes && staged_.size() < max_staged; ++i) {
-        if (!st.is_streamed(selected[i])) continue;
+        const int32_t e = selected[i];
+        if (e < 0 || e >= cfg_.n_expert || seen[(size_t) e] || !st.is_streamed(e)) continue;
+        seen[(size_t) e] = 1;
         bool hit = false;
-        const int slot = lookup_or_load_locked(layer, selected[i], /*front=*/true, &hit);
+        const int slot = lookup_or_load_locked(layer, e, /*front=*/true, &hit);
         if (slot < 0) break;  // eval waits for room instead
-        if (std::find(staged_.begin(), staged_.end(), slot) != staged_.end()) continue;
         ++slots_[(size_t) slot].pins;
         touch_locked(slot);
         staged_.push_back(slot);
