@@ -112,7 +112,7 @@ struct MoeHybridLayerStorage {
         }
         const bool cold_stack = down_cold || gate_up_cold;
         return cold_stack ? cold_local_by_global[(size_t) global_expert] < 0
-                          : cold_backend_kind != MoeHybridColdBackend::None;
+                          : n_streamed > 0 && cold_backend_kind != MoeHybridColdBackend::None;
     }
 
     // --- Bounded GPU expert cache (laguna) ---

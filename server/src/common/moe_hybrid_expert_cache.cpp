@@ -279,11 +279,11 @@ void MoeStreamedExpertCache::destroy() {
     warm_.clear();
     warm_next_ = 0;
     warm_blocked_ = false;
+    evicted_hot_.clear();
+    refill_from_ = SIZE_MAX;
     warm_loading_ = 0;
     warm_loads_ = warm_bytes_ = 0;
     predicted_.clear();
-    staged_.clear();
-    staged_layer_ = -1;
     failed_.clear();
     n_slots_ = 0;
     slot_bytes_ = stride_gate_ = stride_up_ = stride_down_ = 0;
