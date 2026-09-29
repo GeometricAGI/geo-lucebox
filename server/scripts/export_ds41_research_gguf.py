@@ -19,6 +19,30 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def copy_reference_tensor(writer, tensors, target, shape):
+    reference = tensors.get(target)
+    if reference is None:
+        # The loader accepts both native and published GGUF aliases.
+        aliases = {'engram_q.weight': 'engram_q_norm.weight',
+                   'engram_k.weight': 'engram_k_norm.weight',
+                   'engram_wkv.weight': 'engram_kv.weight'}
+        for suffix, alias in aliases.items():
+            if target.endswith('.' + suffix):
+                reference = tensors.get(target[:-len(suffix)] + alias)
+                break
+    if reference is None:
+        raise ValueError(f'Missing reference dense tensor {target}')
+    reference_shape = tuple(int(v) for v in reference.shape[::-1])
+    if reference_shape != tuple(shape):
+        raise ValueError(f'Reference dense shape mismatch for {target}: {reference_shape} != {tuple(shape)}')
+    # Reader data carries the packed byte shape. Writer converts uint8 storage
+    # dimensions back to logical dimensions; passing logical raw_shape is wrong.
+    writer.add_tensor(target, reference.data, raw_dtype=reference.tensor_type)
+    return dict(tensor=target, shape=list(shape), reference_tensor=reference.name,
+                dtype=reference.tensor_type.name, bytes=reference.n_bytes,
+                reference_payload_sha256=sha(memoryview(reference.data).cast('B')))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--artifact', type=Path, required=True)
@@ -27,6 +51,8 @@ def main():
     ap.add_argument('--engram-layout-sha256', required=True)
     ap.add_argument('--geoquant', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--dense-reference', type=Path,
+                    help='Diagnostic: copy exact non-expert tensor payloads from this GGUF; report each source digest')
     args = ap.parse_args()
     # Avoid scripts/profile.py shadowing the Python standard library profile module.
     sys.path = [p for p in sys.path if Path(p or ".").resolve() != Path(__file__).resolve().parent]
@@ -56,6 +82,12 @@ def main():
             raise ValueError(f'{label} identity mismatch')
     if args.output.exists():
         raise FileExistsError(args.output)
+    dense_reader = gguf.GGUFReader(str(args.dense_reference)) if args.dense_reference else None
+    dense_tensors = {t.name:t for t in dense_reader.tensors} if dense_reader else {}
+    dense_identity = (dict(path=str(args.dense_reference.resolve()),
+                          bytes=args.dense_reference.stat().st_size,
+                          mtime_ns=args.dense_reference.stat().st_mtime_ns)
+                      if dense_reader else None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     tmp = args.output.with_suffix(args.output.suffix + '.partial')
     if tmp.exists():
@@ -182,6 +214,9 @@ def main():
         if not matrix and target not in ('token_embd.weight','output.weight'):
             t=t.float()
         t=t.contiguous()
+        if dense_reader is not None:
+            report.append(dict(source=source, **copy_reference_tensor(w, dense_tensors, target, t.shape)))
+            continue
         if t.dtype==torch.bfloat16:
             data=t.view(torch.int16).numpy().view(np.uint16); qtype=gguf.GGMLQuantizationType.BF16
         else:
@@ -189,10 +224,14 @@ def main():
         w.add_tensor(target,data,raw_dtype=qtype)
         report.append({'source':source,'tensor':target,'shape':list(t.shape),'dtype':str(t.dtype),'bytes':t.numel()*t.element_size()})
         if n%25==0: print(f'{n+1}/{len(bindings)} {target}',flush=True)
+    if dense_identity is not None and (args.dense_reference.stat().st_size != dense_identity['bytes']
+            or args.dense_reference.stat().st_mtime_ns != dense_identity['mtime_ns']):
+        raise ValueError('Reference GGUF changed during dense export')
     w.write_header_to_file();w.write_kv_data_to_file();w.write_tensors_to_file(progress=True);w.close()
     os.replace(tmp,args.output)
     args.output.with_suffix('.export.json').write_text(json.dumps({'artifact_manifest_sha256':sha(manifest_bytes),
         'execution':'production engine; BF16-decoded weights; native FP8 activation parity not claimed',
+        'dense_reference':dense_identity,
         'gguf_bytes':args.output.stat().st_size,'tensors':report},indent=2)+'\n')
     print(f'Exported {args.output}: {args.output.stat().st_size/(1<<30):.3f} GiB',flush=True)
 

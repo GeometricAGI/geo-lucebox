@@ -1,0 +1,19 @@
+ggml_cuda_init: found 2 ROCm devices (Total VRAM: 1343344 MiB):
+  Device 0: AMD Radeon Graphics, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+  Device 1: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 1310720 MiB
+backend=ROCm0 type=bf16 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=ROCm0 type=bf16 cols=65 rows=35 tokens=3 max_error=0.0069732666 PASS
+backend=ROCm0 type=bf16 cols=5120 rows=1280 tokens=1 max_error=0.205612183 PASS
+backend=ROCm0 type=bf16 cols=1280 rows=64 tokens=32 max_error=0.124435425 PASS
+backend=ROCm0 type=f32 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=ROCm0 type=f32 cols=65 rows=35 tokens=3 max_error=3.57627869e-07 PASS
+backend=ROCm0 type=f32 cols=5120 rows=1280 tokens=1 max_error=7.62939453e-06 PASS
+backend=ROCm0 type=f32 cols=1280 rows=64 tokens=32 max_error=5.7220459e-06 PASS
+backend=ROCm1 type=bf16 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=ROCm1 type=bf16 cols=65 rows=35 tokens=3 max_error=0.0069732666 PASS
+backend=ROCm1 type=bf16 cols=5120 rows=1280 tokens=1 max_error=0.205612183 PASS
+backend=ROCm1 type=bf16 cols=1280 rows=64 tokens=32 max_error=0.124435425 PASS
+backend=ROCm1 type=f32 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=ROCm1 type=f32 cols=65 rows=35 tokens=3 max_error=3.57627869e-07 PASS
+backend=ROCm1 type=f32 cols=5120 rows=1280 tokens=1 max_error=7.62939453e-06 PASS
+backend=ROCm1 type=f32 cols=1280 rows=64 tokens=32 max_error=5.7220459e-06 PASS

@@ -9,7 +9,7 @@
 bool ggml_packed_expert_init(ggml_packed_expert * out,const ggml_tensor * w) {
     if(!out||!w||!w->data||!ggml_is_contiguous(w)||w->ne[0]<=0||w->ne[0]>INT_MAX||w->ne[1]<=0||w->ne[1]>INT_MAX||w->ne[2]!=1||w->ne[3]!=1)return false;
     const bool header=w->type==GGML_TYPE_GQH_T||w->type==GGML_TYPE_GQH_T_G32_R4||w->type==GGML_TYPE_GQH_T_G32_R3||w->type==GGML_TYPE_GQH2_H||w->type==GGML_TYPE_GQH3||w->type==GGML_TYPE_GQH4||w->type==GGML_TYPE_NVFP4||w->type==GGML_TYPE_DSV41_INT3_G64||w->type==GGML_TYPE_DSV41_INT3_G128;
-    if(!header&&w->type!=GGML_TYPE_MXFP4&&w->type!=GGML_TYPE_BF16&&w->type!=GGML_TYPE_F32)return false;
+    if(!header&&w->type!=GGML_TYPE_Q2_K&&w->type!=GGML_TYPE_IQ2_XXS&&w->type!=GGML_TYPE_MXFP4&&w->type!=GGML_TYPE_BF16&&w->type!=GGML_TYPE_F32)return false;
     if(w->ne[0]%ggml_blck_size(w->type))return false;
     ggml_packed_expert d{};d.body=uintptr_t(w->data);d.type=w->type;d.rows=w->ne[1];d.columns=w->ne[0];d.global=1.f;
     int code=0;if(header&&(!ggml_gqh_lookup(w->data,&d.global,&code)||!std::isfinite(d.global)||d.global<=0||code<0||code>=GQH_GRID_CODES))return false;

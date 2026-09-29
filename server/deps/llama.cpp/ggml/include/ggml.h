@@ -2912,8 +2912,9 @@ extern "C" {
     // sink F32 [heads], selection I32 [selected,queries] in logical raw+compressed
     // order. -1 is padding. Output BF16 matches Q shape. No RoPE is implicit.
     // Raw I8 E4M3 weight bytes [columns,rows], I8 E8M0 scales
-    // [ceil(columns/32),ceil(rows/32)], BF16 input [columns,tokens].
-    // Input activation rounding is the caller's responsibility. BF16 output.
+    // [ceil(columns/32),ceil(rows/32)], BF16 or F32 input [columns,tokens].
+    // Output matches input type; F32 avoids an implicit BF16 activation/output
+    // round trip. Input activation quantization is the caller's responsibility.
     GGML_API struct ggml_tensor * ggml_dsv41_fp8_matmul(
         struct ggml_context * ctx, struct ggml_tensor * weight,
         struct ggml_tensor * scales, struct ggml_tensor * input);

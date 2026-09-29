@@ -1,0 +1,22 @@
+{
+  "scope": "BF16/F32 I/O native-FP8 arithmetic unit qualification only; no production binding or model-quality claim",
+  "configure": [
+    "cmake",
+    "-S",
+    "/home/deano/geo-quant-staging/dsv41/q2-reference-engine-20260927/server",
+    "-B",
+    "/home/deano/geo-quant-staging/dsv41/q2-reference-engine-20260927/build-fp8-io",
+    "-G",
+    "Ninja",
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DLUCE_GPU_BACKEND=hip",
+    "-DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang",
+    "-DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++",
+    "-DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++",
+    "-DCMAKE_HIP_ARCHITECTURES=gfx1151;gfx1201",
+    "-DGGML_CUDA_NO_PEER_COPY=ON",
+    "-DGGML_HIP_NO_VMM=ON"
+  ],
+  "build": "test_ds41_fp8_io only;j4;45min ceiling",
+  "devices": "bothgfx1151andgfx1201; wait for owned model smoke PID1921955 to exit"
+}

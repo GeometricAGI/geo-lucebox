@@ -2,6 +2,7 @@
 #include "ggml-packed-experts.h"
 #include <math.h>
 #include <string.h>
+#include "ggml-packed-iq2-grid.h"
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define PACKED_HD __host__ __device__
 #else
@@ -12,6 +13,18 @@ static PACKED_HD inline float packed_bf16(float x) { uint32_t b;memcpy(&b,&x,4);
 static PACKED_HD inline float packed_e4m3(uint8_t b) {
     int e=(b>>3)&15,m=b&7;float x=e?ldexpf(1.f+m*.125f,e-7):ldexpf(float(m),-9);return b&128?-x:x;
 }
+static PACKED_HD inline float packed_half(const uint8_t * p) {
+    unsigned h=unsigned(p[0])|(unsigned(p[1])<<8);int e=(h>>10)&31,m=h&1023;
+    float value=e?ldexpf(1.f+float(m)/1024.f,e-15):ldexpf(float(m),-24);
+    return h&32768?-value:value;
+}
+static PACKED_HD inline uint64_t packed_iq2_grid(unsigned index) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return packed_iq2_grid_device[index];
+#else
+    return packed_iq2_grid_host[index];
+#endif
+}
 template<int Type = -1>
 static PACKED_HD inline float packed_weight(const ggml_packed_expert & d, int row, int col) {
     const int type = Type < 0 ? d.type : Type;
@@ -20,6 +33,22 @@ static PACKED_HD inline float packed_weight(const ggml_packed_expert & d, int ro
     float v=0;
     if(type==GGML_TYPE_BF16) {uint16_t b;memcpy(&b,body+index*2,2);v=packed_float(uint32_t(b)<<16);}
     else if(type==GGML_TYPE_F32) {memcpy(&v,body+index*4,4);}
+    else if(type==GGML_TYPE_Q2_K) {
+        int j=index%256;const uint8_t * b=body+(index/256)*84;
+        int scale=b[j/16],code=(b[16+(j/128)*32+j%32]>>(2*((j%128)/32)))&3;
+        // Match the reference's separate multiply/subtract before BF16 rounding.
+        volatile float product=(packed_half(b+80)*float(scale&15))*float(code);
+        v=product-packed_half(b+82)*float(scale>>4);
+    } else if(type==GGML_TYPE_IQ2_XXS) {
+        int j=index%256,within=j%32;const uint8_t * b=body+(index/256)*66;
+        const uint8_t * q=b+2+(j/32)*8;
+        uint32_t word=uint32_t(q[4])|(uint32_t(q[5])<<8)|(uint32_t(q[6])<<16)|(uint32_t(q[7])<<24);
+        unsigned signs=(word>>(7*(within/8)))&127;
+        unsigned parity=signs;parity^=parity>>4;parity^=parity>>2;parity^=parity>>1;signs|=(parity&1)<<7;
+        float scale=packed_half(b)*(0.5f+float(word>>28))*0.25f;
+        unsigned grid=(packed_iq2_grid(q[within/8])>>(8*(within%8)))&255;
+        v=scale*float(grid)*((signs&(1u<<(within%8)))?-1.f:1.f);
+    }
     else if(type==GGML_TYPE_DSV41_INT3_G64 || type==GGML_TYPE_DSV41_INT3_G128) {
         const int group=type==GGML_TYPE_DSV41_INT3_G64?64:128, j=index%group;
         const uint8_t * b=body+(index/group)*(4+group*3/8);float scale;memcpy(&scale,b,4);

@@ -6508,11 +6508,6 @@ void ggml_backend_cuda_get_device_description(int device, char * description, si
     snprintf(description, description_size, "%s", prop.name);
 }
 
-void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
-    ggml_cuda_set_device(device);
-
-    CUDA_CHECK(cudaMemGetInfo(free, total));
-}
 
 void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) {
@@ -6588,7 +6583,7 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t 
 
 #if defined(__linux__)
 // Helper function to get available memory from /proc/meminfo for UMA systems
-static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_kb, long * free_swap_kb) {
+static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_kb, long * free_swap_kb, long * total_memory_kb) {
     FILE * meminfo_file = nullptr;
     // 2KB buffer for reading /proc/meminfo since it does not report size info, should be enough
     const size_t BUFFER_SIZE = 2048;
@@ -6598,7 +6593,7 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
     long huge_tlb_free_pages = -1;
     long huge_tlb_page_size = -1;
 
-    if (available_memory_kb == nullptr || free_swap_kb == nullptr) {
+    if (available_memory_kb == nullptr || free_swap_kb == nullptr || total_memory_kb == nullptr) {
         return false;
     }
 
@@ -6620,6 +6615,7 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 
     *available_memory_kb = -1;
     *free_swap_kb = -1;
+    *total_memory_kb = -1;
 
     // Parse the file buffer line by line
     char * line = file_buffer.get();
@@ -6635,7 +6631,9 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
         }
 
         long value;
-        if (sscanf(line, "MemAvailable: %ld kB", &value) == 1) {
+        if (sscanf(line, "MemTotal: %ld kB", &value) == 1) {
+            *total_memory_kb = value;
+        } else if (sscanf(line, "MemAvailable: %ld kB", &value) == 1) {
             *available_memory_kb = value;
         } else if (sscanf(line, "SwapFree: %ld kB", &value) == 1) {
             *free_swap_kb = value;
@@ -6662,16 +6660,15 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 }
 #endif // defined(__linux__)
 
-static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
-    ggml_cuda_set_device(ctx->device);
+void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
+    ggml_cuda_set_device(device);
     CUDA_CHECK(cudaMemGetInfo(free, total));
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/17368
 #if defined(__linux__)
     // Check if this is a UMA (Unified Memory Architecture) system
     cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ctx->device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
     // Check if UMA is explicitly enabled via environment variable
     bool uma_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
@@ -6681,15 +6678,24 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
         // For UMA systems (like DGX Spark), use system memory info
         long available_memory_kb = 0;
         long free_swap_kb = 0;
+        long total_memory_kb = 0;
 
-        if (ggml_backend_cuda_get_available_uma_memory(&available_memory_kb, &free_swap_kb) && available_memory_kb > 0) {
-            *free = (size_t)available_memory_kb * 1024;
+        if (ggml_backend_cuda_get_available_uma_memory(&available_memory_kb, &free_swap_kb, &total_memory_kb) && available_memory_kb >= 0 && total_memory_kb > 0) {
+            *total = (size_t)total_memory_kb * 1024;
+            *free = std::min((size_t)available_memory_kb * 1024, *total);
         } else {
-            GGML_LOG_ERROR("%s: /proc/meminfo reading failed, using cudaMemGetInfo\n", __func__);
+            GGML_LOG_ERROR("%s: UMA memory query failed; refusing automatic allocation\n", __func__);
+            *free = 0;
         }
     }
 #endif // defined(__linux__)
 
+}
+
+static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    const auto * ctx = (const ggml_backend_cuda_device_context *)dev->context;
+    // Cache sizing and backend admission must see the same physical UMA budget.
+    ggml_backend_cuda_get_device_memory(ctx->device, free, total);
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
@@ -6829,7 +6835,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_is_contiguous(op->src[0]) && op->ne[0]<=INT_MAX && ggml_nrows(op)<=INT_MAX;
         case GGML_OP_DSV41_FP8_MATMUL:
             return op->src[0]->type==GGML_TYPE_I8 && op->src[1]->type==GGML_TYPE_I8 &&
-                op->src[2]->type==GGML_TYPE_BF16 && op->type==GGML_TYPE_BF16;
+                (op->src[2]->type==GGML_TYPE_BF16 || op->src[2]->type==GGML_TYPE_F32) &&
+                op->type==op->src[2]->type;
         case GGML_OP_DSV41_SPARSE_ATTN:
             return op->type==GGML_TYPE_BF16 && op->ne[0]==512 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_DSV41_CACHE_QUANT: {

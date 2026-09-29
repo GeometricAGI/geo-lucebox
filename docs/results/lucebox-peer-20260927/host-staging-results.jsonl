@@ -1,0 +1,16 @@
+{"source":0,"destination":1,"pinned":false,"bytes":20480,"iterations":200,"mismatches":0,"mean_us":26.182,"median_us":25.418,"p95_us":30.617}
+{"source":0,"destination":1,"pinned":false,"bytes":122880,"iterations":200,"mismatches":0,"mean_us":68.791,"median_us":64.501,"p95_us":84.529}
+{"source":0,"destination":1,"pinned":false,"bytes":655360,"iterations":200,"mismatches":0,"mean_us":286.850,"median_us":282.922,"p95_us":305.455}
+{"source":0,"destination":1,"pinned":false,"bytes":9953280,"iterations":200,"mismatches":0,"mean_us":3517.239,"median_us":3532.791,"p95_us":3582.104}
+{"source":0,"destination":1,"pinned":true,"bytes":20480,"iterations":200,"mismatches":0,"mean_us":23.675,"median_us":23.273,"p95_us":26.820}
+{"source":0,"destination":1,"pinned":true,"bytes":122880,"iterations":200,"mismatches":0,"mean_us":65.690,"median_us":62.668,"p95_us":83.908}
+{"source":0,"destination":1,"pinned":true,"bytes":655360,"iterations":200,"mismatches":0,"mean_us":279.878,"median_us":264.858,"p95_us":296.618}
+{"source":0,"destination":1,"pinned":true,"bytes":9953280,"iterations":200,"mismatches":0,"mean_us":3525.478,"median_us":3539.384,"p95_us":3563.018}
+{"source":1,"destination":0,"pinned":false,"bytes":20480,"iterations":200,"mismatches":0,"mean_us":24.571,"median_us":23.674,"p95_us":28.063}
+{"source":1,"destination":0,"pinned":false,"bytes":122880,"iterations":200,"mismatches":0,"mean_us":70.283,"median_us":63.169,"p95_us":101.491}
+{"source":1,"destination":0,"pinned":false,"bytes":655360,"iterations":200,"mismatches":0,"mean_us":271.748,"median_us":267.344,"p95_us":299.604}
+{"source":1,"destination":0,"pinned":false,"bytes":9953280,"iterations":200,"mismatches":0,"mean_us":3434.714,"median_us":3382.928,"p95_us":3650.092}
+{"source":1,"destination":0,"pinned":true,"bytes":20480,"iterations":200,"mismatches":0,"mean_us":29.282,"median_us":25.729,"p95_us":42.920}
+{"source":1,"destination":0,"pinned":true,"bytes":122880,"iterations":200,"mismatches":0,"mean_us":64.319,"median_us":60.273,"p95_us":83.006}
+{"source":1,"destination":0,"pinned":true,"bytes":655360,"iterations":200,"mismatches":0,"mean_us":269.333,"median_us":257.305,"p95_us":361.801}
+{"source":1,"destination":0,"pinned":true,"bytes":9953280,"iterations":200,"mismatches":0,"mean_us":3420.788,"median_us":3382.158,"p95_us":3637.398}

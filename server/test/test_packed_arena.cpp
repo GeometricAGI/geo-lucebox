@@ -39,6 +39,24 @@ int main(int argc,char ** argv)try {
         catch(const std::runtime_error &){rejected=true;}
         check(rejected,"invalid arena range accepted");check_matrix(0);check_matrix(2);
     }
-    matrices.clear();ggml_backend_buffer_free(arena);ggml_backend_free(backend);
+    matrices.clear();ggml_backend_buffer_free(arena);
+    const std::string directory=std::string(argv[2]).substr(0,std::string(argv[2]).find_last_of('/'));
+    for(auto type:{GGML_TYPE_Q2_K,GGML_TYPE_IQ2_XXS}){
+        std::ifstream raw(directory+(type==GGML_TYPE_Q2_K?"/q2_k.raw":"/iq2_xxs.raw"),std::ios::binary|std::ios::ate);
+        check(bool(raw),"Q2 fixture open failed");std::vector<uint8_t> payload(size_t(raw.tellg()));raw.seekg(0);raw.read(reinterpret_cast<char *>(payload.data()),payload.size());
+        auto budget=Dsv41PackedMatrix::allocation_bytes(backend,type,64,1024,false);
+        {
+            Dsv41PackedMatrix matrix(backend,type,64,1024,payload.data(),payload.size(),false,nullptr,0,1<<20,budget);
+            std::vector<uint8_t> got(payload.size());ggml_backend_tensor_get(matrix.tensor(),got.data(),0,got.size());
+            check(got==payload,"Q2 raw payload changed");float scale=0;int code=0;
+            check(!ggml_gqh_lookup(matrix.tensor()->data,&scale,&code),"Q2 received GQH metadata");
+        }
+        bool rejected=false;try{Dsv41PackedMatrix bad(backend,type,64,1024,payload.data(),payload.size()-1,false,nullptr,0,1<<20,budget);}catch(const std::runtime_error &){rejected=true;}
+        check(rejected,"Short Q2 payload accepted");
+        auto offset=type==GGML_TYPE_Q2_K?80:0;payload[offset]=0;payload[offset+1]=0x7c;
+        rejected=false;try{Dsv41PackedMatrix bad(backend,type,64,1024,payload.data(),payload.size(),false,nullptr,0,1<<20,budget);}catch(const std::runtime_error &){rejected=true;}
+        check(rejected,"Infinite Q2 scale accepted");
+    }
+    ggml_backend_free(backend);
     puts("packed arena: disjoint payloads/scales, accounting, borrowed lifetime and invalid ranges passed");return 0;
 }catch(const std::exception & e){fprintf(stderr,"%s\n",e.what());return 1;}

@@ -1,0 +1,7 @@
+{
+  "status": "qualified",
+  "pid": 1930406,
+  "utc": "2026-09-28T02:56:37.422031+00:00",
+  "scope": "Arithmetic unit only; grouped projection binding, runtime memory and generated quality still pending",
+  "binary_sha256": "0f62e147a2aeb0a93581189eb1242e64627a4a7afc94df2dad607a92afc7592c"
+}

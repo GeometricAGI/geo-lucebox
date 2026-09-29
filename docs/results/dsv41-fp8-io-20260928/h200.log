@@ -1,0 +1,19 @@
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 286311 MiB):
+  Device 0: NVIDIA H200, compute capability 9.0, VMM: yes, VRAM: 143155 MiB
+  Device 1: NVIDIA H200, compute capability 9.0, VMM: yes, VRAM: 143155 MiB
+backend=CUDA0 type=bf16 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=CUDA0 type=bf16 cols=65 rows=35 tokens=3 max_error=0.0069732666 PASS
+backend=CUDA0 type=bf16 cols=5120 rows=1280 tokens=1 max_error=0.205612183 PASS
+backend=CUDA0 type=bf16 cols=1280 rows=64 tokens=32 max_error=0.124435425 PASS
+backend=CUDA0 type=f32 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=CUDA0 type=f32 cols=65 rows=35 tokens=3 max_error=3.57627869e-07 PASS
+backend=CUDA0 type=f32 cols=5120 rows=1280 tokens=1 max_error=7.62939453e-06 PASS
+backend=CUDA0 type=f32 cols=1280 rows=64 tokens=32 max_error=5.7220459e-06 PASS
+backend=CUDA1 type=bf16 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=CUDA1 type=bf16 cols=65 rows=35 tokens=3 max_error=0.0069732666 PASS
+backend=CUDA1 type=bf16 cols=5120 rows=1280 tokens=1 max_error=0.205612183 PASS
+backend=CUDA1 type=bf16 cols=1280 rows=64 tokens=32 max_error=0.124435425 PASS
+backend=CUDA1 type=f32 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=CUDA1 type=f32 cols=65 rows=35 tokens=3 max_error=3.57627869e-07 PASS
+backend=CUDA1 type=f32 cols=5120 rows=1280 tokens=1 max_error=7.62939453e-06 PASS
+backend=CUDA1 type=f32 cols=1280 rows=64 tokens=32 max_error=5.7220459e-06 PASS

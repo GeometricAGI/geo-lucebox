@@ -1,0 +1,7 @@
+ggml_cuda_init: found 2 ROCm devices (Total VRAM: 1343344 MiB):
+  Device 0: AMD Radeon Graphics, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+  Device 1: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 1310720 MiB
+source=0 destination=1 async=0 mismatches=0
+source=0 destination=1 async=1 mismatches=0
+source=1 destination=0 async=0 mismatches=0
+source=1 destination=0 async=1 mismatches=0

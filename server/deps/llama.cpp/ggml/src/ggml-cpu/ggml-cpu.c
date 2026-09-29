@@ -109,9 +109,12 @@ static void ggml_compute_forward_dsv41_fp8_matmul(const struct ggml_compute_para
         int64_t row=i%rows,token=i/rows;float sum=0;
         for(int64_t col=0;col<cols;++col){
             float v=ds41_decode_fp8(((const uint8_t *)w->data)[row*cols+col],((const uint8_t *)scales->data)[(row/32)*blocks+col/32]);
-            sum+=v*ds41_from_bf16(((const uint16_t *)x->data)[token*cols+col]);
+            float activation=x->type==GGML_TYPE_F32 ? ((const float *)x->data)[token*cols+col] :
+                ds41_from_bf16(((const uint16_t *)x->data)[token*cols+col]);
+            sum+=v*activation;
         }
-        ((uint16_t *)dst->data)[i]=ds41_to_bf16(sum);
+        if(dst->type==GGML_TYPE_F32)((float *)dst->data)[i]=sum;
+        else ((uint16_t *)dst->data)[i]=ds41_to_bf16(sum);
     }
 }
 

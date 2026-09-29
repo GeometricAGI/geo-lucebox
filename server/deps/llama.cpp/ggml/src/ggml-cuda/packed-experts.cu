@@ -9,7 +9,7 @@ static __device__ __forceinline__ float packed_dot(const ggml_packed_expert & d,
     for(int col=lane;col<cols;col+=256) sum+=packed_weight<Type>(d,row,col)*input[col];
     return sum;
 }
-template<bool Typed>
+template<bool Typed, bool WarpReduce>
 static __global__ void packed_experts_kernel(const ggml_packed_expert * desc,const float * x,const int32_t * ids,float * y,int cols,int rows,int routes,int input_routes,int experts) {
     int row=blockIdx.x,route=blockIdx.y,token=blockIdx.z,lane=threadIdx.x;
     int id=ids[int64_t(token)*routes+route];
@@ -23,6 +23,8 @@ static __global__ void packed_experts_kernel(const ggml_packed_expert * desc,con
         // Routes differ per block; specialize once, outside the weight loop.
         switch (d.type) {
 #define PACKED_CASE(TYPE) case TYPE: sum=packed_dot<TYPE>(d,input,row,cols,lane); break;
+            PACKED_CASE(GGML_TYPE_Q2_K)
+            PACKED_CASE(GGML_TYPE_IQ2_XXS)
             PACKED_CASE(GGML_TYPE_GQH_T)
             PACKED_CASE(GGML_TYPE_GQH_T_G32_R4)
             PACKED_CASE(GGML_TYPE_GQH_T_G32_R3)
@@ -40,15 +42,35 @@ static __global__ void packed_experts_kernel(const ggml_packed_expert * desc,con
         }
     } else sum=packed_dot<-1>(d,input,row,cols,lane);
     __shared__ float sums[256];sums[lane]=sum;__syncthreads();
-    for(int step=128;step;step/=2){if(lane<step)sums[lane]+=sums[lane+step];__syncthreads();}
-    if(lane==0)y[(int64_t(token)*routes+route)*rows+row]=sums[0];
+    if constexpr (WarpReduce) {
+        // Preserve the old 256-lane addition tree exactly, but finish the
+        // final six levels within one warp instead of six block barriers.
+        for(int step=128;step>=64;step/=2){if(lane<step)sums[lane]+=sums[lane+step];__syncthreads();}
+        if(lane<32){
+            float value=sums[lane]+sums[lane+32];
+            for(int step=16;step;step/=2){
+#if defined(GGML_USE_HIP)
+                value+=__shfl_down(value,step,32);
+#else
+                value+=__shfl_down_sync(0xffffffffu,value,step,32);
+#endif
+            }
+            if(lane==0)y[(int64_t(token)*routes+route)*rows+row]=value;
+        }
+    } else {
+        for(int step=128;step;step/=2){if(lane<step)sums[lane]+=sums[lane+step];__syncthreads();}
+        if(lane==0)y[(int64_t(token)*routes+route)*rows+row]=sums[0];
+    }
 }
 void ggml_cuda_packed_experts(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
     GGML_ASSERT(ggml_packed_experts_is_op(dst));
     auto * d=dst->src[0];auto * x=dst->src[1];
     const char * mode=std::getenv("LUCE_DS41_TYPED_EXPERTS");
     const bool typed=mode && std::strcmp(mode,"0")!=0;
-    auto kernel=typed ? packed_experts_kernel<true> : packed_experts_kernel<false>;
+    const char * reduction=std::getenv("LUCE_DS41_PACKED_WARP_REDUCE");
+    const bool warp_reduce=reduction && std::strcmp(reduction,"0")!=0;
+    auto kernel=warp_reduce ? (typed ? packed_experts_kernel<true,true> : packed_experts_kernel<false,true>)
+                            : (typed ? packed_experts_kernel<true,false> : packed_experts_kernel<false,false>);
     kernel<<<dim3(dst->ne[0],dst->ne[1],dst->ne[2]),256,0,ctx.stream()>>>(
         static_cast<const ggml_packed_expert *>(d->data),static_cast<const float *>(x->data),static_cast<const int32_t *>(dst->src[2]->data),static_cast<float *>(dst->data),x->ne[0],dst->ne[0],dst->ne[1],x->ne[1],d->ne[1]);
     CUDA_CHECK(cudaGetLastError());

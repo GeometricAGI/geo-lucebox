@@ -1,0 +1,8 @@
+backend=CPU type=bf16 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=CPU type=bf16 cols=65 rows=35 tokens=3 max_error=0.0069732666 PASS
+backend=CPU type=bf16 cols=5120 rows=1280 tokens=1 max_error=0.205612183 PASS
+backend=CPU type=bf16 cols=1280 rows=64 tokens=32 max_error=0.124435425 PASS
+backend=CPU type=f32 cols=1 rows=1 tokens=1 max_error=0 PASS
+backend=CPU type=f32 cols=65 rows=35 tokens=3 max_error=7.15255737e-07 PASS
+backend=CPU type=f32 cols=5120 rows=1280 tokens=1 max_error=0.000183105469 PASS
+backend=CPU type=f32 cols=1280 rows=64 tokens=32 max_error=7.62939453e-05 PASS

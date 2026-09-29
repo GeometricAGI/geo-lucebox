@@ -9777,13 +9777,14 @@ struct ggml_tensor * ggml_dsv41_sparse_attn(struct ggml_context * ctx,
 struct ggml_tensor * ggml_dsv41_fp8_matmul(struct ggml_context * ctx,
         struct ggml_tensor * w,struct ggml_tensor * scales,struct ggml_tensor * x) {
     GGML_ASSERT(ctx && w && scales && x);
-    GGML_ASSERT(w->type==GGML_TYPE_I8 && scales->type==GGML_TYPE_I8 && x->type==GGML_TYPE_BF16);
+    GGML_ASSERT(w->type==GGML_TYPE_I8 && scales->type==GGML_TYPE_I8 &&
+        (x->type==GGML_TYPE_BF16 || x->type==GGML_TYPE_F32));
     GGML_ASSERT(ggml_is_contiguous(w) && ggml_is_contiguous(scales) && ggml_is_contiguous(x));
     GGML_ASSERT(w->ne[0]>0 && w->ne[0]<=INT_MAX-31 && w->ne[1]>0 && w->ne[1]<=INT_MAX-31);
     GGML_ASSERT(w->ne[2]==1 && w->ne[3]==1 && scales->ne[2]==1 && scales->ne[3]==1);
     GGML_ASSERT(scales->ne[0]==(w->ne[0]+31)/32 && scales->ne[1]==(w->ne[1]+31)/32);
     GGML_ASSERT(x->ne[0]==w->ne[0] && x->ne[1]>0 && x->ne[1]<=65535 && x->ne[2]==1 && x->ne[3]==1);
-    struct ggml_tensor * result=ggml_new_tensor_2d(ctx,GGML_TYPE_BF16,w->ne[1],x->ne[1]);
+    struct ggml_tensor * result=ggml_new_tensor_2d(ctx,x->type,w->ne[1],x->ne[1]);
     result->op=GGML_OP_DSV41_FP8_MATMUL;
     result->src[0]=w;result->src[1]=scales;result->src[2]=x;
     return result;

@@ -1,0 +1,32 @@
+{
+  "status": "passed CPU, two H200s, R9700 gfx1201 and Strix gfx1151",
+  "scope": "Native E4M3/E8M0 dense arithmetic with BF16 or F32 I/O; no full-model binding, performance or quality acceptance",
+  "checks": [
+    "1x1 F32 anti-rounding case",
+    "65x35 matrix crosses32x32 scale blocks",
+    "5120x1280 decode shape",
+    "1280x64 with32-token prefill"
+  ],
+  "source_sha256": {
+    "server/CMakeLists.txt": "afe1321eec8bc886bbe76d8e4fbd126b5bdf55c9be401d4ed4c01bb72791740d",
+    "server/test/test_ds41_fp8_io.cpp": "0f06238616a18b5ea5423df5b8f420ec9935c72391676988424e2fdcab51537c",
+    "server/deps/llama.cpp/ggml/include/ggml.h": "b51144e6380a9136bf57348cd2266ac50bcc5a07c8e1faf9df7df321d582228c",
+    "server/deps/llama.cpp/ggml/src/ggml.c": "7b7a3bc415b2e9b6799eeb65c841e859caaabc68fee72eff46e4c3ab84db508f",
+    "server/deps/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c": "7277f6a1ed3749d76117cb9c1bac27ecb0e4e0af59043b798c0b43e853afe432",
+    "server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu": "4b40805e716aa5baca7afe1f8de5c251378c4fe42e7e4ada710ba019be6091a7",
+    "server/deps/llama.cpp/ggml/src/ggml-cuda/dsv41-fp8.cu": "e06140fffa35000946c8027fb0cdfa28518734a7708c46b5d38ce1c098b56ff8"
+  },
+  "binaries_sha256": {
+    "/home/deano_macbook/geo-lucebox/.worktrees/dsv41-production-cuda/server/build-cuda-h200/deps/llama.cpp/ggml/src/ggml-cuda/libggml-cuda.so.0.9.11": "6c310163a353b610a9f049519d67fb75eabd2648f948893992ac7a6c51eea587",
+    "/home/deano_macbook/geo-lucebox/.worktrees/dsv41-production-cuda/server/build-cuda-h200/deps/llama.cpp/ggml/src/libggml-base.so.0.9.11": "b43a735ac00d3e6edf5968020b04a2ba97bca128857dd5aa155cde275077c7fa",
+    "/home/deano_macbook/geo-lucebox/.worktrees/dsv41-production-cuda/server/build-cuda-h200/deps/llama.cpp/ggml/src/libggml-cpu.so.0.9.11": "eb49ca0c6b96c2c01b4a73715542291288eadc829e795db43ae2cafdc9e2b551",
+    "/home/deano_macbook/geo-lucebox/.worktrees/dsv41-production-cuda/server/build-cuda-h200/test_ds41_fp8_io": "ce0fb554f369cad16f9760be67ac5bc34a6837143fba4ed39a1697a1dfdda48f"
+  },
+  "hip": {
+    "status": "qualified",
+    "pid": 1930406,
+    "utc": "2026-09-28T02:56:37.422031+00:00",
+    "scope": "Arithmetic unit only; grouped projection binding, runtime memory and generated quality still pending",
+    "binary_sha256": "0f62e147a2aeb0a93581189eb1242e64627a4a7afc94df2dad607a92afc7592c"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "state": {
+    "status": "qualified",
+    "pid": 1908566,
+    "utc": "2026-09-28T02:45:00.564663+00:00",
+    "scope": "Physical UMA query build loaded full reference with112GiBexpertcache and passed exact canary; not a new golden result",
+    "speed": {
+      "agent_turn_cache_hit": false,
+      "cache_hit": true,
+      "cached_prefix_tokens": 2,
+      "decode_ms": 21846.3,
+      "decode_tokens_per_sec": 5.9,
+      "effective_prompt_tokens": 28,
+      "prefill_ms": 3481.9,
+      "prefilled_tokens": 26
+    },
+    "memory": {
+      "MemTotal": 134311915520,
+      "MemAvailable": 16254382080,
+      "vram": 30739177472
+    }
+  },
+  "engine_binaries": {
+    "/home/deano/geo-quant-staging/dsv41/q2-reference-engine-20260927/build-memory-query/deps/llama.cpp/ggml/src/ggml-hip/libggml-hip.so.0.9.11": "02f49034278f7bef9d28b73e6c4c2f3c9df0e22f3b05f3ef09ab48df2b5b02a2",
+    "/home/deano/geo-quant-staging/dsv41/q2-reference-engine-20260927/build-memory-query/deps/llama.cpp/ggml/src/libggml-base.so.0.9.11": "2275b0fe86d09832dbd1dc494857756920abf6ea4756cd5acb54cb2f1f8eb89b",
+    "/home/deano/geo-quant-staging/dsv41/q2-reference-engine-20260927/build-memory-query/deps/llama.cpp/ggml/src/libggml-cpu.so.0.9.11": "e1092356637482ba3b768138211c1c16730e98a52973996309f69fbe6fd2d20c",
+    "/home/deano/geo-quant-staging/dsv41/q2-reference-engine-20260927/build-memory-query/deps/llama.cpp/ggml/src/libggml.so.0.9.11": "64212dea297504f9821bb430b1d70fbfc8b21442acc7bf6bce63f5551f89587b",
+    "/home/deano/geo-quant-staging/dsv41/q2-reference-engine-20260927/build-memory-query/luce_server": "14a7efa7f8dec20567276d3b1902f8ef4b7bb3b007d798c2e0991016894d304a"
+  },
+  "canary_answer": "4",
+  "physical_query_log_lines": [
+    "[deepseek4] device 1 memory: 110.55 of 125.09 GiB used, 14.54 GiB free (headroom 4.00 GiB)",
+    "[deepseek4] device 1 memory prefill: 111.07 of 125.09 GiB used, 14.01 GiB free (headroom 4.00 GiB)",
+    "[deepseek4] device 1 memory decode: 111.08 of 125.09 GiB used, 14.01 GiB free (headroom 4.00 GiB)",
+    "[deepseek4] device 1 memory prefill: 110.93 of 125.09 GiB used, 14.16 GiB free (headroom 4.00 GiB)",
+    "[deepseek4] device 1 memory decode: 109.95 of 125.09 GiB used, 15.14 GiB free (headroom 4.00 GiB)"
+  ],
+  "server_log_sha256": "1dab7981e406be366a95411c520658cdb376e16ef5aaeef45c4f6477b0528ecb",
+  "limits": "Full-reference smoke only; frozen13/16quality result used the preceding binary. No new quality equivalence claim."
+}

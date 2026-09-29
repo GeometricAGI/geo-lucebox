@@ -32,6 +32,8 @@ std::vector<uint8_t> read(const fs::path & path,uint64_t budget){
 }
 struct Format{ggml_type type;bool awq,palette;};
 Format format(std::string method){
+ if(method=="gguf_q2_k"||method=="ggml_q2_k")return {GGML_TYPE_Q2_K,false,false};
+ if(method=="gguf_iq2_xxs"||method=="ggml_iq2_xxs")return {GGML_TYPE_IQ2_XXS,false,false};
  if(method=="int3_g64"||method=="int3_g64_gptq")return {GGML_TYPE_DSV41_INT3_G64,false,false};
  if(method=="int3_g128"||method=="int3_g128_gptq")return {GGML_TYPE_DSV41_INT3_G128,false,false};
  if(method=="nvfp4_mse"||method=="nvfp4_gptq")return {GGML_TYPE_NVFP4,false,false};

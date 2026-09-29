@@ -2,25 +2,30 @@
 #include "deepseek4_internal.h"
 #include "common/dsv41_research_artifact.h"
 #include "common/dsv41_native_matrix.h"
+#include "common/peer_access.h"
 #include "ggml-packed-experts.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <filesystem>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstring>
 namespace luce::common {
 struct DeepSeek4PackedExperts {
     ggml_context * ctx=nullptr;
     ggml_backend_buffer_t buffer=nullptr;
-    ggml_backend_t backend=nullptr;
+    ggml_backend_t backend=nullptr, peer=nullptr;
     std::vector<ggml_backend_buffer_t> arenas;
     std::vector<std::unique_ptr<Dsv41PackedMatrix>> packed;
     std::vector<std::unique_ptr<Dsv41NativeMatrix>> native;
     ~DeepSeek4PackedExperts() {
         if(backend)ggml_backend_synchronize(backend);
+        if(peer)ggml_backend_synchronize(peer);
         packed.clear();native.clear();
         for(auto arena:arenas)ggml_backend_buffer_free(arena);
         if(buffer)ggml_backend_buffer_free(buffer);
         if(ctx)ggml_free(ctx);
+        if(peer)ggml_backend_free(peer);
     }
 };
 bool load_deepseek4_packed_experts(DeepSeek4Weights & w,const std::string & root,
@@ -44,27 +49,60 @@ bool load_deepseek4_packed_experts(DeepSeek4Weights & w,const std::string & root
     ggml_backend_dev_memory(device,&free_bytes,&total);
     const bool cpu=ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_CPU;
     uint64_t remaining=cpu?UINT64_MAX:free_bytes;
-    constexpr uint64_t reserve=3ull<<30;
+    const char * peer_name=std::getenv("LUCE_DS41_PACKED_PEER_DEVICE");
+    if(peer_name&&*peer_name){
+        auto * peer_device=ggml_backend_dev_by_name(peer_name);
+        // Direct remote pointers currently qualified only on CUDA peer-access GPUs.
+        if(cpu||!peer_device||peer_device==device||
+           std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)),"CUDA")||
+           std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(peer_device)),"CUDA"))
+            throw std::runtime_error("packed peer requires two distinct CUDA devices");
+        const char * primary_name=ggml_backend_dev_name(device);
+        if(!g_peer_access_opt_in||std::strncmp(primary_name,"CUDA",4)||std::strncmp(peer_name,"CUDA",4)||
+           !enable_peer_access_pair(std::atoi(primary_name+4),std::atoi(peer_name+4)))
+            throw std::runtime_error("packed peer requires enabled direct CUDA peer access");
+        owner->peer=ggml_backend_dev_init(peer_device,nullptr);
+        if(!owner->peer)throw std::runtime_error("packed peer backend init failed");
+    }
+    const uint64_t reserve=(owner->peer?8ull:3ull)<<30;
     if(!cpu){if(remaining<=reserve)throw std::runtime_error("no resident expert budget after 3 GiB workspace reserve");remaining-=reserve;}
     uint64_t bytes=ggml_backend_buffer_get_size(owner->buffer);
     owner->packed.reserve(size_t(w.n_layer)*w.n_expert*3);
     const char * names[]={"w1","w3","w2"};
     for(int layer=0;layer<w.n_layer;++layer){
+        ggml_backend_t load_backend=w.backend;
+        uint64_t layer_need=0;
+        for(int surface=0;surface<3;++surface)for(int expert=0;expert<w.n_expert;++expert){
+            const auto name="layers."+std::to_string(layer)+".ffn.experts."+std::to_string(expert)+"."+names[surface];
+            const auto rows=surface==2?w.n_embd:w.n_ff_exp,cols=surface==2?w.n_ff_exp:w.n_embd;
+            layer_need+=replacements.contains(name)?research.allocation_bytes(name,rows,cols,w.backend):
+                Dsv41PackedMatrix::allocation_bytes(w.backend,GGML_TYPE_MXFP4,rows,cols,false);
+        }
+        if(!cpu){
+            ggml_backend_dev_memory(device,&free_bytes,&total);
+            if(free_bytes<reserve||layer_need>free_bytes-reserve){
+                if(!owner->peer)throw std::runtime_error("resident layer exceeds primary memory; no qualified peer configured");
+                load_backend=owner->peer;
+                ggml_backend_dev_memory(ggml_backend_get_device(load_backend),&free_bytes,&total);
+            }
+            if(free_bytes<reserve||layer_need>free_bytes-reserve)throw std::runtime_error("resident layer exceeds primary and peer memory");
+            remaining=free_bytes-reserve;
+        }
         uint64_t arena_bytes=0;
         for(int surface=0;surface<3;++surface)for(int expert=0;expert<w.n_expert;++expert) {
             const std::string name="layers."+std::to_string(layer)+".ffn.experts."+std::to_string(expert)+"."+names[surface];
             if(!replacements.contains(name))continue;
-            const uint64_t size=research.allocation_bytes(name,surface==2?w.n_embd:w.n_ff_exp,surface==2?w.n_ff_exp:w.n_embd,w.backend);
+            const uint64_t size=research.allocation_bytes(name,surface==2?w.n_embd:w.n_ff_exp,surface==2?w.n_ff_exp:w.n_embd,load_backend);
             if(arena_bytes>remaining||size>remaining-arena_bytes)throw std::runtime_error("resident layer exceeds expert budget");
             arena_bytes+=size;
         }
         ggml_backend_buffer_t arena=nullptr;
         if(arena_bytes) {
             if(!cpu) {
-                ggml_backend_dev_memory(device,&free_bytes,&total);
+                ggml_backend_dev_memory(ggml_backend_get_device(load_backend),&free_bytes,&total);
                 if(free_bytes<reserve||arena_bytes>free_bytes-reserve)throw std::runtime_error("resident layer would consume workspace reserve");
             }
-            arena=ggml_backend_alloc_buffer(w.backend,arena_bytes);
+            arena=ggml_backend_alloc_buffer(load_backend,arena_bytes);
             if(!arena)throw std::runtime_error("resident layer arena allocation failed");
             owner->arenas.push_back(arena);
             ggml_backend_buffer_set_usage(arena,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -77,9 +115,9 @@ bool load_deepseek4_packed_experts(DeepSeek4Weights & w,const std::string & root
                 const std::string name="layers."+std::to_string(layer)+".ffn.experts."+std::to_string(expert)+"."+names[surface];
                 ggml_tensor * tensor=nullptr;uint64_t used=0;
                 if(replacements.contains(name)){
-                    auto p=research.load(name,rows,cols,w.backend,1ull<<30,remaining,false,arena,arena_offset);tensor=p->tensor();used=p->device_bytes();arena_offset+=used;owner->packed.push_back(std::move(p));
+                    auto p=research.load(name,rows,cols,load_backend,1ull<<30,remaining,false,arena,arena_offset);tensor=p->tensor();used=p->device_bytes();arena_offset+=used;owner->packed.push_back(std::move(p));
                 }else{
-                    auto p=native.load(name,rows,cols,w.backend,1ull<<30,remaining,false);
+                    auto p=native.load(name,rows,cols,load_backend,1ull<<30,remaining,false);
                     if(p->scales())throw std::runtime_error("native FP8 experts need an explicit scaled binding: "+name);
                     tensor=p->weight();used=p->device_bytes();owner->native.push_back(std::move(p));
                 }
@@ -87,10 +125,11 @@ bool load_deepseek4_packed_experts(DeepSeek4Weights & w,const std::string & root
                 remaining-=used;bytes+=used;
                 if(!ggml_packed_expert_init(&desc[expert],tensor))throw std::runtime_error("unsupported packed expert descriptor: "+name);
             }
+            ggml_backend_synchronize(load_backend);
             ggml_backend_tensor_set(tensors[layer][surface],desc.data(),0,desc.size()*sizeof(desc[0]));
         }
         if(arena_offset!=arena_bytes)throw std::runtime_error("resident arena accounting mismatch");
-        std::fprintf(stderr,"[deepseek41-packed] resident layer %d/%d: %.3f GiB (no eviction)\n",layer+1,w.n_layer,double(bytes)/(1ull<<30));
+        std::fprintf(stderr,"[deepseek41-packed] resident layer %d/%d: %.3f GiB (no eviction; weights=%s)\n",layer+1,w.n_layer,double(bytes)/(1ull<<30),ggml_backend_name(load_backend));
     }
     for(int layer=0;layer<w.n_layer;++layer)w.layers[layer].packed_experts=tensors[layer];
     w.packed_expert_owner=std::move(owner);

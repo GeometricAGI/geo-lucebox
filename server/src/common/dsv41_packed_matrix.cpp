@@ -31,14 +31,15 @@ Dsv41PackedMatrix::Dsv41PackedMatrix(ggml_backend_t backend,ggml_type type,uint6
  const uint8_t * payload,size_t bytes,bool palette,const float * awq,size_t count,
  uint64_t host_budget,uint64_t device_budget,ggml_backend_buffer_t arena,uint64_t arena_offset):impl_(new Impl){
  auto & p=*impl_;p.backend=backend;
+ const bool standard=type==GGML_TYPE_Q2_K||type==GGML_TYPE_IQ2_XXS;
  const bool nvfp4=type==GGML_TYPE_NVFP4;
  const unsigned int3=type==GGML_TYPE_DSV41_INT3_G64?64:type==GGML_TYPE_DSV41_INT3_G128?128:0;
  const uint64_t block_elements=int3?int3:nvfp4?64:256;
  require(backend&&rows&&columns&&columns%block_elements==0&&rows<=uint64_t(INT64_MAX)/columns,"Invalid packed matrix dimensions");
- uint32_t stride=type==GGML_TYPE_GQH_T?61:type==GGML_TYPE_GQH_T_G32_R4?57:type==GGML_TYPE_GQH_T_G32_R3?56:type==GGML_TYPE_GQH2_H?73:type==GGML_TYPE_GQH3?105:type==GGML_TYPE_GQH4?137:nvfp4?36:int3?4+int3*3/8:0;
+ uint32_t stride=standard?ggml_type_size(type):type==GGML_TYPE_GQH_T?61:type==GGML_TYPE_GQH_T_G32_R4?57:type==GGML_TYPE_GQH_T_G32_R3?56:type==GGML_TYPE_GQH2_H?73:type==GGML_TYPE_GQH3?105:type==GGML_TYPE_GQH4?137:nvfp4?36:int3?4+int3*3/8:0;
  require(stride,"Unsupported packed matrix type");
- const bool scalar=stride>=73;
- require(!(nvfp4||int3)||(!palette&&!count),"Dense research weights cannot carry palette or AWQ column metadata");
+ const bool scalar=!standard&&stride>=73;
+ require(!(standard||nvfp4||int3)||(!palette&&!count),"Dense research weights cannot carry palette or AWQ column metadata");
  require(!palette||!scalar,"Scalar GQH palette has no canonical codec");
  require(count==0||(awq&&count==columns),"Invalid packed AWQ dimensions");
  require(columns<=UINT64_MAX/4,"AWQ size overflow");
@@ -48,9 +49,16 @@ Dsv41PackedMatrix::Dsv41PackedMatrix(ggml_backend_t backend,ggml_type type,uint6
  std::vector<uint8_t> expanded;
  if(palette){expanded=dsv41_expand_scale_palette(payload,bytes,rows,columns,stride,host_budget-p.metadata);payload=expanded.data();bytes=expanded.size();}
  const uint64_t blocks=rows*(columns/block_elements);
- require(blocks<=(UINT64_MAX-5)/stride&&payload&&bytes==5+blocks*stride,"Invalid packed wire size");
+ require(blocks<=(UINT64_MAX-5)/stride&&payload&&bytes==(standard?0:5)+blocks*stride,"Invalid packed wire size");
+ if(standard)for(uint64_t b=0;b<blocks;++b){
+  const auto * block=payload+b*stride;
+  const auto finite_half=[](const uint8_t * p){return ((uint16_t(p[0])|(uint16_t(p[1])<<8))&0x7c00)!=0x7c00;};
+  require(type==GGML_TYPE_IQ2_XXS?finite_half(block):finite_half(block+80)&&finite_half(block+82),"Nonfinite Q2 block scale");
+ }
+ float global=1.f;
+ if(!standard){
  uint32_t bits=uint32_t(payload[0])|(uint32_t(payload[1])<<8)|(uint32_t(payload[2])<<16)|(uint32_t(payload[3])<<24);
- float global;std::memcpy(&global,&bits,4);
+ std::memcpy(&global,&bits,4);
  require(std::isfinite(global)&&global>0&&(scalar?payload[4]<12:payload[4]==0),"Invalid GQH global header");
  require(!int3||global==1.f,"INT3 private header must be identity");
  for(uint64_t b=0;b<blocks;++b){
@@ -62,6 +70,7 @@ Dsv41PackedMatrix::Dsv41PackedMatrix(ggml_backend_t backend,ggml_type type,uint6
   for(uint32_t i=stride-52;i<stride;++i)require(block[i]<243,"Invalid packed ternary digit");
   require(block[stride-1]<3,"Invalid packed ternary padding");
   }
+ }
  }
  p.context=ggml_init({8*ggml_tensor_overhead()+4096,nullptr,true});require(p.context,"Packed context allocation failed");
  p.weight=ggml_new_tensor_2d(p.context,type,int64_t(columns),int64_t(rows));
@@ -85,9 +94,9 @@ Dsv41PackedMatrix::Dsv41PackedMatrix(ggml_backend_t backend,ggml_type type,uint6
  }
  auto * base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(p.buffer))+arena_offset;
  require(ggml_backend_tensor_alloc(p.buffer,p.weight,base)==GGML_STATUS_SUCCESS,"Packed tensor binding failed");
- ggml_backend_tensor_set(p.weight,payload+5,0,bytes-5);
+ ggml_backend_tensor_set(p.weight,payload+(standard?0:5),0,bytes-(standard?0:5));
  if(scales){require(ggml_backend_tensor_alloc(p.buffer,scales,base+offset)==GGML_STATUS_SUCCESS,"Packed scale binding failed");ggml_backend_tensor_set(scales,awq,0,count*4);}
- ggml_gqh_register(p.weight->data,ggml_nbytes(p.weight),global,payload[4]);p.registered=true;
+ if(!standard){ggml_gqh_register(p.weight->data,ggml_nbytes(p.weight),global,payload[4]);p.registered=true;}
  if(scales)require((scalar?ggml_gqh_register_research_input_scale:ggml_gqh_register_ternary_input_scale)(p.weight,awq,int64_t(columns),scales->data),"Packed AWQ registration failed");
 }
 uint64_t Dsv41PackedMatrix::allocation_bytes(ggml_backend_t backend,ggml_type type,uint64_t rows,uint64_t columns,bool awq) {
