@@ -1610,6 +1610,9 @@ if(LUCE_TESTS)
     add_test(NAME test_ds41_mxfp8_cpu COMMAND test_ds41_mxfp8 cpu)
     add_test(NAME test_ds41_mxfp8_gpu COMMAND test_ds41_mxfp8 gpu)
     set_tests_properties(test_ds41_mxfp8_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    # Kernel timing/exactness for the DS4.1 routed-expert decode matvec (not a pass/fail test).
+    add_executable(bench_ds41_iq_mmid test/bench_ds41_iq_mmid.cpp)
+    target_link_libraries(bench_ds41_iq_mmid PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
