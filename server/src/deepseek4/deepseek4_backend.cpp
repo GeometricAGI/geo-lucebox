@@ -1618,7 +1618,14 @@ bool DeepSeek4Backend::validate_model_features() const {
 #if !defined(LUCE_BACKEND_HIP) && !defined(GGML_USE_HIP)
     // Qualified on ROCm only: on CUDA the candidate-block selection (past
     // 16,384 compressed rows) does not match the reference yet.
-    unsupported = "a CUDA build (V4.1 is qualified on ROCm)";
+    // LUCE_DS41_ALLOW_CUDA=1 runs it anyway for research evaluation (H200
+    // quality panels), where that divergence is accepted and reported.
+    if (env_flag_enabled("LUCE_DS41_ALLOW_CUDA")) {
+        std::fprintf(stderr, "[deepseek4] V4.1 on CUDA allowed by LUCE_DS41_ALLOW_CUDA: candidate-block "
+                     "selection past 16,384 compressed rows is not qualified against the reference\n");
+    } else {
+        unsupported = "a CUDA build (V4.1 is qualified on ROCm; LUCE_DS41_ALLOW_CUDA=1 for research)";
+    }
 #endif
     if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
         unsupported = "fused decode";
