@@ -8930,7 +8930,7 @@ bool DeepSeek4PrefillPass::run_layers(int count, std::string & error) {
 
         // HC pre over every row of every sequence.
         ggml_tensor * norm_hc = ggml_rms_norm(ctx, state_in_, w.hc_eps);
-        ggml_tensor * mix_attn = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, fc.fn_attn_f16[(size_t) il], norm_hc),
+        ggml_tensor * mix_attn = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, fc.fn_attn_weights[(size_t) il], norm_hc),
                                                  mix_dim, total);
         ggml_tensor * pre_attn = ggml_ds4_hc_pre(
             ctx, mix_attn, ds4_fused_hc_base_f32(ctx, L.hc_attn_base), state_in_, n_hc,
@@ -8962,7 +8962,7 @@ bool DeepSeek4PrefillPass::run_layers(int count, std::string & error) {
 
         // HC pre -> one MoE FFN over all rows.
         norm_hc = ggml_rms_norm(ctx, hc_after_attn, w.hc_eps);
-        ggml_tensor * mix_ffn = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, fc.fn_ffn_f16[(size_t) il], norm_hc),
+        ggml_tensor * mix_ffn = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, fc.fn_ffn_weights[(size_t) il], norm_hc),
                                                 mix_dim, total);
         ggml_tensor * pre_ffn = ggml_ds4_hc_pre(
             ctx, mix_ffn, ds4_fused_hc_base_f32(ctx, L.hc_ffn_base), hc_after_attn, n_hc,
