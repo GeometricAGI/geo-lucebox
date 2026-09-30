@@ -1957,6 +1957,9 @@ if(LUCE_TESTS)
     add_test(NAME test_ds41_mxfp8_cpu COMMAND test_ds41_mxfp8 cpu)
     add_test(NAME test_ds41_mxfp8_gpu COMMAND test_ds41_mxfp8 gpu)
     set_tests_properties(test_ds41_mxfp8_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    # Kernel timing/exactness for the DS4.1 routed-expert decode matvec (not a pass/fail test).
+    add_executable(bench_ds41_iq_mmid test/bench_ds41_iq_mmid.cpp)
+    target_link_libraries(bench_ds41_iq_mmid PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
 
     add_executable(test_backend_memory test/test_backend_memory.cpp)
     target_link_libraries(test_backend_memory PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
