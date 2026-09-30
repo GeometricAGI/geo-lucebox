@@ -2099,6 +2099,15 @@ bool DeepSeek4Backend::load_model() {
                 cfg_.model_path.c_str());
             return false;
         }
+    } else if (env_flag_enabled("LUCE_DS4_FORCE_HYBRID")) {
+        // Measurement switch: serve a model that would fit on the hybrid expert
+        // path (with LUCE_EXPERT_BUDGET_MB and/or --ds4-expert-placement) so the
+        // hybrid tier's own cost can be timed against the fully resident load.
+        std::fprintf(stderr, "[deepseek4] hybrid expert load forced by LUCE_DS4_FORCE_HYBRID\n");
+        if (!init_hybrid_model()) {
+            std::fprintf(stderr, "[deepseek4] hybrid mode failed: %s\n", cfg_.model_path.c_str());
+            return false;
+        }
     } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[deepseek4] full model load failed, trying hybrid mode...\n");
         if (!init_hybrid_model()) {
