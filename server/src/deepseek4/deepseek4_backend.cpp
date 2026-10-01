@@ -4462,8 +4462,12 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // An image prompt whose last image leaves no captured text rows gives the
     // drafter no context to start from; decode that request plainly.
     const bool image_without_draft_context = req.images && spec_feat_window_.empty();
+    // Diagnostic: LUCE_DS4_SPEC_CAPTURE_ONLY=1 keeps the drafter loaded (so the prompt's final band still
+    // prefills through the feature-capture graph) but decodes plain AR, separating the capture band's
+    // effect on the KV from the speculative verify's when their outputs differ from a no-drafter run.
+    static const bool spec_capture_only = env_flag_enabled("LUCE_DS4_SPEC_CAPTURE_ONLY");
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 && !image_without_draft_context &&
-        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
+        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar && !spec_capture_only) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
             return result;
