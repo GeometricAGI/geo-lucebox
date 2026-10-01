@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <string>
 #include <vector>
 
 namespace luce::common {
@@ -84,7 +85,7 @@ public:
             return (exact && *exact && *exact != '0') ||
                    (sequential && *sequential && *sequential != '0');
         }();
-        if (seq_verify) {
+        if (seq_verify || force_sequential_) {
             boundary_checkpoint_.clear();
             std::vector<int32_t> am_all;
             std::vector<float> feat_all;
@@ -117,17 +118,56 @@ public:
             return true;
         }
         std::vector<int32_t> am;
+        if (diag_plain_decode_) {
+            // Diagnostic: exactly the call the plain AR decode loop makes (deepseek4_step_layer_range with
+            // no verify hooks, decode-graph reuse, the hybrid storage and expert runtime), one token at a time.
+            std::vector<int32_t> am_all;
+            for (int t = 0; t < n; ++t) {
+                std::vector<float> logits, hc_state;
+                if (!deepseek4_step_layer_range(backend_, device_, w_, cache_, hc_state,
+                                                embed_buf_.data() + (size_t) t * w_.n_embd, 1, base_pos + t,
+                                                0, w_.n_layer, &logits, tokens.data() + t, telemetry_,
+                                                /*allow_decode_graph_reuse=*/true, nullptr,
+                                                moe_hybrid_, expert_runtime_, routing_stats_)) return false;
+                if ((int) logits.size() < w_.n_vocab) return false;
+                int best = 0;
+                for (int i = 1; i < w_.n_vocab; i++) if (logits[(size_t) i] > logits[(size_t) best]) best = i;
+                am_all.push_back(best);
+            }
+            last_tok = am_all.back();
+            verify_n_ = n;
+            if (all_argmax) *all_argmax = std::move(am_all);
+            return true;
+        }
+        if (diag_plain_ar_) {
+            // Diagnostic: the ordinary AR decode step (no verify hooks at all), one token at a time.
+            std::vector<int32_t> am_all;
+            for (int t = 0; t < n; ++t) {
+                std::vector<float> logits;
+                if (!deepseek4_step(backend_, device_, w_, cache_, embed_buf_.data() + (size_t) t * w_.n_embd, 1,
+                                    base_pos + t, logits, moe_hybrid_, tokens.data() + t, nullptr, telemetry_,
+                                    routing_stats_, nullptr, expert_runtime_, true)) return false;
+                int best = 0;
+                for (int i = 1; i < w_.n_vocab; i++) if (logits[(size_t) i] > logits[(size_t) best]) best = i;
+                am_all.push_back(best);
+            }
+            last_tok = am_all.back();
+            verify_n_ = n;
+            if (all_argmax) *all_argmax = std::move(am_all);
+            return true;
+        }
+        static const std::vector<int> no_capture;
         // Reuse the normal cached graph for q==1 so reference verification has
         // exactly the same target arithmetic as ordinary AR decode.
-        if (!deepseek4_dspark_verify_forward(backend_, device_, w_, cache_, capture_ids_,
+        if (!deepseek4_dspark_verify_forward(backend_, device_, w_, cache_, diag_no_capture_ ? no_capture : capture_ids_,
                                              embed_buf_.data(), tokens.data(), n, base_pos, am,
                                              keep_logits_ ? &verify_logits_ : nullptr,
                                              verify_features_, telemetry_,
-                                             /*allow_graph_reuse=*/true,
+                                             /*allow_graph_reuse=*/!diag_no_graph_reuse_,
                                              moe_hybrid_, expert_runtime_,
                                              routing_stats_,
-                                             &boundary_checkpoint_,
-                                             &window_rows_)) {
+                                             diag_no_window_ ? nullptr : &boundary_checkpoint_,
+                                             diag_no_window_ ? nullptr : &window_rows_)) {
             return false;
         }
         if (am.empty()) return false;
@@ -206,6 +246,190 @@ public:
     const std::vector<int> & capture_layer_ids() const override { return capture_ids_; }
 
     void set_keep_logits(bool b) { keep_logits_ = b; }
+
+    static bool diag_tensor_diff(ggml_tensor * a, ggml_tensor * b, size_t & nbytes_diff, float & max_abs) {
+        nbytes_diff = 0; max_abs = 0.0f;
+        if (!a || !b) { nbytes_diff = (a || b) ? 1 : 0; return nbytes_diff != 0; }
+        const size_t na = ggml_nbytes(a), nb = ggml_nbytes(b);
+        if (na != nb) { nbytes_diff = na > nb ? na - nb : nb - na; return true; }
+        std::vector<uint8_t> x(na), y(nb);
+        ggml_backend_tensor_get(a, x.data(), 0, na);
+        ggml_backend_tensor_get(b, y.data(), 0, nb);
+        for (size_t i = 0; i < na; ++i) if (x[i] != y[i]) ++nbytes_diff;
+        if (nbytes_diff && a->type == GGML_TYPE_F32) {
+            const float * fx = (const float *) x.data(); const float * fy = (const float *) y.data();
+            for (size_t i = 0; i < na / 4; ++i) max_abs = std::max(max_abs, std::fabs(fx[i] - fy[i]));
+        }
+        return nbytes_diff != 0;
+    }
+
+    // Compare two cache snapshots field by field; prints the differing ones.
+    void diag_compare_snapshots(const DeepSeek4Snapshot & a, const DeepSeek4Snapshot & b, long step) {
+        int printed = 0, differing = 0;
+        auto report = [&](const char * field, int layer, ggml_tensor * ta, ggml_tensor * tb) {
+            size_t nd; float m;
+            if (diag_tensor_diff(ta, tb, nd, m)) {
+                ++differing;
+                if (printed++ < 16)
+                    std::fprintf(stderr, "[ds4-spec-diag-cache] step=%ld layer=%d %s: %zu bytes differ (max_abs %.3g, %zu bytes, type %s)\n",
+                                 step, layer, field, nd, m, ta ? ggml_nbytes(ta) : 0, ta ? ggml_type_name(ta->type) : "?");
+            }
+        };
+        if (a.cur_pos != b.cur_pos) std::fprintf(stderr, "[ds4-spec-diag-cache] step=%ld cur_pos %d vs %d\n", step, a.cur_pos, b.cur_pos);
+        report("hc_state", -1, a.hc_state_snap, b.hc_state_snap);
+        for (size_t l = 0; l < a.layers.size() && l < b.layers.size(); ++l) {
+            const auto & x = a.layers[l]; const auto & y = b.layers[l];
+            if (x.n_comp != y.n_comp || x.n_index_comp != y.n_index_comp)
+                std::fprintf(stderr, "[ds4-spec-diag-cache] step=%ld layer=%zu counters n_comp %d vs %d, n_index_comp %d vs %d\n",
+                             step, l, x.n_comp, y.n_comp, x.n_index_comp, y.n_index_comp);
+            report("raw_kv", (int) l, x.raw_kv, y.raw_kv);
+            report("comp_kv", (int) l, x.comp_kv, y.comp_kv);
+            report("index_comp_kv", (int) l, x.index_comp_kv, y.index_comp_kv);
+            report("attn_compressor.state_kv", (int) l, x.attn_compressor.state_kv, y.attn_compressor.state_kv);
+            report("attn_compressor.state_score", (int) l, x.attn_compressor.state_score, y.attn_compressor.state_score);
+            report("indexer_compressor.state_kv", (int) l, x.indexer_compressor.state_kv, y.indexer_compressor.state_kv);
+            report("indexer_compressor.state_score", (int) l, x.indexer_compressor.state_score, y.indexer_compressor.state_score);
+        }
+        std::fprintf(stderr, "[ds4-spec-diag-cache] step=%ld summary: %d differing fields\n", step, differing);
+    }
+
+    // Diagnostic (LUCE_DS4_SPEC_DIAG): from the same KV state, run the batched verify and then the same
+    // tokens as single-token forwards, capturing every layer's mean-over-HC state and the logits in both,
+    // and report per token the first layer that differs and whether the argmax differs. Leaves the cache
+    // as it was.
+    bool diag_batch_vs_sequential(const std::vector<int32_t> & tokens, int base_pos, long step) {
+        if (!snapshot_kv()) return false;
+        const std::vector<int> saved_ids = capture_ids_;
+        const bool saved_keep = keep_logits_;
+        // LUCE_DS4_SPEC_DIAG_RAW: keep the drafter's capture layers and logits setting (the production
+        // verify call) instead of capturing every layer; compares argmax only.
+        static const bool diag_raw = [] { const char * v = std::getenv("LUCE_DS4_SPEC_DIAG_RAW"); return v && *v && *v != '0'; }();
+        // LUCE_DS4_SPEC_DIAG_MODE=logits: production captures but logits kept; =capture: all layers captured, no logits
+        static const std::string diag_mode = [] { const char * v = std::getenv("LUCE_DS4_SPEC_DIAG_MODE"); return std::string(v ? v : ""); }();
+        const bool variant_mode = diag_mode == "ar" || diag_mode == "plain" || diag_mode == "nocapture" || diag_mode == "nowindow" || diag_mode == "noreuse";
+        if (variant_mode) {
+            // production sequential verify (force_sequential_) vs the named variant of it, same state
+            int lt2 = -1;
+            std::vector<int32_t> am_p, am_v;
+            // "plain" compares the production verify as the loop runs it (batched); the others the sequential one.
+            const bool reference_batched = diag_mode == "plain";
+            const char * reference_label = reference_batched ? "production-batched" : "production-seq";
+            force_sequential_ = !reference_batched;
+            bool ok2 = verify_batch(tokens, base_pos, lt2, &am_p);
+            DeepSeek4Snapshot after_p, after_v;
+            ok2 = ok2 && deepseek4_snapshot_save(cache_, snap_backend_, after_p);
+            ok2 = ok2 && restore_kv();
+            if (diag_mode == "ar") diag_plain_ar_ = true;
+            if (diag_mode == "plain") diag_plain_decode_ = true;
+            if (diag_mode == "nocapture") diag_no_capture_ = true;
+            if (diag_mode == "nowindow") diag_no_window_ = true;
+            if (diag_mode == "noreuse") diag_no_graph_reuse_ = true;
+            ok2 = ok2 && verify_batch(tokens, base_pos, lt2, &am_v);
+            diag_plain_ar_ = diag_plain_decode_ = diag_no_capture_ = diag_no_window_ = diag_no_graph_reuse_ = false;
+            force_sequential_ = false;
+            ok2 = ok2 && deepseek4_snapshot_save(cache_, snap_backend_, after_v);
+            if (ok2 && step < 3) {
+                std::fprintf(stderr, "[ds4-spec-diag-cache] step=%ld cache after %s verify vs after %s:\n", step, reference_label, diag_mode.c_str());
+                diag_compare_snapshots(after_p, after_v, step);
+            }
+            free_deepseek4_snapshot(after_p);
+            free_deepseek4_snapshot(after_v);
+            ok2 = ok2 && restore_kv();
+            verify_features_.clear(); verify_logits_.clear();
+            if (!ok2) return false;
+            for (size_t t = 0; t < tokens.size(); ++t)
+                std::fprintf(stderr, "[ds4-spec-diag] step=%ld pos=%d slot=%zu tok=%d argmax %s=%d %s=%d%s\n",
+                             step, base_pos, t, tokens[t], reference_label, am_p[t], diag_mode.c_str(), am_v[t], am_p[t] == am_v[t] ? "" : " DIFFER");
+            return true;
+        }
+        if (diag_mode == "logits") {
+            keep_logits_ = true;
+        } else if (diag_mode == "capture") {
+            capture_ids_.clear();
+            for (int l = 0; l < w_.n_layer; ++l) capture_ids_.push_back(l);
+        } else if (!diag_raw) {
+            capture_ids_.clear();
+            for (int l = 0; l < w_.n_layer; ++l) capture_ids_.push_back(l);
+            keep_logits_ = true;
+        }
+        int lt = -1;
+        std::vector<int32_t> am_b, am_s;
+        std::vector<float> attn_b, attn_s;
+        ds4_set_diag_attn_capture(&attn_b);
+        bool ok = verify_batch(tokens, base_pos, lt, &am_b);
+        std::vector<float> fb = verify_features_, lb = verify_logits_;
+        DeepSeek4Snapshot after_batched, after_sequential;
+        ok = ok && deepseek4_snapshot_save(cache_, snap_backend_, after_batched);
+        ok = ok && restore_kv();
+        force_sequential_ = true;
+        ds4_set_diag_attn_capture(&attn_s);
+        ok = ok && verify_batch(tokens, base_pos, lt, &am_s);
+        force_sequential_ = false;
+        ds4_set_diag_attn_capture(nullptr);
+        std::vector<float> fs = verify_features_, ls = verify_logits_;
+        ok = ok && deepseek4_snapshot_save(cache_, snap_backend_, after_sequential);
+        if (ok && step < 4) diag_compare_snapshots(after_batched, after_sequential, step);
+        free_deepseek4_snapshot(after_batched);
+        free_deepseek4_snapshot(after_sequential);
+        ok = ok && restore_kv();
+        capture_ids_ = saved_ids;
+        keep_logits_ = saved_keep;
+        verify_features_.clear();
+        verify_logits_.clear();
+        if (!ok) return false;
+        const int n = (int) tokens.size();
+        const size_t nl = (size_t) w_.n_layer, ne = (size_t) w_.n_embd, nv = (size_t) w_.n_vocab;
+        if (step < 2) std::fprintf(stderr, "[ds4-spec-diag] step=%ld attention captures: batched %zu floats, sequential %zu floats (expect %zu)\n",
+                                   step, attn_b.size(), attn_s.size(), (size_t) n * nl * ne);
+        if (diag_raw || !diag_mode.empty()) {
+            for (int t = 0; t < n; ++t)
+                std::fprintf(stderr, "[ds4-spec-diag] step=%ld pos=%d slot=%d tok=%d argmax batch=%d seq=%d%s (raw production verify)\n",
+                             step, base_pos, t, tokens[t], am_b[t], am_s[t], am_b[t] == am_s[t] ? "" : " MISMATCH");
+            return true;
+        }
+        if (fb.size() != fs.size() || fb.size() != (size_t) n * nl * ne || lb.size() < (size_t) n * nv || ls.size() < (size_t) n * nv) {
+            std::fprintf(stderr, "[ds4-spec-diag] step=%ld size mismatch fb=%zu fs=%zu lb=%zu ls=%zu\n", step, fb.size(), fs.size(), lb.size(), ls.size());
+            return false;
+        }
+        for (int t = 0; t < n; ++t) {
+            int first_layer = -1; float first_max = 0.0f, last_max = 0.0f;
+            for (size_t l = 0; l < nl; ++l) {
+                float m = 0.0f;
+                for (size_t d = 0; d < ne; ++d) m = std::max(m, std::fabs(fb[((size_t) t * nl + l) * ne + d] - fs[((size_t) t * nl + l) * ne + d]));
+                if (m > 0.0f && first_layer < 0) { first_layer = (int) l; first_max = m; }
+                if (l + 1 == nl) last_max = m;
+            }
+            float lmax = 0.0f;
+            for (size_t v = 0; v < nv; ++v) lmax = std::max(lmax, std::fabs(lb[(size_t) t * nv + v] - ls[(size_t) t * nv + v]));
+            std::fprintf(stderr, "[ds4-spec-diag] step=%ld pos=%d slot=%d tok=%d argmax batch=%d seq=%d%s first_diff_layer=%d (max_abs %.3g) last_layer_max_abs=%.3g logits_max_abs=%.3g\n",
+                         step, base_pos, t, tokens[t], am_b[t], am_s[t], am_b[t] == am_s[t] ? "" : " MISMATCH",
+                         first_layer, first_max, last_max, lmax);
+            if (step < 2 && attn_b.size() == (size_t) n * nl * ne && attn_s.size() == attn_b.size()) {
+                // batched capture is layer-major ([layer][token]); the sequential one is token-major ([token][layer])
+                std::fprintf(stderr, "[ds4-spec-diag-attn] step=%ld slot=%d attention-output max_abs per layer:", step, t);
+                for (size_t l = 0; l < nl; ++l) {
+                    float m = 0.0f;
+                    for (size_t d = 0; d < ne; ++d)
+                        m = std::max(m, std::fabs(attn_b[(l * (size_t) n + (size_t) t) * ne + d] - attn_s[((size_t) t * nl + l) * ne + d]));
+                    std::fprintf(stderr, " L%zu=%.2g", l, m);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            if (step < 2) {
+                std::fprintf(stderr, "[ds4-spec-diag-layers] step=%ld slot=%d max_abs per layer:", step, t);
+                for (size_t l = 0; l < nl; ++l) {
+                    float m = 0.0f, ref = 0.0f;
+                    for (size_t d = 0; d < ne; ++d) {
+                        m = std::max(m, std::fabs(fb[((size_t) t * nl + l) * ne + d] - fs[((size_t) t * nl + l) * ne + d]));
+                        ref = std::max(ref, std::fabs(fs[((size_t) t * nl + l) * ne + d]));
+                    }
+                    std::fprintf(stderr, " L%zu=%.2g/%.2g", l, m, ref);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        return true;
+    }
     void set_telemetry(DeepSeek4StepTelemetry * t) { telemetry_ = t; }
     const std::vector<float> & last_features() const { return verify_features_; }
     int last_verify_n() const { return verify_n_; }
@@ -258,6 +482,9 @@ private:
     DeepSeek4Snapshot snap_{};
     DeepSeek4StepTelemetry * telemetry_ = nullptr;
     bool keep_logits_ = false;
+    bool force_sequential_ = false;   // diag_batch_vs_sequential
+    bool diag_plain_ar_ = false, diag_no_capture_ = false, diag_no_window_ = false, diag_no_graph_reuse_ = false;
+    bool diag_plain_decode_ = false;  // the production AR decode call, no verify hooks
     int verify_n_ = 0;
     std::vector<float> embed_buf_;
     std::vector<float> verify_logits_;
@@ -1295,6 +1522,11 @@ bool run_deepseek4_dspark_spec_decode(
                 std::fprintf(stderr,
                     "[ds4-spec] draft overlap probe launch failed; disabling\n");
             }
+        }
+
+        static const bool spec_diag = spec_env_flag("LUCE_DS4_SPEC_DIAG");
+        if (spec_diag && q >= 2 && !target.diag_batch_vs_sequential(draft_tok, pos, steps)) {
+            std::fprintf(stderr, "[ds4-spec-diag] step=%ld diagnostic failed\n", steps);
         }
 
         // ── Rollback state save (cheap) or legacy full snapshot ──

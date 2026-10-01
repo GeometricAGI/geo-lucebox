@@ -5180,6 +5180,11 @@ static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
     return result;
 }
 
+// Diagnostic: when set, every layer's host-side attention output of a forward is appended here
+// ([n_tokens x n_embd] per layer, layer-major), for comparing the batched verify with decode.
+static thread_local std::vector<float> * g_ds4_diag_attn_capture = nullptr;
+void ds4_set_diag_attn_capture(std::vector<float> * out) { g_ds4_diag_attn_capture = out; }
+
 static bool ds4_hc_cuda_enabled() {
 #if defined(LUCE_BACKEND_CUDA)
     return true;
@@ -5305,10 +5310,23 @@ static void hc_pre_batch(std::vector<float> & working,
         std::vector<float> mix((size_t) mix_dim * (size_t) n_tokens);
         bool device_mix = false;
 #if defined(LUCE_BACKEND_CUDA)
-        device_mix = ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data &&
-            (fn_tensor->type==GGML_TYPE_F16 || fn_tensor->type==GGML_TYPE_F32) &&
-            deepseek4_cuda_hc_pre_mix_batch(hc_state, n_tokens, fn_tensor->data,
-                                            n_embd, n_hc, hc_eps, mix.data(), fn_tensor->type==GGML_TYPE_F32);
+        // Diagnostic (LUCE_DS4_HC_MIX_PER_TOKEN): the single-token mix kernel per token instead of the
+        // batch kernel, to test whether the batch kernel reduces in another order.
+        static const bool mix_per_token = ds4_env_flag("LUCE_DS4_HC_MIX_PER_TOKEN");
+        if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data &&
+            (fn_tensor->type==GGML_TYPE_F16 || fn_tensor->type==GGML_TYPE_F32)) {
+            if (mix_per_token) {
+                device_mix = true;
+                for (int t = 0; t < n_tokens && device_mix; ++t) {
+                    device_mix = deepseek4_cuda_hc_pre_mix(hc_state + (size_t) t * hc_dim, fn_tensor->data,
+                                                           n_embd, n_hc, hc_eps, mix.data() + (size_t) t * mix_dim,
+                                                           fn_tensor->type==GGML_TYPE_F32);
+                }
+            } else {
+                device_mix = deepseek4_cuda_hc_pre_mix_batch(hc_state, n_tokens, fn_tensor->data,
+                                                             n_embd, n_hc, hc_eps, mix.data(), fn_tensor->type==GGML_TYPE_F32);
+            }
+        }
 #endif
         if (!device_mix) {
             std::vector<float> flat(hc_dim * (size_t) n_tokens);
@@ -7898,10 +7916,21 @@ static bool ds4_run_verify_attention(
             inputs.index_comp_rows = i64_input(pos / ratio);
             inputs.index_comp_pos = i32_input(pos + 1 - ratio);
         }
-        const DeepSeek4PreparedProjectedLane lane_proj =
-            ds4_slice_projected_lane(ctx, batched, w, t, inputs.rope_pos);
         ggml_tensor * lane_cur = ggml_view_2d(ctx, normed, n_embd, 1, normed->nb[1],
                                               (size_t) t * normed->nb[1]);
+        // Diagnostic (LUCE_DS4_VERIFY_LANE_PROJ): project each lane's Q/KV/compressor inputs on its own,
+        // as single-token decode does, instead of slicing the q-wide batched projection.
+        static const bool lane_proj_env = ds4_env_flag("LUCE_DS4_VERIFY_LANE_PROJ");
+        DeepSeek4PreparedProjectedLane lane_proj;
+        if (lane_proj_env) {
+            DeepSeek4PreparedProjectedLane one =
+                build_mla_qkv_projection(ctx, ggml_cont(ctx, lane_cur), w, L, 1);
+            build_mla_qkv_rope(ctx, one, w, ds4_rope_params(w, ratio), 1, inputs.rope_pos,
+                               /*fuse_q_rope=*/false);
+            lane_proj = ds4_slice_projected_lane(ctx, one, w, 0, inputs.rope_pos);
+        } else {
+            lane_proj = ds4_slice_projected_lane(ctx, batched, w, t, inputs.rope_pos);
+        }
         DeepSeek4MlaLaneBindings lane =
             deepseek4_contiguous_lane_bindings(w, il, lc, comp_lc, pos);
         ggml_tensor * store_view = selection.view(ctx, t, 1);
@@ -10459,6 +10488,12 @@ bool deepseek4_step_layer_range(
             const bool exact_tokenwise_prefill =
                 !reuse_decode_attn && !decode_tokenwise_verify && n_tokens > 1 &&
                 cache.prefill_mode == PrefillAttentionMode::Exact;
+            if (g_ds4_diag_attn_capture && il == layer_begin) {
+                std::fprintf(stderr, "[ds4-diag-path] n_tokens=%d decode_tokenwise_verify=%d exact_tokenwise_prefill=%d reuse_decode_attn=%d "
+                             "fused_verify_candidate=%d heterogeneous_batched_prefill=%d standard_layer_major_prefill=%d\n",
+                             n_tokens, decode_tokenwise_verify ? 1 : 0, exact_tokenwise_prefill ? 1 : 0, reuse_decode_attn ? 1 : 0,
+                             fused_verify_candidate ? 1 : 0, heterogeneous_batched_prefill ? 1 : 0, standard_layer_major_prefill ? 1 : 0);
+            }
             if (decode_tokenwise_verify) {
                 if (!ds4_run_verify_attention(
                         backend, w, L, lc, comp_lc, il, cur.data(), n_tokens, kv_start,
@@ -10922,6 +10957,12 @@ bool deepseek4_step_layer_range(
                 if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
             }
             if (ctx) ggml_free(ctx);
+            }
+
+            // Diagnostic capture of the host-side attention output (ds4_set_diag_attn_capture).
+            if (g_ds4_diag_attn_capture && !attn_out_host.empty()) {
+                g_ds4_diag_attn_capture->insert(g_ds4_diag_attn_capture->end(), attn_out_host.begin(),
+                                                attn_out_host.begin() + (size_t) n_tokens * n_embd);
             }
 
             // ── HC post (attention) ─────────────────────────────────

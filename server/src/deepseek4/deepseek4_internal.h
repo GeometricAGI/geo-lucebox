@@ -758,6 +758,9 @@ bool init_deepseek4_streamed_expert_cache(
 // Returns logits for last token.
 struct Ds4VerifyHooks;
 
+// Diagnostic capture of each layer's host-side attention output (deepseek4_graph.cpp).
+void ds4_set_diag_attn_capture(std::vector<float> * out);
+
 bool deepseek4_step(
     ggml_backend_t              backend,
     int                         device,
